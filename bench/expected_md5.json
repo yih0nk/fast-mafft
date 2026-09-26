@@ -1,0 +1,117 @@
+{
+ "16S.T": {
+  "input_md5": "3b32c0689f161123e8350dd102fffc29",
+  "output_md5": {
+   "1": "52a159c532103d9db248a892eb7cd152",
+   "10": "52a159c532103d9db248a892eb7cd152",
+   "4": "52a159c532103d9db248a892eb7cd152"
+  }
+ },
+ "edge": {
+  "input_md5": "9521fd65a08cc8c12b91b4c2aa7c9cd0",
+  "output_md5": {
+   "1": "0625e47cebde542c3b000949c5860b7a",
+   "4": "0625e47cebde542c3b000949c5860b7a"
+  }
+ },
+ "edge_noshort": {
+  "input_md5": "e70efa321bcec7f9e31ac5a4d6ff2b96",
+  "output_md5": {
+   "1": "4f0a0d8947bff52a6efd6c3b95dc21d2",
+   "4": "4f0a0d8947bff52a6efd6c3b95dc21d2"
+  }
+ },
+ "homfam_aldosered": {
+  "input_md5": "dd5ef3865d1862bc6dcf59bf651aef34",
+  "output_md5": {
+   "1": "7fbfa160b9ff991617b23ffe7b1f5d1d",
+   "4": "7fbfa160b9ff991617b23ffe7b1f5d1d"
+  }
+ },
+ "prot2k": {
+  "input_md5": "3e8147c2ac4d317a7cbda8dc0f58163e",
+  "output_md5": {
+   "1": "087f57deb47586e78b43609dbf6800bd",
+   "10": "087f57deb47586e78b43609dbf6800bd",
+   "4": "087f57deb47586e78b43609dbf6800bd"
+  }
+ },
+ "rnasim10k": {
+  "input_md5": "217a0f12193dae72db0d1d6408d03880",
+  "output_md5": {
+   "1": "03a55e5dd08145359e35ea4bc10f4e9c",
+   "10": "03a55e5dd08145359e35ea4bc10f4e9c",
+   "4": "03a55e5dd08145359e35ea4bc10f4e9c"
+  }
+ },
+ "rnasim1k": {
+  "input_md5": "2dbeda9dfeeca6c73b640cb8c2e8e7a9",
+  "output_md5": {
+   "1": "d3d860c0602f89fa605926b20c5b8ba8",
+   "10": "d3d860c0602f89fa605926b20c5b8ba8",
+   "4": "d3d860c0602f89fa605926b20c5b8ba8"
+  }
+ },
+ "rnasim2k": {
+  "input_md5": "3d4b14f8bc478948399c6767d173bb29",
+  "output_md5": {
+   "1": "c0105c3bdcc2103a6468606263ab25c6",
+   "10": "c0105c3bdcc2103a6468606263ab25c6",
+   "4": "c0105c3bdcc2103a6468606263ab25c6"
+  }
+ },
+ "rnasim579": {
+  "input_md5": "35a1c39af452896374e5f7c03bbf60ba",
+  "output_md5": {
+   "1": "862a63a64dce0f3cd25cac99f2df2b7f",
+   "10": "862a63a64dce0f3cd25cac99f2df2b7f",
+   "4": "862a63a64dce0f3cd25cac99f2df2b7f"
+  }
+ },
+ "rnasim5k": {
+  "input_md5": "3d39ddd41994ee966b5e0a7ca0b5a855",
+  "output_md5": {
+   "1": "d8f2622e2e80f94ec5aeda52460a2907",
+   "10": "d8f2622e2e80f94ec5aeda52460a2907",
+   "4": "d8f2622e2e80f94ec5aeda52460a2907"
+  }
+ },
+ "sim10k": {
+  "input_md5": "533b8032c4d3961d7c570447c495eae0",
+  "output_md5": {
+   "10": "fd7d4060b4a7f637f5f2cefa11119029"
+  }
+ },
+ "sim1k": {
+  "input_md5": "7bb0da25388fc2a06eec6903518f9c5e",
+  "output_md5": {
+   "1": "3e271a550159a7231272aa6a9a3097d3",
+   "10": "3e271a550159a7231272aa6a9a3097d3",
+   "4": "3e271a550159a7231272aa6a9a3097d3"
+  }
+ },
+ "sim2k": {
+  "input_md5": "d9fff17873c1849e2c565c96f204f4a8",
+  "output_md5": {
+   "1": "5ccea931f54026a293d84d646306b8be",
+   "10": "5ccea931f54026a293d84d646306b8be",
+   "4": "5ccea931f54026a293d84d646306b8be"
+  }
+ },
+ "sim3k_long": {
+  "input_md5": "883d9715278451ef3aed1562a0515005",
+  "output_md5": {
+   "1": "71bca344a3c8cc49e3554e8b4f824345",
+   "10": "71bca344a3c8cc49e3554e8b4f824345",
+   "4": "71bca344a3c8cc49e3554e8b4f824345"
+  }
+ },
+ "sim5k": {
+  "input_md5": "4450adcf432c2616b29d271b30a038d4",
+  "output_md5": {
+   "1": "2cbec8db3ad273234dae148d26171dfb",
+   "10": "2cbec8db3ad273234dae148d26171dfb",
+   "4": "2cbec8db3ad273234dae148d26171dfb"
+  }
+ }
+}
