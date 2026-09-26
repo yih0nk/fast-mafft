@@ -102,6 +102,7 @@ typedef struct _msadistmtxthread_arg
 	char **seq;
 	int **skiptable;
 	Jobtable *jobpospt;
+	void *fast; // msadistfast_t *: exact fast scorer; NULL -> original naivepairscorefast()
 #ifdef enablemultithread
 	pthread_mutex_t *mutex;
 #endif
@@ -1188,6 +1189,483 @@ static void *ylmsacompactdisthalfmtxthread( void *arg ) // enablemultithread == 
 	}
 }
 
+/*
+ * fast-mafft: exact fast replacement for naivepairscorefast() in the
+ * "Making a distance matrix from msa" stage.
+ *
+ * naivepairscorefast( s1, s2, skip1, skip2, penal ) drops the columns where
+ * both rows are gaps and returns
+ *     sum over columns with residues in both rows of amino_dis[c1][c2]
+ *   + penal * ( number of maximal runs of (gap,residue) columns
+ *             + number of maximal runs of (residue,gap) columns )
+ * accumulated in a double.  Every summand is an int and every partial sum is
+ * an integer far below 2^53, so the double sum is exact; it equals the same
+ * sum taken in int64 in any order and converted to double at the end.
+ *
+ * Gap runs: once gap-gap columns are removed, a run of (gap in i, residue
+ * in j) columns is exactly one maximal gap block of row i (in the aligned
+ * row) that holds at least one residue of row j.  With G the gap bitmask of
+ * row i and X = G & ~G_j, the multiword sum G + X carries out of each such
+ * block into the column just after it, a column where G is 0, so the count
+ * is popcount( (G + X) & ~G ).  The i->j and j->i result bits never share a
+ * column, so one popcount of their OR counts both.
+ *
+ * Residue scores, bit-plane path: when the alignment has at most 4 residue
+ * kinds and some 2-bit coding makes amino_dis[x][y] a function Td of
+ * code(x)^code(y) (true for MAFFT's nucleotide matrix: match, transition,
+ * transversion), each row is stored as gap mask + 2 code-bit planes and
+ *     sum = Td[3]*n_rr + (Td[0]-Td[3])*n_0 + (Td[1]-Td[3])*n_1 + (Td[2]-Td[3])*n_2
+ * where n_rr counts both-residue columns and n_d those with code xor d;
+ * all counts are popcounts (NEON when available).
+ * Generic path (any other residue bytes < 0x80): the same gap masks plus a
+ * residue mask; the both-residue columns are visited bit by bit and scored
+ * from a flat copy of amino_dis.
+ * Rows of unequal length or bytes >= 0x80 fall back to the original code.
+ *
+ * Debug (environment):
+ *   MAFFT_MSADIST=ref      original function for every pair
+ *   MAFFT_MSADIST=check    fast and original for every pair; exit(1) on any
+ *                          bitwise difference ("generic,check" also works)
+ *   MAFFT_MSADIST=generic  skip the bit-plane path
+ *   MAFFT_MSADIST_DUMP=f   write the finished matrix (row i, j>i, doubles)
+ *   MAFFT_MSADIST_SAVEMSA=f  write the aligned rows + amino_dis (bench input)
+ */
+/* BEGIN msadistfast kernel */
+#include <stdint.h>
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define MSADIST_NEON 1
+#else
+#define MSADIST_NEON 0
+#endif
+
+#define MSADIST_CHUNK 4000 // 128-column blocks per u16 accumulation chunk (16*4000 < 65536)
+
+typedef struct _msadistfast
+{
+	int nseq;
+	int L;        // aligned length
+	int W;        // 64-bit words per row mask; even, and W*64 > L so the last carry has room
+	int penal;
+	int check;    // 1: also run naivepairscorefast() and compare bitwise
+	int xorpath;  // 1: bit-plane path, 0: generic path
+	char **seq;   // the aligned rows (generic path reads residues from them)
+	/* bit-plane path: <= 4 residue kinds and amino_dis[x][y] depends only on code(x)^code(y) */
+	uint64_t *planes; // per row, per 128 columns: G[2] b0[2] b1[2] (gap mask, code bit 0, code bit 1)
+	long long Td[4];  // amino_dis value for code xor d
+	/* generic path: any residue bytes < 0x80 */
+	uint64_t *masks;  // per row, per 64 columns: G, R (gap mask, residue mask)
+	int *T;           // 0x80*0x80 copy of amino_dis (the gap row and column are never used)
+	/* preparation */
+	int nthreads;
+	int phase;
+	unsigned char lut[0x80];
+} msadistfast_t;
+
+typedef struct _msadistprep
+{
+	msadistfast_t *f;
+	int r0, r1;
+	int bad;               // phase 0: a row of another length, or a byte >= 0x80
+	unsigned char seen[0x80];
+	int nknown;            // phase 0: bytes seen so far, in known[] (NEON fast scan)
+	unsigned char known[0x80];
+} msadistprep_t;
+
+static void msadistfast_free( msadistfast_t *f )
+{
+	if( f == NULL ) return;
+	free( f->planes );
+	free( f->masks );
+	free( f->T );
+	free( f );
+}
+
+#if MSADIST_NEON
+// bit k of the result = top bit of byte k of m0|m1|m2|m3 (each byte 0x00 or 0xff)
+static inline uint64_t msadist_movemask64( uint8x16_t m0, uint8x16_t m1, uint8x16_t m2, uint8x16_t m3 )
+{
+	static const uint8_t wt[16] = { 1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128 };
+	const uint8x16_t bw = vld1q_u8( wt );
+	uint8x16_t s0 = vpaddq_u8( vandq_u8( m0, bw ), vandq_u8( m1, bw ) );
+	uint8x16_t s1 = vpaddq_u8( vandq_u8( m2, bw ), vandq_u8( m3, bw ) );
+	s0 = vpaddq_u8( s0, s1 );
+	s0 = vpaddq_u8( s0, s0 );
+	return( vgetq_lane_u64( vreinterpretq_u64_u8( s0 ), 0 ) );
+}
+
+// 64 bytes (all < 0x80) through f->lut
+static inline void msadist_lut64( const msadistfast_t *f, const unsigned char *s, uint8x16_t *c0, uint8x16_t *c1, uint8x16_t *c2, uint8x16_t *c3 )
+{
+	const uint8x16x4_t lo = vld1q_u8_x4( f->lut ), hi = vld1q_u8_x4( f->lut + 64 );
+	const uint8x16_t k64 = vdupq_n_u8( 64 );
+	uint8x16_t v;
+	v = vld1q_u8( s );    *c0 = vqtbx4q_u8( vqtbl4q_u8( lo, v ), hi, vsubq_u8( v, k64 ) );
+	v = vld1q_u8( s+16 ); *c1 = vqtbx4q_u8( vqtbl4q_u8( lo, v ), hi, vsubq_u8( v, k64 ) );
+	v = vld1q_u8( s+32 ); *c2 = vqtbx4q_u8( vqtbl4q_u8( lo, v ), hi, vsubq_u8( v, k64 ) );
+	v = vld1q_u8( s+48 ); *c3 = vqtbx4q_u8( vqtbl4q_u8( lo, v ), hi, vsubq_u8( v, k64 ) );
+}
+#endif
+
+// phase 0: check lengths and collect the residue bytes; phase 1: build the row bit masks
+static void *msadist_prepthread( void *arg )
+{
+	msadistprep_t *p = (msadistprep_t *)arg;
+	msadistfast_t *f = p->f;
+	int i, c, k, w, cmax, L = f->L, W = f->W;
+	for( i=p->r0; i<p->r1; i++ )
+	{
+		const unsigned char *s = (const unsigned char *)f->seq[i];
+		if( f->phase == 0 )
+		{
+			unsigned char hi = 0;
+			if( (int)strlen( f->seq[i] ) != L ) { p->bad = 1; continue; }
+			c = 0;
+#if MSADIST_NEON
+			// 16 bytes at a time while they are all bytes already seen (<= 8 kinds)
+			while( p->nknown <= 8 && c + 16 <= L )
+			{
+				uint8x16_t v = vld1q_u8( s+c ), m = vdupq_n_u8( 0 );
+				for( k=0; k<p->nknown; k++ ) m = vorrq_u8( m, vceqq_u8( v, vdupq_n_u8( p->known[k] ) ) );
+				if( vminvq_u8( m ) != 0xff )
+				{
+					for( k=c; k<c+16; k++ )
+					{
+						hi |= s[k];
+						if( !p->seen[s[k]&0x7f] ) { p->seen[s[k]&0x7f] = 1; p->known[p->nknown++] = s[k]&0x7f; }
+					}
+				}
+				c += 16;
+			}
+#endif
+			for( ; c<L; c++ ) { hi |= s[c]; p->seen[s[c]&0x7f] = 1; }
+			if( hi & 0x80 ) p->bad = 1;
+		}
+		else if( f->xorpath )
+		{
+			uint64_t *pl = f->planes + (size_t)i * 3 * W;
+			for( w=0; w*64<L; w++ )
+			{
+				uint64_t g = 0, b0 = 0, b1 = 0, v;
+				uint64_t *blk = pl + ( w >> 1 ) * 6 + ( w & 1 );
+				cmax = L - w*64 < 64 ? L - w*64 : 64;
+#if MSADIST_NEON
+				if( cmax == 64 )
+				{
+					uint8x16_t c0, c1, c2, c3;
+					msadist_lut64( f, s + w*64, &c0, &c1, &c2, &c3 );
+					blk[0] = msadist_movemask64( vtstq_u8( c0, vdupq_n_u8( 4 ) ), vtstq_u8( c1, vdupq_n_u8( 4 ) ), vtstq_u8( c2, vdupq_n_u8( 4 ) ), vtstq_u8( c3, vdupq_n_u8( 4 ) ) );
+					blk[2] = msadist_movemask64( vtstq_u8( c0, vdupq_n_u8( 1 ) ), vtstq_u8( c1, vdupq_n_u8( 1 ) ), vtstq_u8( c2, vdupq_n_u8( 1 ) ), vtstq_u8( c3, vdupq_n_u8( 1 ) ) );
+					blk[4] = msadist_movemask64( vtstq_u8( c0, vdupq_n_u8( 2 ) ), vtstq_u8( c1, vdupq_n_u8( 2 ) ), vtstq_u8( c2, vdupq_n_u8( 2 ) ), vtstq_u8( c3, vdupq_n_u8( 2 ) ) );
+					continue;
+				}
+#endif
+				for( k=0; k<cmax; k++ )
+				{
+					v = f->lut[s[w*64+k]];
+					g |= ( ( v >> 2 ) & 1 ) << k;
+					b0 |= ( v & 1 ) << k;
+					b1 |= ( ( v >> 1 ) & 1 ) << k;
+				}
+				blk[0] = g; blk[2] = b0; blk[4] = b1;
+			}
+		}
+		else
+		{
+			uint64_t *mk = f->masks + (size_t)i * 2 * W;
+			for( w=0; w*64<L; w++ )
+			{
+				uint64_t g = 0, r = 0, v;
+				cmax = L - w*64 < 64 ? L - w*64 : 64;
+#if MSADIST_NEON
+				if( cmax == 64 )
+				{
+					const uint8x16_t gap = vdupq_n_u8( '-' );
+					g = msadist_movemask64( vceqq_u8( vld1q_u8( s+w*64 ), gap ), vceqq_u8( vld1q_u8( s+w*64+16 ), gap ), vceqq_u8( vld1q_u8( s+w*64+32 ), gap ), vceqq_u8( vld1q_u8( s+w*64+48 ), gap ) );
+					mk[2*w] = g; mk[2*w+1] = ~g;
+					continue;
+				}
+#endif
+				for( k=0; k<cmax; k++ )
+				{
+					v = ( s[w*64+k] == '-' );
+					g |= v << k;
+					r |= ( v ^ 1 ) << k;
+				}
+				mk[2*w] = g; mk[2*w+1] = r;
+			}
+		}
+	}
+	return( NULL );
+}
+
+static void msadist_prepphase( msadistfast_t *f, msadistprep_t *p, int phase )
+{
+	int t, nth = f->nthreads;
+	f->phase = phase;
+	for( t=0; t<nth; t++ )
+	{
+		p[t].f = f;
+		p[t].r0 = (int)( (long long)f->nseq * t / nth );
+		p[t].r1 = (int)( (long long)f->nseq * ( t + 1 ) / nth );
+	}
+#ifdef enablemultithread
+	if( nth > 1 )
+	{
+		pthread_t *handle = calloc( nth, sizeof( pthread_t ) );
+		for( t=0; t<nth; t++ ) pthread_create( handle+t, NULL, msadist_prepthread, (void *)(p+t) );
+		for( t=0; t<nth; t++ ) pthread_join( handle[t], NULL );
+		free( handle );
+	}
+	else
+#endif
+		for( t=0; t<nth; t++ ) msadist_prepthread( (void *)(p+t) );
+}
+
+// find a 2-bit code for each of the K<=4 residue kinds such that
+// amino_dis[chr[a]][chr[b]] is a function of code[a]^code[b]
+static int msadist_findxorcode( int K, const unsigned char *chr, int *code, long long *Td )
+{
+	int p[4], a, b, d, ok, set[4];
+	long long v, f[4];
+	for( p[0]=0; p[0]<4; p[0]++ ) for( p[1]=0; p[1]<4; p[1]++ ) for( p[2]=0; p[2]<4; p[2]++ ) for( p[3]=0; p[3]<4; p[3]++ )
+	{
+		if( p[0]==p[1] || p[0]==p[2] || p[0]==p[3] || p[1]==p[2] || p[1]==p[3] || p[2]==p[3] ) continue;
+		ok = 1;
+		for( d=0; d<4; d++ ) { set[d] = 0; f[d] = 0; }
+		for( a=0; a<K && ok; a++ ) for( b=0; b<K; b++ )
+		{
+			d = p[a] ^ p[b];
+			v = amino_dis[chr[a]][chr[b]];
+			if( !set[d] ) { set[d] = 1; f[d] = v; }
+			else if( f[d] != v ) { ok = 0; break; }
+		}
+		if( ok )
+		{
+			for( a=0; a<4; a++ ) code[a] = p[a];
+			for( d=0; d<4; d++ ) Td[d] = f[d]; // an unset entry never occurs (no such pair of kinds)
+			return( 1 );
+		}
+	}
+	return( 0 );
+}
+
+// Returns NULL when the original function must be used.
+// MAFFT_MSADIST may contain "ref" (use the original), "check" (compare every pair
+// with the original) and "generic" (skip the bit-plane path).
+static msadistfast_t *msadistfast_prepare( int nseq, char **seq, int penal, int nthreads )
+{
+	msadistfast_t *f;
+	msadistprep_t *p;
+	int code[4];
+	unsigned char chr[4];
+	int t, a, b, c, K, bad;
+	long long Td[4];
+	unsigned char seen[0x80];
+	const char *mode = getenv( "MAFFT_MSADIST" );
+
+	if( mode && strstr( mode, "ref" ) ) return( NULL );
+	if( nseq < 2 ) return( NULL );
+	if( nthreads < 1 ) nthreads = 1;
+	if( nthreads > nseq ) nthreads = nseq;
+
+	f = calloc( 1, sizeof( msadistfast_t ) );
+	p = calloc( nthreads, sizeof( msadistprep_t ) );
+	f->nseq = nseq;
+	f->seq = seq;
+	f->L = strlen( seq[0] );
+	f->W = ( f->L / 64 + 2 ) & ~1;
+	f->penal = penal;
+	f->check = ( mode && strstr( mode, "check" ) );
+	f->nthreads = nthreads;
+
+	msadist_prepphase( f, p, 0 );
+	bad = 0;
+	memset( seen, 0, sizeof( seen ) );
+	for( t=0; t<nthreads; t++ )
+	{
+		bad |= p[t].bad;
+		for( c=0; c<0x80; c++ ) seen[c] |= p[t].seen[c];
+	}
+	if( bad || seen[0] )
+	{
+		free( p );
+		msadistfast_free( f );
+		return( NULL );
+	}
+
+	K = 0;
+	for( c=1; c<0x80; c++ ) if( seen[c] && c != '-' )
+	{
+		if( K < 4 ) chr[K] = c;
+		K++;
+	}
+	f->xorpath = ( K <= 4 && !( mode && strstr( mode, "generic" ) ) && msadist_findxorcode( K, chr, code, Td ) );
+	if( f->xorpath )
+	{
+		for( a=0; a<4; a++ ) f->Td[a] = Td[a];
+		memset( f->lut, 0, sizeof( f->lut ) );
+		f->lut['-'] = 4;
+		for( a=0; a<K; a++ ) f->lut[chr[a]] = code[a];
+		f->planes = calloc( (size_t)nseq * 3 * f->W, sizeof( uint64_t ) );
+		if( f->check ) reporterr( "msadist fast (bit-plane path): L=%d K=%d Td=%lld,%lld,%lld,%lld penal=%d\n", f->L, K, Td[0], Td[1], Td[2], Td[3], penal );
+	}
+	else
+	{
+		f->T = calloc( 0x80 * 0x80, sizeof( int ) );
+		for( a=0; a<0x80; a++ ) for( b=0; b<0x80; b++ ) f->T[(a<<7)|b] = ( a == '-' || b == '-' ) ? 0 : amino_dis[a][b];
+		f->masks = calloc( (size_t)nseq * 2 * f->W, sizeof( uint64_t ) );
+		if( f->check ) reporterr( "msadist fast (generic path): L=%d K=%d penal=%d\n", f->L, K, penal );
+	}
+	msadist_prepphase( f, p, 1 );
+	free( p );
+	return( f );
+}
+
+// one 64-column word of the gap-run count: blocks of a (gaps of one row) that
+// contain a residue of the other row end where the carry of a + (a & ~b) lands
+#define MSADIST_RUNWORD( a, b, ca, cb, e ) \
+	do { \
+		uint64_t a_ = (a), b_ = (b), ta_, tb_, sa_, sb_; \
+		ta_ = a_ + ( a_ & ~b_ ); sa_ = ta_ + (ca); \
+		tb_ = b_ + ( b_ & ~a_ ); sb_ = tb_ + (cb); \
+		(ca) = ( ta_ < a_ ) | ( sa_ < ta_ ); \
+		(cb) = ( tb_ < b_ ) | ( sb_ < tb_ ); \
+		(e) = ( sa_ & ~a_ ) | ( sb_ & ~b_ ); \
+	} while( 0 )
+
+static inline long long msadist_xorscore( const msadistfast_t *f, const uint64_t *pi, const uint64_t *pj )
+{
+	long long len = f->L, nA = 0, nB = 0, n1 = 0, n2 = 0, nE = 0;
+	int nblk = f->W / 2, k0, k1, k;
+	uint64_t ci = 0, cj = 0, e0, e1;
+#if MSADIST_NEON
+	for( k0=0; k0<nblk; k0=k1 )
+	{
+		uint16x8_t aA = vdupq_n_u16( 0 ), aB = vdupq_n_u16( 0 ), a1 = vdupq_n_u16( 0 ), a2 = vdupq_n_u16( 0 ), aE = vdupq_n_u16( 0 );
+		k1 = k0 + MSADIST_CHUNK < nblk ? k0 + MSADIST_CHUNK : nblk;
+		for( k=k0; k<k1; k++ )
+		{
+			const uint64_t *qi = pi + 6*k, *qj = pj + 6*k;
+			uint64x2_t gi = vld1q_u64( qi ), i0 = vld1q_u64( qi+2 ), i1 = vld1q_u64( qi+4 );
+			uint64x2_t gj = vld1q_u64( qj ), j0 = vld1q_u64( qj+2 ), j1 = vld1q_u64( qj+4 );
+			uint64x2_t gor = vorrq_u64( gi, gj );
+			uint64x2_t x0 = veorq_u64( i0, j0 ), x1 = veorq_u64( i1, j1 );
+			uint64x2_t t0 = vorrq_u64( gor, x0 ), t1 = vorrq_u64( gor, x1 );
+			aA = vpadalq_u8( aA, vcntq_u8( vreinterpretq_u8_u64( gor ) ) );
+			aB = vpadalq_u8( aB, vcntq_u8( vreinterpretq_u8_u64( vorrq_u64( t0, x1 ) ) ) );
+			a1 = vpadalq_u8( a1, vcntq_u8( vreinterpretq_u8_u64( vbicq_u64( x0, t1 ) ) ) );
+			a2 = vpadalq_u8( a2, vcntq_u8( vreinterpretq_u8_u64( vbicq_u64( x1, t0 ) ) ) );
+			MSADIST_RUNWORD( qi[0], qj[0], ci, cj, e0 );
+			MSADIST_RUNWORD( qi[1], qj[1], ci, cj, e1 );
+			aE = vpadalq_u8( aE, vcntq_u8( vreinterpretq_u8_u64( vcombine_u64( vcreate_u64( e0 ), vcreate_u64( e1 ) ) ) ) );
+		}
+		nA += vaddlvq_u16( aA ); nB += vaddlvq_u16( aB ); n1 += vaddlvq_u16( a1 ); n2 += vaddlvq_u16( a2 ); nE += vaddlvq_u16( aE );
+	}
+#else
+	(void)k0; (void)k1;
+	for( k=0; k<nblk; k++ )
+	{
+		const uint64_t *qi = pi + 6*k, *qj = pj + 6*k;
+		int h;
+		for( h=0; h<2; h++ )
+		{
+			uint64_t gor = qi[h] | qj[h], x0 = qi[2+h] ^ qj[2+h], x1 = qi[4+h] ^ qj[4+h];
+			nA += __builtin_popcountll( gor );
+			nB += __builtin_popcountll( gor | x0 | x1 );
+			n1 += __builtin_popcountll( x0 & ~( gor | x1 ) );
+			n2 += __builtin_popcountll( x1 & ~( gor | x0 ) );
+		}
+		MSADIST_RUNWORD( qi[0], qj[0], ci, cj, e0 );
+		MSADIST_RUNWORD( qi[1], qj[1], ci, cj, e1 );
+		nE += __builtin_popcountll( e0 ) + __builtin_popcountll( e1 );
+	}
+#endif
+	// nA counts columns with a gap in either row, nB those that are not identical
+	// residue pairs.  Padding columns (>= len) have no gap bit and code 0 in both
+	// rows, so they add to neither.  Both-residue columns: len - nA; with code
+	// xor 0: len - nB; xor 1: n1; xor 2: n2; xor 3: the rest.
+	return( f->Td[3] * ( len - nA ) + ( f->Td[0] - f->Td[3] ) * ( len - nB ) + ( f->Td[1] - f->Td[3] ) * n1 + ( f->Td[2] - f->Td[3] ) * n2
+	      + (long long)f->penal * nE );
+}
+
+static inline long long msadist_genericscore( const msadistfast_t *f, int i, int j )
+{
+	const uint64_t *mi = f->masks + (size_t)i * 2 * f->W, *mj = f->masks + (size_t)j * 2 * f->W;
+	const unsigned char *si = (const unsigned char *)f->seq[i], *sj = (const unsigned char *)f->seq[j];
+	const int *T = f->T;
+	uint64_t ci = 0, cj = 0, e, rr;
+	long long s = 0, nE = 0;
+	int w, W = f->W;
+	for( w=0; w<W; w++ )
+	{
+		const unsigned char *a = si + w*64, *b = sj + w*64;
+		rr = mi[2*w+1] & mj[2*w+1];
+		while( rr )
+		{
+			int k = __builtin_ctzll( rr );
+			s += T[(a[k]<<7)|b[k]];
+			rr &= rr - 1;
+		}
+		MSADIST_RUNWORD( mi[2*w], mj[2*w], ci, cj, e );
+		nE += __builtin_popcountll( e );
+	}
+	return( s + (long long)f->penal * nE );
+}
+
+// exact value of naivepairscorefast( seq[i], seq[j], skip[i], skip[j], penal ) for this alignment
+static inline double msadistfast_score( const msadistfast_t *f, int i, int j )
+{
+	long long s;
+	if( f->xorpath )
+		s = msadist_xorscore( f, f->planes + (size_t)i * 3 * f->W, f->planes + (size_t)j * 3 * f->W );
+	else
+		s = msadist_genericscore( f, i, j );
+	return( (double)s );
+}
+/* END msadistfast kernel */
+
+static double msadist_pairscore( msadistmtxthread_arg_t *targ, int i, int j )
+{
+	msadistfast_t *f = (msadistfast_t *)targ->fast;
+	double v;
+	if( f == NULL ) return( naivepairscorefast( targ->seq[i], targ->seq[j], targ->skiptable[i], targ->skiptable[j], penalty_dist ) );
+	v = msadistfast_score( f, i, j );
+	if( f->check )
+	{
+		double r = naivepairscorefast( targ->seq[i], targ->seq[j], targ->skiptable[i], targ->skiptable[j], penalty_dist );
+		if( memcmp( &r, &v, sizeof( double ) ) )
+		{
+			reporterr( "msadist check FAILED at i=%d j=%d: fast=%.17g ref=%.17g\n", i, j, v, r );
+			exit( 1 );
+		}
+	}
+	return( v );
+}
+
+static void msadist_savemsa( const char *fn, int njob, char **seq, int *selfscore ) // debug: input for a standalone kernel benchmark
+{
+	FILE *fp = fopen( fn, "wb" );
+	int i, L = strlen( seq[0] );
+	if( fp == NULL ) { reporterr( "Cannot open %s\n", fn ); return; }
+	fwrite( &penalty_dist, sizeof( int ), 1, fp );
+	for( i=0; i<0x80; i++ ) fwrite( amino_dis[i], sizeof( int ), 0x80, fp );
+	fwrite( &njob, sizeof( int ), 1, fp );
+	fwrite( &L, sizeof( int ), 1, fp );
+	fwrite( selfscore, sizeof( int ), njob, fp );
+	for( i=0; i<njob; i++ ) fwrite( seq[i], 1, L, fp );
+	fclose( fp );
+}
+
+static void msadist_dump( const char *fn, int njob, double **iscore )
+{
+	FILE *fp = fopen( fn, "wb" );
+	int i;
+	if( fp == NULL ) { reporterr( "Cannot open %s\n", fn ); return; }
+	for( i=0; i<njob-1; i++ ) fwrite( iscore[i]+1, sizeof( double ), njob-1-i, fp );
+	fclose( fp );
+}
+
 #if 1
 static void *msadistmtxthread( void *arg ) // enablemultithread == 0 demo tsukau
 {
@@ -1241,7 +1719,7 @@ static void *msadistmtxthread( void *arg ) // enablemultithread == 0 demo tsukau
 				iscoretmp = 2.0; // 2013/Oct/17
 			else
 			{
-				iscoretmp = ( 1.0 - naivepairscorefast( seq[i], seq[j], skiptable[i], skiptable[j], penalty_dist ) / bunbo ) * 2.0; // 2014/Aug/15 fast 
+				iscoretmp = ( 1.0 - msadist_pairscore( targ, i, j ) / bunbo ) * 2.0; // 2014/Aug/15 fast; fast-mafft: exact replacement for naivepairscorefast()
 				if( iscoretmp > 10 ) iscoretmp = 10.0;  // 2015/Mar/17
 	
 			}
@@ -4622,8 +5100,14 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 #endif
 		{
 			reporterr( "Making a distance matrix from msa.. \n" );
+			if( getenv( "MAFFT_MSADIST_SAVEMSA" ) ) msadist_savemsa( getenv( "MAFFT_MSADIST_SAVEMSA" ), njob, bseq, selfscore );
+#ifdef enablemultithread
+			msadistfast_t *msadistfast = msadistfast_prepare( njob, bseq, penalty_dist, nthreadpair ); // fast-mafft; NULL -> original scorer
+#else
+			msadistfast_t *msadistfast = msadistfast_prepare( njob, bseq, penalty_dist, 1 ); // fast-mafft; NULL -> original scorer
+#endif
 			skiptable = AllocateIntMtx( njob, 0 );
-			makeskiptable( njob, skiptable, bseq ); // allocate suru.
+			if( msadistfast == NULL || msadistfast->check ) makeskiptable( njob, skiptable, bseq ); // allocate suru. (only the original scorer uses it)
 #ifdef enablemultithread
 			if( nthreadpair > 0 )
 			{
@@ -4648,6 +5132,7 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 					targ[i].seq = bseq;
 					targ[i].skiptable = skiptable;
 					targ[i].jobpospt = &jobpos;
+					targ[i].fast = msadistfast;
 					targ[i].mutex = &mutex;
 	
 					pthread_create( handle+i, NULL, msadistmtxthread, (void *)(targ+i) );
@@ -4684,6 +5169,7 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 					targ[0].seq = bseq;
 					targ[0].skiptable = skiptable;
 					targ[0].jobpospt = &jobpos;
+					targ[0].fast = msadistfast;
 	
 					msadistmtxthread( targ );
 				}
@@ -4691,6 +5177,8 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 				free( targ );
 #endif
 			}
+			msadistfast_free( msadistfast ); msadistfast = NULL;
+			if( getenv( "MAFFT_MSADIST_DUMP" ) ) msadist_dump( getenv( "MAFFT_MSADIST_DUMP" ), njob, mtx );
 			if( skiptable) FreeIntMtx( skiptable ); skiptable = NULL;
 			reporterr(       "\ndone.\n\n" );
 			free( selfscore ); selfscore = NULL;
