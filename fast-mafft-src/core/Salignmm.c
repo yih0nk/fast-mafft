@@ -1,4 +1,12 @@
 #include "mltaln.h"
+#include "progtiming.h"
+#ifdef PROGTIMING
+int pt_nofastdp = -1; /* A/B switch for timing builds: MAFFT_NOFASTDP=1 disables the fast DP path */
+static int pt_fastdp_enabled( void ) { if( pt_nofastdp < 0 ) pt_nofastdp = ( getenv( "MAFFT_NOFASTDP" ) != NULL ); return( !pt_nofastdp ); }
+#define FASTDP_ON ( pt_fastdp_enabled() )
+#else
+#define FASTDP_ON 1
+#endif
 #include "dp.h"
 
 #define MACHIGAI 0
@@ -396,6 +404,74 @@ static void match_calc( double **n_dynamicmtx, double *match, double **cpmx1, do
 	} 
 	free( scarr );
 #endif
+}
+
+/* work/prog: dense variant of match_calc() for the per-row calls of the DP.
+   match_calc() sums, for each column j, scarr[l]*cpmx2[l][j] over the letters l with a nonzero
+   weight in that column, in ascending l, as a chain of fused multiply-adds starting from 0.0.
+   Here the same chain runs over every letter that is nonzero in *any* column (ascending l).
+   The extra terms have cpmx2[l][j] == 0.0, and fma(s, 0.0, acc) == acc exactly for finite s
+   whenever acc is not -0.0; acc starts at +0.0 and can never become -0.0 (weights are >= 0 and
+   exact cancellation rounds to +0.0), so every match[j] is bit-identical.  The loop over j is
+   independent per column and vectorizes. */
+#define DENSE_MAXU 8
+static TLS int dense_nu = -1;
+static TLS int dense_u[DENSE_MAXU];
+
+static void match_calc_dense_prep( double **cpmx2, int lgth2 )
+{
+	int l, j, n = 0;
+	for( l=0; l<nalphabets; l++ )
+	{
+		double *c = cpmx2[l];
+		for( j=0; j<lgth2; j++ ) if( c[j] ) break;
+		if( j < lgth2 )
+		{
+			if( n == DENSE_MAXU ) { dense_nu = -1; return; }
+			dense_u[n++] = l;
+		}
+	}
+	dense_nu = n;
+}
+
+static void match_calc_dense( double **n_dynamicmtx, double * restrict match, double **cpmx1, double **cpmx2, int i1, int lgth2 )
+{
+	double scu[DENSE_MAXU];
+	int u, j, k;
+	for( u=0; u<dense_nu; u++ )
+	{
+		int l = dense_u[u];
+		double sc = 0.0;
+		for( k=0; k<nalphabets; k++ )
+			sc += n_dynamicmtx[k][l] * cpmx1[k][i1];
+		scu[u] = sc;
+	}
+	if( dense_nu == 4 ) // the usual case for nucleotides
+	{
+		const double s0 = scu[0], s1 = scu[1], s2 = scu[2], s3 = scu[3];
+		const double * restrict c0 = cpmx2[dense_u[0]];
+		const double * restrict c1 = cpmx2[dense_u[1]];
+		const double * restrict c2 = cpmx2[dense_u[2]];
+		const double * restrict c3 = cpmx2[dense_u[3]];
+		for( j=0; j<lgth2; j++ )
+		{
+			double a = 0.0;
+			a += s0 * c0[j];
+			a += s1 * c1[j];
+			a += s2 * c2[j];
+			a += s3 * c3[j];
+			match[j] = a;
+		}
+		return;
+	}
+	for( j=0; j<lgth2; j++ ) match[j] = 0.0;
+	for( u=0; u<dense_nu; u++ )
+	{
+		const double sc = scu[u];
+		const double * restrict c = cpmx2[dense_u[u]];
+		for( j=0; j<lgth2; j++ )
+			match[j] += sc * c[j];
+	}
 }
 
 static void Atracking_localhom( double *impwmpt, double *lasthorizontalw, double *lastverticalw, 
@@ -1083,6 +1159,246 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
 	return( wm );
 }
 
+/* work/prog: fast evaluation of one DP row of A__align (trywarp == 0).  Same cells, same
+   floating-point expressions (each a*b+c statement is contracted to one fmadd, exactly as in the
+   original loop) and the same comparison order; only the evaluation is reorganized:
+   (1) the column recurrence (m[], mp[]) and the candidate it offers to each cell are independent
+       across j, so they are computed first in a separate, vectorizable pass;
+   (2) the row recurrence (mi, mpi) is kept in registers instead of TLS statics;
+   (3) all selects are branch-free and ijp is written once per cell. */
+static void Adp_row_fast( int i, int lastj, double * restrict colw, int * restrict colij, double * restrict colg2,
+	double * restrict mloc, int * restrict mploc, double * restrict curw, int * restrict ijpi,
+	const double * restrict prew, const double * restrict gf2, const double * restrict fg2, const double * restrict og2,
+	double fgcp1va, double ogcp1va, double gf1va, double gf1vapre, double fpenalty_ex,
+	double *mip, int *mpip, double *wmp )
+{
+	int j, ijv;
+#ifdef PROGTIMING
+	double _t0 = pt_now(), _t1;
+#endif
+	double mil = *mip;
+	int mpil = *mpip;
+	double wmv = *wmp;
+
+	for( j=1; j<lastj; j++ )
+	{
+		double mj = mloc[j];
+		int mpj = mploc[j];
+		double g3 = mj + fgcp1va * gf2[j];         // = *mjpt + fgcp1va * *gf2pt
+		double g4 = prew[j-1] + ogcp1va * gf2[j-1]; // = *prept + ogcp1va * *gf2ptpre
+		int take = ( g4 >= mj );
+		colw[j] = g3;
+		colij[j] = i - mpj;
+		mloc[j] = ( take ? g4 : mj ) + fpenalty_ex;
+		mploc[j] = take ? i-1 : mpj;
+	}
+#ifdef PROGTIMING
+	_t1 = pt_now(); pt_acc[21] += _t1 - _t0; _t0 = _t1;
+#endif
+	if( fpenalty_ex == 0.0 && lastj > 1 )
+	{
+		/* The row recurrence is  mi = ( g2 >= mi ? g2 : mi ) + fpenalty_ex.  Adding +0.0 only turns
+		   -0.0 into +0.0, so after the first column mi is already "canonical" and mi + 0.0 == mi
+		   bitwise.  Precomputing g2 + 0.0 (vectorized, below) and selecting between it and mi
+		   therefore reproduces every mi bit-for-bit while taking the add off the serial chain.
+		   Comparisons are unaffected by the sign of zero.  Column 1 is done exactly as before. */
+		double * restrict g2c = colg2;
+		for( j=1; j<lastj; j++ )
+		{
+			double g2 = prew[j-1] + og2[j] * gf1vapre; // = *prept + *ogcp2pt * gf1vapre
+			g2c[j] = g2 + fpenalty_ex;
+		}
+#ifdef PROGTIMING
+		_t1 = pt_now(); pt_acc[22] += _t1 - _t0; _t0 = _t1;
+#endif
+		j = 1;
+		{
+			double gg;
+			wmv = prew[j-1];
+			ijv = 0;
+			gg = mil + fg2[j-1] * gf1va;
+			if( gg > wmv ) { wmv = gg; ijv = -( j - mpil ); }
+			gg = prew[j-1] + og2[j] * gf1vapre;
+			if( gg >= mil ) { mil = gg; mpil = j-1; }
+			mil += fpenalty_ex;
+			{
+				double cw = colw[j];
+				int cij = colij[j];
+				int take = ( cw > wmv );
+				ijv = take ? cij : ijv;
+				wmv = take ? cw : wmv;
+			}
+			curw[j] += wmv;
+			ijpi[j] = ijv;
+		}
+		for( j=2; j<lastj; j++ )
+		{
+			double gg, g2 = g2c[j];
+			int take2;
+			wmv = prew[j-1];
+			ijv = 0;
+			gg = mil + fg2[j-1] * gf1va;                // = mi + *fgcp2pt * gf1va
+			if( gg > wmv )
+			{
+				wmv = gg;
+				ijv = -( j - mpil );
+			}
+			take2 = ( g2 >= mil );
+			mil = take2 ? g2 : mil;
+			mpil = take2 ? j-1 : mpil;
+			{
+				double cw = colw[j];
+				int cij = colij[j];
+				int take = ( cw > wmv );
+				ijv = take ? cij : ijv;
+				wmv = take ? cw : wmv;
+			}
+			curw[j] += wmv;
+			ijpi[j] = ijv;
+		}
+		*mip = mil;
+		*mpip = mpil;
+		*wmp = wmv;
+#ifdef PROGTIMING
+		_t1 = pt_now(); pt_acc[23] += _t1 - _t0;
+#endif
+		return;
+	}
+	for( j=1; j<lastj; j++ )
+	{
+		double gg;
+		wmv = prew[j-1];
+		ijv = 0;
+		gg = mil + fg2[j-1] * gf1va;                // = mi + *fgcp2pt * gf1va
+		if( gg > wmv )
+		{
+			wmv = gg;
+			ijv = -( j - mpil );
+		}
+		gg = prew[j-1] + og2[j] * gf1vapre;         // = *prept + *ogcp2pt * gf1vapre
+		if( gg >= mil )
+		{
+			mil = gg;
+			mpil = j-1;
+		}
+		mil += fpenalty_ex;
+		{
+			double cw = colw[j];
+			int cij = colij[j];
+			int take = ( cw > wmv );
+			ijv = take ? cij : ijv;
+			wmv = take ? cw : wmv;
+		}
+		curw[j] += wmv;
+		ijpi[j] = ijv;
+	}
+	*mip = mil;
+	*mpip = mpil;
+	*wmp = wmv;
+}
+
+/* work/prog: one DP row of A__align with the match scores fused in, for the common nucleotide
+   case (exactly 4 letters in use in seq2's profile, see match_calc_dense) with a zero gap-extension
+   penalty.  Per cell it performs the same operations as match_calc() + the original loop:
+     match = (((0 + s0*c0) + s1*c1) + s2*c2) + s3*c3            (fmadd chain, see match_calc_dense)
+     column candidate / m[] update, row candidate / mi update  (as in Adp_row_fast)
+     currentw[j] = match + wm
+   Column lgth2 has no match value in the original either (match_calc fills 0..lgth2-1 only), so
+   its currentw entry keeps the value already in the buffer, exactly as before.  One scalar pass
+   lets the out-of-order core overlap the independent per-column work with the serial mi chain. */
+#define ADP_CELL( FIRST, HASMATCH ) \
+	{ \
+		double mj = mloc[j], pw = prew[j-1], base, g3, g4, gg, g2; \
+		int mpj = mploc[j], takec, take; \
+		if( HASMATCH ) \
+		{ \
+			base = 0.0; \
+			base += s0 * c0[j]; \
+			base += s1 * c1[j]; \
+			base += s2 * c2[j]; \
+			base += s3 * c3[j]; \
+		} \
+		else \
+			base = curw[j]; \
+		g3 = mj + fgcp1va * gf2[j]; \
+		g4 = pw + ogcp1va * gf2[j-1]; \
+		takec = ( g4 >= mj ); \
+		mloc[j] = ( takec ? g4 : mj ) + fpenalty_ex; \
+		mploc[j] = takec ? i-1 : mpj; \
+		wmv = pw; \
+		ijv = 0; \
+		gg = mil + fg2[j-1] * gf1va; \
+		if( gg > wmv ) { wmv = gg; ijv = -( j - mpil ); } \
+		g2 = pw + og2[j] * gf1vapre; \
+		if( FIRST ) \
+		{ \
+			if( g2 >= mil ) { mil = g2; mpil = j-1; } \
+			mil += fpenalty_ex; \
+		} \
+		else \
+		{ \
+			double g2c = g2 + fpenalty_ex; \
+			int take2 = ( g2c >= mil ); \
+			mil = take2 ? g2c : mil; \
+			mpil = take2 ? j-1 : mpil; \
+		} \
+		take = ( g3 > wmv ); \
+		ijv = take ? i - mpj : ijv; \
+		wmv = take ? g3 : wmv; \
+		curw[j] = base + wmv; \
+		ijpi[j] = ijv; \
+	}
+
+static void Adp_row_fused4( int i, int lgth2,
+	double * restrict mloc, int * restrict mploc, double * restrict curw, int * restrict ijpi,
+	const double * restrict prew, const double * restrict gf2, const double * restrict fg2, const double * restrict og2,
+	const double * restrict c0, const double * restrict c1, const double * restrict c2, const double * restrict c3,
+	const double *scu,
+	double fgcp1va, double ogcp1va, double gf1va, double gf1vapre, double fpenalty_ex,
+	double *mip, int *mpip, double *wmp )
+{
+	// requires lgth2 >= 1 and fpenalty_ex == 0.0 (see Adp_row_fast for why mi + 0.0 can leave the chain)
+	const double s0 = scu[0], s1 = scu[1], s2 = scu[2], s3 = scu[3];
+	double mil = *mip, wmv = *wmp;
+	int mpil = *mpip, ijv, j;
+
+	j = 1;
+	if( 1 < lgth2 ) ADP_CELL( 1, 1 ) else ADP_CELL( 1, 0 )
+	for( j=2; j<lgth2; j++ )
+		ADP_CELL( 0, 1 )
+	if( lgth2 >= 2 )
+	{
+		j = lgth2;
+		ADP_CELL( 0, 0 )
+	}
+	*mip = mil;
+	*mpip = mpil;
+	*wmp = wmv;
+}
+
+static void dense_scores( double **n_dynamicmtx, double **cpmx1, int i1, double *scu )
+{
+	int u, k;
+	for( u=0; u<dense_nu; u++ ) // same chain as match_calc's scarr[l]
+	{
+		int l = dense_u[u];
+		double sc = 0.0;
+		for( k=0; k<nalphabets; k++ )
+			sc += n_dynamicmtx[k][l] * cpmx1[k][i1];
+		scu[u] = sc;
+	}
+}
+
+#ifdef PROGTIMING
+static TLS double *chk_m = NULL, *chk_cur = NULL, *chk_match = NULL;
+static TLS int *chk_mp = NULL, *chk_ijp = NULL;
+static TLS int pt_chkrow_pending = 0;
+static TLS double pt_chk_mi, pt_chk_wm, pt_chk_t;
+static TLS int pt_chk_mpi;
+static int pt_dpcheck_v = -1;
+static int pt_dpcheck( void ) { if( pt_dpcheck_v < 0 ) pt_dpcheck_v = ( getenv( "MAFFT_DPCHECK" ) != NULL ); return( pt_dpcheck_v ); }
+#endif
+
 double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **seq1, char **seq2, double *eff1, double *eff2, int icyc, int jcyc, int alloclen, int constraint, double *impmatch, char *sgap1, char *sgap2, char *egap1, char *egap2, int *chudanpt, int chudanref, int *chudanres, int headgp, int tailgp, int firstmem, int calledbyfulltreebase, double ***cpmxchild0, double ***cpmxchild1, double ***cpmxresult, double orieff1, double orieff2 )
 /* score no keisan no sai motokaraaru gap no atukai ni mondai ga aru */
 {
@@ -1138,6 +1454,10 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 	double *gapfreq1pt;
 	static TLS double *gapfreq2;
 	double *gapfreq2pt;
+	static TLS double *dpcolw = NULL; // fast DP path (work/prog): column-candidate scores of the current row
+	static TLS int *dpcolij = NULL;
+	static TLS double *dpcolg2 = NULL;
+	static TLS int dpcolalloc = 0;
 	double fpenalty = (double)penalty_l;
 	double fpenalty_shift = (double)penalty_shift;
 	double *fgcp2pt;
@@ -1165,6 +1485,10 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 	double *wmrecordspt, *wmrecords1pt, *prevwmrecordspt;
 	int *warpipt, *warpjpt;
 	char *gt1, *gt2, *gt1bk, *gt2bk;
+	int usefused, rowfused;
+	double fsel_s[4];
+	double *fsel_c[4];
+	PT_DECL;
 
 //	for( i=0; i<icyc; i++ ) fprintf( stderr, "%s, %f\n", seq1[i], eff1[i] );
 //	for( i=0; i<jcyc; i++ ) fprintf( stderr, "%s, %f\n", seq2[i], eff2[i] );
@@ -1213,10 +1537,18 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 		{
 //			fprintf( stderr, "## Not allocated\n" );
 		}
+		if( dpcolalloc )
+		{
+			free( dpcolw ); dpcolw = NULL;
+			free( dpcolij ); dpcolij = NULL;
+			free( dpcolg2 ); dpcolg2 = NULL;
+			dpcolalloc = 0;
+		}
 		return( 0.0 );
 	}
 
 
+	PT_START();
 	lgth1 = strlen( seq1[0] );
 	lgth2 = strlen( seq2[0] );
 #if 0
@@ -1295,6 +1627,9 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 	mseq1 = AllocateCharMtx( icyc, 0 );
 	mseq2 = AllocateCharMtx( jcyc, 0 );
 	mseq = AllocateCharMtx( icyc+jcyc, lgth1+lgth2+100 );
+#ifdef PROGTIMING
+	{ double _n = pt_now(); pt_acc[24] += _n - _pt_t; }
+#endif
 
 
 	if( lgth1 > orlgth1 || lgth2 > orlgth2 )
@@ -1423,6 +1758,9 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 		commonAlloc2 = ll2;
 	}
 	ijp = commonIP;
+#ifdef PROGTIMING
+	double _pt_s1 = pt_now();
+#endif
 
 #if 0
 	{
@@ -1677,6 +2015,9 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 #endif
 	
 
+#ifdef PROGTIMING
+	double _pt_s2 = pt_now(); pt_acc[25] += _pt_s1 - _pt_t; pt_acc[26] += _pt_s2 - _pt_s1; // (25 includes 24)
+#endif
 	for( i=0; i<lgth1; i++ ) 
 	{
 		ogcp1[i] = 0.5 * ( 1.0 - ogcp1opt[i] ) * fpenalty * ( gapfreq1pt[i] );
@@ -1703,6 +2044,8 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 	match_calc( n_dynamicmtx, currentw, *cpmx1pt, *cpmx2pt, 0, lgth2, doublework, intwork, 1 );
 	if( constraint )
 		imp_match_out_vead( currentw, 0, lgth2 ); // 060306
+	if( FASTDP_ON && !constraint ) match_calc_dense_prep( *cpmx2pt, lgth2 );
+	else dense_nu = -1;
 #if 0 // -> tbfast.c // impossible
 	if( localhom )
 		imp_match_calc( n_dynamicmtx, currentw, icyc, jcyc, lgth1, lgth2, seq1, seq2, eff1, eff2, localhom, 1, 0 );
@@ -1807,6 +2150,28 @@ for( i=0; i<lgth2; i++ )
 	fprintf( stderr, "fgcp2[%d]=%f\n", i, ogcp2[i] );
 #endif
 
+	if( !trywarp && dpcolalloc < lgth2+2 )
+	{
+		if( dpcolalloc ) { free( dpcolw ); free( dpcolij ); free( dpcolg2 ); }
+		dpcolalloc = lgth2 + 2 + 100;
+		dpcolw = AllocateFloatVec( dpcolalloc );
+		dpcolij = AllocateIntVec( dpcolalloc );
+		dpcolg2 = AllocateFloatVec( dpcolalloc );
+	}
+#ifdef PROGTIMING
+	if( pt_dpcheck() )
+	{
+		chk_m = realloc( chk_m, sizeof( double ) * ( lgth2+2 ) );
+		chk_mp = realloc( chk_mp, sizeof( int ) * ( lgth2+2 ) );
+		chk_cur = realloc( chk_cur, sizeof( double ) * ( lgth2+2 ) );
+		chk_ijp = realloc( chk_ijp, sizeof( int ) * ( lgth2+2 ) );
+		chk_match = realloc( chk_match, sizeof( double ) * ( lgth2+2 ) );
+	}
+#endif
+
+	usefused = ( FASTDP_ON && !trywarp && !constraint && dense_nu >= 0 && fpenalty_ex == 0.0 && lgth2 >= 1 );
+
+	PT_ADD(7);
 	for( i=1; i<lasti; i++ )
 	{
 
@@ -1828,7 +2193,68 @@ for( i=0; i<lgth2; i++ )
 
 		previousw[0] = initverticalw[i-1];
 
-		match_calc( n_dynamicmtx, currentw, *cpmx1pt, *cpmx2pt, i, lgth2, doublework, intwork, 0 );
+		rowfused = 0;
+		if( usefused )
+		{
+			/* Letters whose row score is exactly 0.0 (e.g. the gap letter, which scores 0 against
+			   everything) only add exact zeros to the match sums, so they are dropped; if at most 4
+			   letters remain, the fused kernel is used, padded with 0.0 * (weights >= 0) terms,
+			   which are exact no-ops as well (see match_calc_dense). */
+			double scu[DENSE_MAXU];
+			int u, nsel = 0;
+			dense_scores( n_dynamicmtx, *cpmx1pt, i, scu );
+			for( u=0; u<dense_nu; u++ )
+			{
+				if( scu[u] == 0.0 ) continue;
+				if( nsel == 4 ) { nsel = 5; break; }
+				fsel_s[nsel] = scu[u];
+				fsel_c[nsel] = (*cpmx2pt)[dense_u[u]];
+				nsel++;
+			}
+			if( nsel <= 4 )
+			{
+				for( ; nsel<4; nsel++ )
+				{
+					fsel_s[nsel] = 0.0;
+					fsel_c[nsel] = (*cpmx2pt)[0];
+				}
+				rowfused = 1;
+			}
+		}
+
+#ifdef PROGTIMING
+		if( !rowfused || pt_dpcheck() ) { double _mc0 = pt_now();
+#else
+		if( !rowfused ) {
+#endif
+#ifdef PROGTIMING
+		if( dense_nu >= 0 && pt_dpcheck() )
+		{
+			double t0 = pt_now(), t1, t2;
+			match_calc_dense( n_dynamicmtx, chk_match, *cpmx1pt, *cpmx2pt, i, lgth2 );
+			t1 = pt_now();
+			match_calc( n_dynamicmtx, currentw, *cpmx1pt, *cpmx2pt, i, lgth2, doublework, intwork, 0 );
+			t2 = pt_now();
+			pt_acc[16] += t1 - t0; pt_acc[17] += t2 - t1;
+			if( memcmp( chk_match, currentw, sizeof( double ) * lgth2 ) )
+			{
+				reporterr( "\nDPCHECK MISMATCH in match_calc_dense row %d (lgth2=%d, nu=%d)\n", i, lgth2, dense_nu );
+				exit( 1 );
+			}
+		}
+		else
+#endif
+		if( dense_nu >= 0 )
+			match_calc_dense( n_dynamicmtx, currentw, *cpmx1pt, *cpmx2pt, i, lgth2 );
+		else
+			match_calc( n_dynamicmtx, currentw, *cpmx1pt, *cpmx2pt, i, lgth2, doublework, intwork, 0 );
+#ifdef PROGTIMING
+		pt_acc[11] += pt_now() - _mc0;
+#endif
+		}
+#ifdef PROGTIMING
+		pt_acc[12] += (double)lgth2;
+#endif
 #if XXXXXXX
 fprintf( stderr, "\n" );
 fprintf( stderr, "i=%d\n", i );
@@ -1894,6 +2320,66 @@ fprintf( stderr, "\n" );
 			warpjpt = warpj + 1;
 		}
 
+
+		if( rowfused )
+		{
+#ifdef PROGTIMING
+			if( pt_dpcheck() ) // verification mode: fused row on shadow copies, then the original match_calc (above) + loop
+			{
+				double t0, t1;
+				double chk_mi = mi, chk_wm = wm; int chk_mpi = mpi;
+				memcpy( chk_m, m, sizeof( double ) * ( lastj ) );
+				memcpy( chk_mp, mp, sizeof( int ) * ( lastj ) );
+				memcpy( chk_cur, currentw, sizeof( double ) * ( lastj ) );
+				t0 = pt_now();
+				Adp_row_fused4( i, lgth2, chk_m, chk_mp, chk_cur, chk_ijp, previousw, gapfreq2pt, fgcp2, ogcp2,
+					fsel_c[0], fsel_c[1], fsel_c[2], fsel_c[3], fsel_s,
+					fgcp1va, ogcp1va, gf1va, gf1vapre, fpenalty_ex, &chk_mi, &chk_mpi, &chk_wm );
+				t1 = pt_now();
+				chk_cur[0] = currentw[0]; // column 0 is set outside the row kernels
+				pt_acc[13] += t1 - t0;
+				pt_chkrow_pending = 1;
+				pt_chk_mi = chk_mi; pt_chk_mpi = chk_mpi; pt_chk_wm = chk_wm; pt_chk_t = t1;
+				goto originalloop;
+			}
+			{ double _f0 = pt_now();
+#endif
+			Adp_row_fused4( i, lgth2, m, mp, currentw, ijp[i], previousw, gapfreq2pt, fgcp2, ogcp2,
+				fsel_c[0], fsel_c[1], fsel_c[2], fsel_c[3], fsel_s,
+				fgcp1va, ogcp1va, gf1va, gf1vapre, fpenalty_ex, &mi, &mpi, &wm );
+#ifdef PROGTIMING
+			pt_acc[23] += pt_now() - _f0; }
+#endif
+			lastverticalw[i] = currentw[lgth2-1];
+			continue;
+		}
+
+		if( !trywarp && FASTDP_ON )
+		{
+#ifdef PROGTIMING
+			if( pt_dpcheck() ) // verification mode: run the fast row on shadow copies, then the original loop, and compare
+			{
+				double t0 = pt_now(), t1;
+				double chk_mi = mi, chk_wm = wm; int chk_mpi = mpi;
+				memcpy( chk_m, m, sizeof( double ) * ( lastj ) );
+				memcpy( chk_mp, mp, sizeof( int ) * ( lastj ) );
+				memcpy( chk_cur, currentw, sizeof( double ) * ( lastj ) );
+				t0 = pt_now();
+				Adp_row_fast( i, lastj, dpcolw, dpcolij, dpcolg2, chk_m, chk_mp, chk_cur, chk_ijp, previousw, gapfreq2pt, fgcp2, ogcp2, fgcp1va, ogcp1va, gf1va, gf1vapre, fpenalty_ex, &chk_mi, &chk_mpi, &chk_wm );
+				t1 = pt_now();
+				pt_acc[13] += t1 - t0;
+				pt_chkrow_pending = 1;
+				pt_chk_mi = chk_mi; pt_chk_mpi = chk_mpi; pt_chk_wm = chk_wm; pt_chk_t = t1;
+				goto originalloop;
+			}
+#endif
+			Adp_row_fast( i, lastj, dpcolw, dpcolij, dpcolg2, m, mp, currentw, ijp[i], previousw, gapfreq2pt, fgcp2, ogcp2, fgcp1va, ogcp1va, gf1va, gf1vapre, fpenalty_ex, &mi, &mpi, &wm );
+			lastverticalw[i] = currentw[lgth2-1];
+			continue;
+		}
+#ifdef PROGTIMING
+		originalloop:
+#endif
 
 		for( j=1; j<lastj; j++ )
 		{
@@ -2012,6 +2498,20 @@ fprintf( stderr, "\n" );
 			gf2ptpre++;
 			gf2pt++;
 		}
+#ifdef PROGTIMING
+		if( pt_chkrow_pending )
+		{
+			pt_acc[14] += pt_now() - pt_chk_t;
+			pt_chkrow_pending = 0;
+			if( memcmp( chk_m, m, sizeof( double ) * lastj ) || memcmp( chk_mp, mp, sizeof( int ) * lastj ) || memcmp( chk_cur, currentw, sizeof( double ) * lastj )
+			 || memcmp( chk_ijp+1, ijp[i]+1, sizeof( int ) * ( lastj-1 ) ) || memcmp( &pt_chk_mi, &mi, sizeof( double ) ) || pt_chk_mpi != mpi || memcmp( &pt_chk_wm, &wm, sizeof( double ) ) )
+			{
+				reporterr( "\nDPCHECK MISMATCH in A__align row %d (lgth1=%d, lgth2=%d)\n", i, lgth1, lgth2 );
+				exit( 1 );
+			}
+			pt_acc[15] += 1.0; // rows checked
+		}
+#endif
 		lastverticalw[i] = currentw[lgth2-1];
 
 		if( trywarp )
@@ -2054,6 +2554,7 @@ fprintf( stderr, "\n" );
 	for( j=0; j<jcyc; j++ ) strcpy( mseq2[j], seq2[j] );
 	*/
 
+	PT_ADD(8);
 	gt1 = gt1bk = AllocateCharVec( lgth1+lgth2+1 );
 	gt2 = gt2bk = AllocateCharVec( lgth1+lgth2+1 );
 
@@ -2068,6 +2569,7 @@ fprintf( stderr, "\n" );
 		if( !tailgp ) wm = wmo;
 	}
 
+	PT_ADD(9);
 //	reporterr( "wm = %f\n", wm );
 
 #if 1
@@ -2205,6 +2707,7 @@ fprintf( stderr, "\n" );
 	previousicyc = icyc;
 	previouscall = calledbyfulltreebase;
 
+	PT_ADD(10);
 	free( mseq1 );
 	free( mseq2 );
 	FreeCharMtx( mseq );

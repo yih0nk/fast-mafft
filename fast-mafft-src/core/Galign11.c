@@ -1,4 +1,11 @@
 #include "mltaln.h"
+#include "progtiming.h"
+#ifdef PROGTIMING
+extern int pt_nofastdp;
+#define FASTDP_ON ( pt_nofastdp < 0 ? ( pt_nofastdp = ( getenv( "MAFFT_NOFASTDP" ) != NULL ) ) == 0 : !pt_nofastdp )
+#else
+#define FASTDP_ON 1
+#endif
 #include "dp.h"
 
 #define DEBUG 0
@@ -910,6 +917,133 @@ fprintf( stderr, "\n" );
 #endif
 	return( wm );
 }
+/* work/prog: fast evaluation of one DP row of G__align11 (trywarp == 0).  Same cells,
+   expressions and comparison order as the original loop; the column recurrence runs in its
+   own vectorizable pass, the row recurrence stays in registers, selects are branch-free. */
+static void Gdp_row_fast( int i, int lastj, int lgth2, double * restrict colw, int * restrict colij, double * restrict colg2,
+	double * restrict mloc, int * restrict mploc, double * restrict curw, int * restrict ijpi,
+	const double * restrict prew, double fpenalty, double fpenalty_ex, double fpenalty_ex_i,
+	double *mip, int *mpip, double *wmp )
+{
+	int j, ijv;
+	double mil = *mip;
+	int mpil = *mpip;
+	double wmv = *wmp;
+
+	for( j=1; j<lastj; j++ )
+	{
+		double mj = mloc[j];
+		int mpj = mploc[j];
+		double pw = prew[j-1];
+		int take = ( pw >= mj );
+		colw[j] = mj + fpenalty;
+		colij[j] = i - mpj;
+		mloc[j] = take ? pw : mj;
+		mploc[j] = take ? i-1 : mpj;
+	}
+#if USE_PENALTY_EX
+	for( j=1; j<lastj && j<lgth2; j++ ) // 2018/May/11: not for j == lgth2
+		mloc[j] += fpenalty_ex;
+	if( fpenalty_ex_i == 0.0 && lastj > 1 )
+	{
+		/* See Adp_row_fast (Salignmm.c): with a +0.0 extension penalty, mi + 0.0 == mi bitwise once
+		   mi is not -0.0 (true after column 1), so the add moves off the serial chain into a
+		   vectorized pass over the candidates.  Column 1 is done exactly as before. */
+		double * restrict pwc = colg2;
+		double gg, pw;
+		for( j=1; j<lastj; j++ )
+			pwc[j] = prew[j-1] + fpenalty_ex_i;
+		j = 1;
+		pw = prew[j-1];
+		wmv = pw;
+		ijv = 0;
+		gg = mil + fpenalty;
+		if( gg > wmv ) { wmv = gg; ijv = -( j - mpil ); }
+		if( pw >= mil ) { mil = pw; mpil = j-1; }
+		mil += fpenalty_ex_i;
+		{
+			double cw = colw[j];
+			int cij = colij[j];
+			int take = ( cw > wmv );
+			ijv = take ? cij : ijv;
+			wmv = take ? cw : wmv;
+		}
+		curw[j] += wmv;
+		ijpi[j] = ijv;
+		for( j=2; j<lastj; j++ )
+		{
+			double pc = pwc[j];
+			int take2;
+			wmv = prew[j-1];
+			ijv = 0;
+			gg = mil + fpenalty;
+			if( gg > wmv )
+			{
+				wmv = gg;
+				ijv = -( j - mpil );
+			}
+			take2 = ( pc >= mil );
+			mil = take2 ? pc : mil;
+			mpil = take2 ? j-1 : mpil;
+			{
+				double cw = colw[j];
+				int cij = colij[j];
+				int take = ( cw > wmv );
+				ijv = take ? cij : ijv;
+				wmv = take ? cw : wmv;
+			}
+			curw[j] += wmv;
+			ijpi[j] = ijv;
+		}
+		*mip = mil;
+		*mpip = mpil;
+		*wmp = wmv;
+		return;
+	}
+#endif
+	for( j=1; j<lastj; j++ )
+	{
+		double gg, pw = prew[j-1];
+		wmv = pw;
+		ijv = 0;
+		gg = mil + fpenalty;
+		if( gg > wmv )
+		{
+			wmv = gg;
+			ijv = -( j - mpil );
+		}
+		if( pw >= mil )
+		{
+			mil = pw;
+			mpil = j-1;
+		}
+#if USE_PENALTY_EX
+		mil += fpenalty_ex_i;
+#endif
+		{
+			double cw = colw[j];
+			int cij = colij[j];
+			int take = ( cw > wmv );
+			ijv = take ? cij : ijv;
+			wmv = take ? cw : wmv;
+		}
+		curw[j] += wmv;
+		ijpi[j] = ijv;
+	}
+	*mip = mil;
+	*mpip = mpil;
+	*wmp = wmv;
+}
+
+#ifdef PROGTIMING
+static TLS double *g_chk_m = NULL, *g_chk_cur = NULL;
+static TLS int *g_chk_mp = NULL, *g_chk_ijp = NULL;
+static TLS int g_chk_pending = 0, g_chk_mpi;
+static TLS double g_chk_mi, g_chk_wm, g_chk_t;
+static int g_dpcheck_v = -1;
+static int g_dpcheck( void ) { if( g_dpcheck_v < 0 ) g_dpcheck_v = ( getenv( "MAFFT_DPCHECK" ) != NULL ); return( g_dpcheck_v ); }
+#endif
+
 double G__align11( double **n_dynamicmtx, char **seq1, char **seq2, int alloclen, int headgp, int tailgp )
 {
 
@@ -952,6 +1086,10 @@ double G__align11( double **n_dynamicmtx, char **seq1, char **seq2, int alloclen
 	static TLS double **doublework = NULL;
 	static TLS int orlgth1 = 0, orlgth2 = 0;
 	static TLS double **amino_dynamicmtx = NULL; // ??
+	static TLS double *dpcolw = NULL; // fast DP path (work/prog)
+	static TLS int *dpcolij = NULL;
+	static TLS double *dpcolg2 = NULL;
+	static TLS int dpcolalloc = 0;
 
 	int *warpis = NULL;
 	int *warpjs = NULL;
@@ -996,6 +1134,13 @@ double G__align11( double **n_dynamicmtx, char **seq1, char **seq2, int alloclen
 		}
 		orlgth1 = 0;
 		orlgth2 = 0;
+		if( dpcolalloc )
+		{
+			free( dpcolw ); dpcolw = NULL;
+			free( dpcolij ); dpcolij = NULL;
+			free( dpcolg2 ); dpcolg2 = NULL;
+			dpcolalloc = 0;
+		}
 		return( 0.0 );
 	}
 
@@ -1241,6 +1386,24 @@ for( i=0; i<lgth2+1; i++ )
 fprintf( stderr, "\n" );
 #endif
 
+	if( !trywarp && dpcolalloc < lgth2+2 )
+	{
+		if( dpcolalloc ) { free( dpcolw ); free( dpcolij ); free( dpcolg2 ); }
+		dpcolalloc = lgth2 + 2 + 100;
+		dpcolw = AllocateFloatVec( dpcolalloc );
+		dpcolij = AllocateIntVec( dpcolalloc );
+		dpcolg2 = AllocateFloatVec( dpcolalloc );
+	}
+#ifdef PROGTIMING
+	if( g_dpcheck() )
+	{
+		g_chk_m = realloc( g_chk_m, sizeof( double ) * ( lgth2+2 ) );
+		g_chk_mp = realloc( g_chk_mp, sizeof( int ) * ( lgth2+2 ) );
+		g_chk_cur = realloc( g_chk_cur, sizeof( double ) * ( lgth2+2 ) );
+		g_chk_ijp = realloc( g_chk_ijp, sizeof( int ) * ( lgth2+2 ) );
+	}
+#endif
+
 	for( i=1; i<lasti; i++ )
 	{
 		wtmp = previousw; 
@@ -1290,6 +1453,32 @@ fprintf( stderr, "\n" );
 
 		if( i < lgth1 ) fpenalty_ex_i = fpenalty_ex;
 		else fpenalty_ex_i = 0.0; // 2018/May/11
+
+		if( !trywarp && FASTDP_ON )
+		{
+#ifdef PROGTIMING
+			if( g_dpcheck() )
+			{
+				double t0, t1;
+				g_chk_mi = mi; g_chk_wm = wm; g_chk_mpi = mpi;
+				memcpy( g_chk_m, m, sizeof( double ) * lastj );
+				memcpy( g_chk_mp, mp, sizeof( int ) * lastj );
+				memcpy( g_chk_cur, currentw, sizeof( double ) * lastj );
+				t0 = pt_now();
+				Gdp_row_fast( i, lastj, lgth2, dpcolw, dpcolij, dpcolg2, g_chk_m, g_chk_mp, g_chk_cur, g_chk_ijp, previousw, fpenalty, fpenalty_ex, fpenalty_ex_i, &g_chk_mi, &g_chk_mpi, &g_chk_wm );
+				t1 = pt_now();
+				pt_acc[18] += t1 - t0;
+				g_chk_pending = 1; g_chk_t = t1;
+				goto originalloop;
+			}
+#endif
+			Gdp_row_fast( i, lastj, lgth2, dpcolw, dpcolij, dpcolg2, m, mp, currentw, ijp[i], previousw, fpenalty, fpenalty_ex, fpenalty_ex_i, &mi, &mpi, &wm );
+			lastverticalw[i] = currentw[lgth2-1]; // lgth2==0 no toki error
+			continue;
+		}
+#ifdef PROGTIMING
+		originalloop:
+#endif
 
 		for( j=1; j<lastj; j++ )
 		{
@@ -1422,6 +1611,20 @@ fprintf( stderr, "\n" );
 			prept++;
 			mpjpt++;
 		}
+#ifdef PROGTIMING
+		if( g_chk_pending )
+		{
+			pt_acc[19] += pt_now() - g_chk_t;
+			g_chk_pending = 0;
+			if( memcmp( g_chk_m, m, sizeof( double ) * lastj ) || memcmp( g_chk_mp, mp, sizeof( int ) * lastj ) || memcmp( g_chk_cur, currentw, sizeof( double ) * lastj )
+			 || memcmp( g_chk_ijp+1, ijp[i]+1, sizeof( int ) * ( lastj-1 ) ) || memcmp( &g_chk_mi, &mi, sizeof( double ) ) || g_chk_mpi != mpi || memcmp( &g_chk_wm, &wm, sizeof( double ) ) )
+			{
+				reporterr( "\nDPCHECK MISMATCH in G__align11 row %d (lgth1=%d, lgth2=%d)\n", i, lgth1, lgth2 );
+				exit( 1 );
+			}
+			pt_acc[20] += 1.0;
+		}
+#endif
 		lastverticalw[i] = currentw[lgth2-1]; // lgth2==0 no toki error
 
 		if( trywarp )

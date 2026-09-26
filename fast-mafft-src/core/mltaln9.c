@@ -15133,20 +15133,20 @@ void gapcountadd( double *freq, char **seq, int nseq, double *eff, int lgth )
 void gapcountf( double *freq, char **seq, int nseq, double *eff, int lgth )
 {
 	int i, j;
-	double fr;
 
 //	for( i=0; i<lgth; i++ ) freq[i] = 0.0;
 //	return;
 
-	for( i=0; i<lgth; i++ )
+	/* work/prog: row-major traversal (one sequence at a time) instead of column-major.
+	   Each freq[i] still receives 0.0 + eff[j] for the gapped sequences j in ascending j,
+	   so the sums are bit-identical; the strided per-column walk over all rows is gone. */
+	for( i=0; i<lgth; i++ ) freq[i] = 0.0;
+	for( j=0; j<nseq; j++ )
 	{
-		fr = 0.0;
-		for( j=0; j<nseq; j++ )
-		{
-			if( seq[j][i] == '-' ) fr += eff[j];
-		}
-		freq[i] = fr;
-//		reporterr(       "in gapcountf, freq[%d] = %f\n", i, freq[i] );
+		const char *sp = seq[j];
+		const double e = eff[j];
+		for( i=0; i<lgth; i++ )
+			if( sp[i] == '-' ) freq[i] += e;
 	}
 //	reporterr(       "\n" );
 	return;

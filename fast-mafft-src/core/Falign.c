@@ -1,4 +1,8 @@
 #include "mltaln.h"
+#include "progtiming.h"
+#ifdef PROGTIMING
+TLS double pt_acc[PT_NACC];
+#endif
 
 #if 0
 static FILE *fftfp;
@@ -809,12 +813,14 @@ double Falign( int **whichmtx, double ***scoringmatrices, double **n_dynamicmtx,
 	int count, count0;
 	int len1, len2;
 	int totallen;
+	int off1, off2; // work/prog: current length of the rows of result1 / result2
 	double totalscore;
 	double dumdb = 0.0;
 	int headgp, tailgp;
 	static TLS double *gstart = NULL;
 	static TLS double *gend = NULL;
 	static TLS double **codonscoremtx;
+	PT_DECL;
 
 
 	if( seq1 == NULL )
@@ -866,6 +872,7 @@ double Falign( int **whichmtx, double ***scoringmatrices, double **n_dynamicmtx,
 	}
 
 
+	PT_START();
 	len1 = strlen( seq1[0] );
 	len2 = strlen( seq2[0] );
 	nlentmp = MAX( len1, len2 );
@@ -1094,6 +1101,7 @@ double Falign( int **whichmtx, double ***scoringmatrices, double **n_dynamicmtx,
 
 	for( j=0; j<clus1; j++ ) strcpy( tmpseq1[j], seq1[j] );
 	for( j=0; j<clus2; j++ ) strcpy( tmpseq2[j], seq2[j] );
+	PT_ADD(0);
 
 #if 0
 fftfp = fopen( "input_of_Falign", "w" );
@@ -1272,6 +1280,7 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 
 
 		getKouho( kouho, NKOUHO, soukan, nlen );
+		PT_ADD(1);
 
 #if 0
 		for( i=0; i<NKOUHO; i++ )
@@ -1321,6 +1330,9 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 
 //		fprintf( stderr, "lag = %d\n", lag );
 		tmpint = alignableReagion( clus1, clus2, tmpptr1, tmpptr2, eff1, eff2, segment+count );
+#ifdef PROGTIMING
+		pt_acc[27] += 1.0;
+#endif
 
 //		if( lag == -50 ) exit( 1 );
 		
@@ -1509,7 +1521,12 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 	fprintf( trap_g, "%d  %d forg\n", MIN( clus1, clus2 ), count-1 );
 #endif
 
+#ifdef PROGTIMING
+	pt_acc[28] += 1.0;
+#endif
+	PT_ADD(2);
 	totallen = 0;
+	off1 = off2 = 0;
 	for( j=0; j<clus1; j++ ) result1[j][0] = 0;
 	for( j=0; j<clus2; j++ ) result2[j][0] = 0;
 	totalscore = 0.0;
@@ -1617,6 +1634,7 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 		if( kobetsubunkatsu && fftkeika ) commongappick( clus2, tmpres2 ); //dvtditr に呼ばれたとき fftkeika=1
 //		if( kobetsubunkatsu ) commongappick( clus2, tmpres2 );
 
+		PT_ADD(3);
 		if( constraint )
 		{
 			fprintf( stderr, "Not supported\n" );
@@ -1735,14 +1753,25 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 		}
 #endif
 
+		PT_ADD(4);
 		nlen = strlen( tmpres1[0] );
 		if( totallen + nlen > alloclen )
 		{
 			fprintf( stderr, "totallen=%d +  nlen=%d > alloclen = %d\n", totallen, nlen, alloclen );
 			ErrorExit( "LENGTH OVER in Falign\n " );
 		}
-		for( j=0; j<clus1; j++ ) strcat( result1[j], tmpres1[j] );
-		for( j=0; j<clus2; j++ ) strcat( result2[j], tmpres2[j] );
+		/* work/prog: append at the known end of each row instead of strcat(), which rescanned
+		   the whole partial result of every row for every segment (quadratic in the number of
+		   segments).  Within a group all rows are aligned, hence equally long, so the bytes are
+		   the same as with strcat(). */
+		{
+			int add1 = strlen( tmpres1[0] ), add2 = strlen( tmpres2[0] );
+			for( j=0; j<clus1; j++ ) memcpy( result1[j]+off1, tmpres1[j], add1+1 );
+			for( j=0; j<clus2; j++ ) memcpy( result2[j]+off2, tmpres2[j], add2+1 );
+			off1 += add1;
+			off2 += add2;
+		}
+		PT_ADD(5);
 		totallen += nlen;
 #if 0
 		fprintf( stderr, "$#####$$$$ i=%d", i );
@@ -1796,6 +1825,7 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 	FreeCharMtx( rndseq2 );
 #endif
 
+	PT_ADD(6);
 	return( totalscore );
 }
 

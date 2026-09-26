@@ -1,4 +1,31 @@
 #include "mltaln.h"
+#include "progtiming.h"
+#ifdef PROGTIMING
+typedef struct { int l, thread, clus1, clus2, len1, len2, c0, c1; double t[8]; double acc[PT_NACC]; } ptrec_t;
+static ptrec_t *ptlog = NULL;
+static double pt_base = 0.0;
+static void ptlog_write( int njob, int pass )
+{
+	char *fn = getenv( "MAFFT_PROGLOG" );
+	FILE *fp;
+	int i, k;
+	if( !fn || !ptlog ) return;
+	fp = fopen( fn, "a" );
+	if( !fp ) return;
+	for( i=0; i<njob-1; i++ )
+	{
+		ptrec_t *r = ptlog+i;
+		fprintf( fp, "%d %d %d %d %d %d %d %d %d", pass, r->l, r->thread, r->c0, r->c1, r->clus1, r->clus2, r->len1, r->len2 );
+		for( k=0; k<8; k++ ) fprintf( fp, " %.6f", r->t[k] );
+		for( k=0; k<PT_NACC; k++ ) fprintf( fp, " %.6f", r->acc[k] );
+		fprintf( fp, "\n" );
+	}
+	fclose( fp );
+}
+#define PTT(k) do { if( ptlog ) ptlog[l].t[k] = pt_now() - pt_base; } while( 0 )
+#else
+#define PTT(k)
+#endif
 
 
 #define REPORTCOSTS 0
@@ -132,6 +159,11 @@ typedef struct _treebasethread_arg
 	int **anchindex;
 	pthread_mutex_t *mutex;
 	pthread_cond_t *treecond;
+	// work/prog: ready-queue scheduling (see tbsched_* below)
+	struct _tbsched *sched;
+	// work/prog: guards the rows of aseq against ReallocateCharMtx (write lock) while member rows
+	// are copied in and out (read lock), so those copies no longer hold the global mutex
+	pthread_rwlock_t *aseqlock;
 } treebasethread_arg_t;
 
 typedef struct _distancematrixthread_arg
@@ -2174,6 +2206,101 @@ static void	pickpairanch( ExtAnch **pairanch, ExtAnch *extanch, int **anchindex,
 }
 
 #ifdef enablemultithread
+/* work/prog: ready-queue scheduling of the guide-tree merges.
+   The original loop hands out merge steps strictly in index order and a thread that takes step l
+   blocks until both children of l are done, so independent subtrees overlap only within a window
+   of nthreadtb consecutive steps.  Here a step is queued as soon as both children are done, and the
+   ready step with the largest estimated remaining critical path (sum over the step and its
+   ancestors of size^0.75, size = number of sequences under the node) runs first.  The alignment
+   computed at each step depends only on its two children's results, so the output is unchanged. */
+typedef struct _tbsched
+{
+	int *heap;     // ready steps, max-heap on prio (ties: smaller index first)
+	int nheap;
+	int ntaken;    // steps handed out so far
+	int *parent;   // parent step of each step, -1 for the root
+	double *prio;
+	int inorder;   // 1: original in-order dispatch (A/B testing only)
+} tbsched_t;
+
+static int tbsched_before( tbsched_t *sc, int a, int b )
+{
+	if( sc->prio[a] != sc->prio[b] ) return( sc->prio[a] > sc->prio[b] );
+	return( a < b );
+}
+
+static void tbsched_push( tbsched_t *sc, int l )
+{
+	int k = sc->nheap++, up;
+	while( k > 0 )
+	{
+		up = ( k - 1 ) / 2;
+		if( !tbsched_before( sc, l, sc->heap[up] ) ) break;
+		sc->heap[k] = sc->heap[up];
+		k = up;
+	}
+	sc->heap[k] = l;
+}
+
+static int tbsched_pop( tbsched_t *sc )
+{
+	int top = sc->heap[0], last = sc->heap[--sc->nheap], k = 0, c;
+	while( ( c = 2 * k + 1 ) < sc->nheap )
+	{
+		if( c + 1 < sc->nheap && tbsched_before( sc, sc->heap[c+1], sc->heap[c] ) ) c++;
+		if( !tbsched_before( sc, sc->heap[c], last ) ) break;
+		sc->heap[k] = sc->heap[c];
+		k = c;
+	}
+	if( sc->nheap ) sc->heap[k] = last;
+	return( top );
+}
+
+static int tbsched_isready( Treedep *dep, int l )
+{
+	return( ( dep[l].child0 == -1 || dep[dep[l].child0].done ) && ( dep[l].child1 == -1 || dep[dep[l].child1].done ) );
+}
+
+static void tbsched_init( tbsched_t *sc, int njob, Treedep *dep, int inorder )
+{
+	int l, nstep = njob - 1;
+	double *size = calloc( nstep, sizeof( double ) );
+	sc->heap = calloc( nstep, sizeof( int ) );
+	sc->parent = calloc( nstep, sizeof( int ) );
+	sc->prio = calloc( nstep, sizeof( double ) );
+	sc->nheap = 0;
+	sc->ntaken = 0;
+	sc->inorder = inorder;
+#ifdef PROGTIMING
+	if( getenv( "MAFFT_INORDER" ) ) sc->inorder = 1;
+#endif
+	for( l=0; l<nstep; l++ ) sc->parent[l] = -1;
+	for( l=0; l<nstep; l++ ) // children always have smaller indices
+	{
+		size[l] = ( dep[l].child0 == -1 ? 1.0 : size[dep[l].child0] ) + ( dep[l].child1 == -1 ? 1.0 : size[dep[l].child1] );
+		if( dep[l].child0 != -1 ) sc->parent[dep[l].child0] = l;
+		if( dep[l].child1 != -1 ) sc->parent[dep[l].child1] = l;
+	}
+	for( l=nstep-1; l>=0; l-- ) // parents always have larger indices
+		sc->prio[l] = pow( size[l], 0.75 ) + ( sc->parent[l] == -1 ? 0.0 : sc->prio[sc->parent[l]] );
+	for( l=0; l<nstep; l++ )
+		if( tbsched_isready( dep, l ) ) tbsched_push( sc, l );
+	free( size );
+}
+
+static void tbsched_free( tbsched_t *sc )
+{
+	free( sc->heap );
+	free( sc->parent );
+	free( sc->prio );
+}
+
+static void tbsched_done( tbsched_t *sc, Treedep *dep, int l ) // call with the mutex held, after dep[l].done = 1
+{
+	int p = sc->parent[l];
+	if( p != -1 && tbsched_isready( dep, p ) ) tbsched_push( sc, p );
+}
+
 static void *treebasethread( void *arg )
 {
 	treebasethread_arg_t *targ = (treebasethread_arg_t *)arg;
@@ -2217,6 +2344,7 @@ static void *treebasethread( void *arg )
 	double ***cpmxchild0, ***cpmxchild1;
 	double orieff1, orieff2;
 	ExtAnch *pairanch = NULL;
+	int localcopylen = 0;
 #if SKIP
 	int **skiptable1 = NULL, **skiptable2 = NULL;
 #endif
@@ -2258,7 +2386,22 @@ static void *treebasethread( void *arg )
 	while( 1 )
 	{
 		pthread_mutex_lock( targ->mutex );
-		l = *jobpospt;
+		if( targ->sched && !targ->sched->inorder )
+		{
+			tbsched_t *sc = targ->sched;
+			while( sc->nheap == 0 && sc->ntaken < njob-1 )
+				pthread_cond_wait( targ->treecond, targ->mutex );
+			if( sc->ntaken == njob-1 )
+				l = njob-1; // nothing left: exit below
+			else
+			{
+				l = tbsched_pop( sc );
+				sc->ntaken++;
+				if( sc->ntaken == njob-1 ) pthread_cond_broadcast( targ->treecond ); // wake idle threads so they can exit
+			}
+		}
+		else
+			l = *jobpospt;
 		if( l == njob-1 )
 		{
 			pthread_mutex_unlock( targ->mutex );
@@ -2282,7 +2425,8 @@ static void *treebasethread( void *arg )
 			free( localmem );
 			return( NULL );
 		}
-		*jobpospt = l+1;
+		if( !targ->sched || targ->sched->inorder ) *jobpospt = l+1;
+		PTT(0);
 
 //		reporterr( "l=%d, child0=%d, child1=%d\n", l, dep[l].child0, dep[l].child1 );
 
@@ -2304,6 +2448,7 @@ static void *treebasethread( void *arg )
 		while( *nrunpt >= nthreadtb ) // tabun iranai
 			pthread_cond_wait( targ->treecond, targ->mutex ); // tabun iranai
 		(*nrunpt)++;
+		PTT(1);
 
 		m1 = topol[l][0][0];
 		m2 = topol[l][1][0];
@@ -2352,6 +2497,7 @@ static void *treebasethread( void *arg )
 		{
 //			reporterr(       "SKIP!\n" );
 			dep[l].done = 1;
+			if( targ->sched ) tbsched_done( targ->sched, dep, l );
 			(*nrunpt)--;
 			pthread_cond_broadcast( targ->treecond );
 //			free( topol[l][0] ); topol[l][0] = NULL;
@@ -2382,24 +2528,13 @@ static void *treebasethread( void *arg )
 		if( *alloclen <= len1 + len2 )
 		{
 			reporterr(       "\nReallocating.." );
+			pthread_rwlock_wrlock( targ->aseqlock ); // wait until no thread is copying rows of aseq
 			*alloclen = ( len1 + len2 ) + 1000;
 			ReallocateCharMtx( aseq, njob, *alloclen + 10  ); 
+			pthread_rwlock_unlock( targ->aseqlock );
 			reporterr(       "done. *alloclen = %d\n", *alloclen );
 		}
-
-
-		for( i=0; (j=localmem[0][i])!=-1; i++ )
-		{
-			localcopy[j] = calloc( *alloclen, sizeof( char ) );
-			strcpy( localcopy[j], aseq[j] );
-//			localcopy[j] = aseq[j];	
-		}
-		for( i=0; (j=localmem[1][i])!=-1; i++ )
-		{
-			localcopy[j] = calloc( *alloclen, sizeof( char ) );
-			strcpy( localcopy[j], aseq[j] );
-//			localcopy[j] = aseq[j];	
-		}
+		localcopylen = *alloclen; // work/prog: the member rows are copied after the mutex is released
 
 		if( !nevermemsave && ( alg != 'M' && ( len1 > 30000 || len2 > 30000  ) ) )
 		{
@@ -2418,7 +2553,22 @@ static void *treebasethread( void *arg )
 
 		pthread_mutex_unlock( targ->mutex );
 
+		/* work/prog: copy the member rows outside the global mutex.  The rows belong to finished
+		   children, so nobody writes them now; the read lock only excludes a concurrent
+		   ReallocateCharMtx() by another thread.  Buffer size as in the original (alloclen at the
+		   time of the length check, > len1+len2). */
+		for( i=0; (j=localmem[0][i])!=-1; i++ ) localcopy[j] = calloc( localcopylen, sizeof( char ) );
+		for( i=0; (j=localmem[1][i])!=-1; i++ ) localcopy[j] = calloc( localcopylen, sizeof( char ) );
+		pthread_rwlock_rdlock( targ->aseqlock );
+		for( i=0; (j=localmem[0][i])!=-1; i++ ) strcpy( localcopy[j], aseq[j] );
+		for( i=0; (j=localmem[1][i])!=-1; i++ ) strcpy( localcopy[j], aseq[j] );
+		pthread_rwlock_unlock( targ->aseqlock );
+
 #if 1 // CHUUI@@@@
+#ifdef PROGTIMING
+		PTT(2);
+		if( ptlog ) { int k; for( k=0; k<PT_NACC; k++ ) pt_acc[k] = 0.0; }
+#endif
 		clus1 = fastconjuction_noname( localmem[0], localcopy, mseq1, effarr1, effarr, indication1, 0.0, &orieff1 );
 		clus2 = fastconjuction_noname( localmem[1], localcopy, mseq2, effarr2, effarr, indication2, 0.0, &orieff2 );
 #else
@@ -2470,6 +2620,7 @@ static void *treebasethread( void *arg )
 #endif
 
 
+		PTT(3);
 //		fprintf( trap_g, "\nSTEP-%d\n", l );
 //		fprintf( trap_g, "group1 = %s\n", indication1 );
 //		fprintf( trap_g, "group2 = %s\n", indication2 );
@@ -2579,6 +2730,10 @@ static void *treebasethread( void *arg )
 					ErrorExit( "ERROR IN SOURCE FILE" );
 			}
 		}
+#ifdef PROGTIMING
+		PTT(4);
+		if( ptlog ) { int k; for( k=0; k<PT_NACC; k++ ) ptlog[l].acc[k] = pt_acc[k]; ptlog[l].l = l; ptlog[l].thread = thread_no; ptlog[l].clus1 = clus1; ptlog[l].clus2 = clus2; ptlog[l].len1 = len1; ptlog[l].len2 = len2; ptlog[l].c0 = dep[l].child0; ptlog[l].c1 = dep[l].child1; }
+#endif
 #if SCOREOUT
 		reporterr(       "score = %10.2f\n", pscore );
 #endif
@@ -2643,20 +2798,27 @@ static void *treebasethread( void *arg )
 
 
 
-		pthread_mutex_lock( targ->mutex );
-		dep[l].done = 1;
-		(*nrunpt)--;
-		pthread_cond_broadcast( targ->treecond );
-
+		/* work/prog: write the aligned rows back before the step is marked done (the parent reads
+		   them only after that), under the aseq read lock instead of the global mutex. */
+		pthread_rwlock_rdlock( targ->aseqlock );
 		for( i=0; (j=localmem[0][i])!=-1; i++ )
 			strcpy( aseq[j], localcopy[j] );
 		for( i=0; (j=localmem[1][i])!=-1; i++ )
 			strcpy( aseq[j], localcopy[j] );
+		pthread_rwlock_unlock( targ->aseqlock );
+
+		pthread_mutex_lock( targ->mutex );
+		dep[l].done = 1;
+		if( targ->sched ) tbsched_done( targ->sched, dep, l );
+		PTT(5);
+		(*nrunpt)--;
+		pthread_cond_broadcast( targ->treecond );
 
 //		reporterr( "at step %d\n", l );
 //		use_getrusage();
 
 		pthread_mutex_unlock( targ->mutex );
+		PTT(6);
 
 
 
@@ -2682,6 +2844,7 @@ static void *treebasethread( void *arg )
 
 //		reporterr(       "\n" );
 
+		PTT(7);
 		free( localmem[0] );
 		free( localmem[1] );
 	}
@@ -4959,6 +5122,8 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			int *fftlog;
 			int nrun;
 			int nthread_yoyu;
+			tbsched_t tbsched;
+			pthread_rwlock_t aseqlock;
 	
 			nthread_yoyu = nthreadtb * 1;
 			nrun = 0;
@@ -4968,9 +5133,17 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			handle = calloc( nthread_yoyu, sizeof( pthread_t ) ); 
 			pthread_mutex_init( &mutex, NULL );
 			pthread_cond_init( &treecond, NULL );
+			pthread_rwlock_init( &aseqlock, NULL );
 	
 			for( i=0; i<njob; i++ ) dep[i].done = 0; 
 			for( i=0; i<njob; i++ ) fftlog[i] = 1; 
+			/* The only order-dependent state in the progressive pass is the one-way switch to the
+			   memsave algorithm (alg = 'M') at the first step whose profile exceeds 30000 columns.
+			   When that can plausibly happen, keep the original in-order dispatch. */
+			tbsched_init( &tbsched, njob, dep, ( !nevermemsave && alg != 'M' && nlenmax > 3000 ) );
+#ifdef PROGTIMING
+			if( getenv( "MAFFT_PROGLOG" ) ) { ptlog = calloc( njob, sizeof( ptrec_t ) ); pt_base = pt_now(); }
+#endif
 	
 			for( i=0; i<nthread_yoyu; i++ )
 			{
@@ -5007,6 +5180,8 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 #endif
 				targ[i].mutex = &mutex;
 				targ[i].treecond = &treecond;
+				targ[i].sched = &tbsched;
+				targ[i].aseqlock = &aseqlock;
 	
 				pthread_create( handle+i, NULL, treebasethread, (void *)(targ+i) );
 			}
@@ -5015,8 +5190,14 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			{
 				pthread_join( handle[i], NULL );
 			}
+#ifdef PROGTIMING
+			ptlog_write( njob, iguidetree );
+			free( ptlog ); ptlog = NULL;
+#endif
 			pthread_mutex_destroy( &mutex );
 			pthread_cond_destroy( &treecond );
+			tbsched_free( &tbsched );
+			pthread_rwlock_destroy( &aseqlock );
 			free( handle );
 			free( targ );
 			free( fftlog );
