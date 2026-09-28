@@ -1129,9 +1129,26 @@ function removetmpfile() { # for MPI
 			fi
 
 
-			cat "$1"              | tr "\r" "\n" > "$TMPFILE/infile"
+# fast-mafft (overhead lever): tr copies only about 30-50 MB/s. For a regular file whose bytes are
+# all ASCII, crtolf writes what tr "\r" "\n" writes in any locale (CR -> LF, all else unchanged).
+# It exits non-zero on any other input (a byte >= 0x80, an I/O error), and then the original
+# pipeline runs and rewrites infile. stdin, pipes and Windows always take the original pipeline.
+			if [ "$windows" = "no" ] && [ "$1" != "-" ] && [ -f "$1" ] && [ -x "$prefix/crtolf" ] && "$prefix/crtolf" "$1" > "$TMPFILE/infile" 2>/dev/null; then
+				:
+			else
+				cat "$1"              | tr "\r" "\n" > "$TMPFILE/infile"
+			fi
 			echo ""                             >> "$TMPFILE/infile"
-			cat "$addfile"        | tr "\r" "\n" | grep -v "^$" > "$TMPFILE/_addfile"
+# fast-mafft: `cat f | tr "\r" "\n" | grep -v "^$" > out` gives an empty file when f is /dev/null
+# (the default for all of the files below), so skip the three processes in that case.
+			function mafftfiltercopy() {
+				if [ "$1" = "/dev/null" ]; then
+					: > "$2"
+				else
+					cat "$1" | tr "\r" "\n" | grep -v "^$" > "$2"
+				fi
+			}
+			mafftfiltercopy "$addfile" "$TMPFILE/_addfile"
 
 			if [ $dofilter -eq 1 ]; then
 #				mv "$TMPFILE/infile" "$TMPFILE/_tofilter"
@@ -1141,16 +1158,16 @@ function removetmpfile() { # for MPI
 			fi
 			cat "$TMPFILE/_addfile" >> "$TMPFILE/infile"
 
-			cat "$scorematrix"    | tr "\r" "\n" | grep -v "^$" > "$TMPFILE/_aamtx"
-			cat "$mergetable"     | tr "\r" "\n" | grep -v "^$" > "$TMPFILE/_subalignmentstable"
-			cat "$treeinfile"     | tr "\r" "\n" | grep -v "^$" > "$TMPFILE/_guidetree"
-			cat "$codonposfile"   | tr "\r" "\n" | grep -v "^$" > "$TMPFILE/_codonpos"
-			cat "$codonscorefile" | tr "\r" "\n" | grep -v "^$" > "$TMPFILE/_codonscore"
-			cat "$seedtablefile"  | tr "\r" "\n" | grep -v "^$" > "$TMPFILE/_seedtablefile"
-			cat "$laraparams"     | tr "\r" "\n" | grep -v "^$" > "$TMPFILE/_lara.params"
-			cat "$pdblist"        | tr "\r" "\n" | grep -v "^$" > "$TMPFILE/pdblist"
-			cat "$ownlist"        | tr "\r" "\n" | grep -v "^$" > "$TMPFILE/ownlist"
-			cat "$anchorfile"     | tr "\r" "\n" | grep -v "^$" > "$TMPFILE/_externalanchors"
+			mafftfiltercopy "$scorematrix" "$TMPFILE/_aamtx"
+			mafftfiltercopy "$mergetable" "$TMPFILE/_subalignmentstable"
+			mafftfiltercopy "$treeinfile" "$TMPFILE/_guidetree"
+			mafftfiltercopy "$codonposfile" "$TMPFILE/_codonpos"
+			mafftfiltercopy "$codonscorefile" "$TMPFILE/_codonscore"
+			mafftfiltercopy "$seedtablefile" "$TMPFILE/_seedtablefile"
+			mafftfiltercopy "$laraparams" "$TMPFILE/_lara.params"
+			mafftfiltercopy "$pdblist" "$TMPFILE/pdblist"
+			mafftfiltercopy "$ownlist" "$TMPFILE/ownlist"
+			mafftfiltercopy "$anchorfile" "$TMPFILE/_externalanchors"
 
 			SAVEIFS=$IFS
 # Fixed a bug: 'n' was misinterpreted as delimiter, 2020/Jun/19
@@ -1167,6 +1184,7 @@ $laraparams
 $pdblist
 $ownlist"
 			for f in $filelist; do
+				[ "$f" = "/dev/null" ] && continue # fast-mafft: file(1) never reports UTF-16/32 for /dev/null
 				file "$f" 2>/dev/null | grep -e 'UTF-16' -e 'UTF-32' >& /dev/null && printf "$f: UTF-16 or UTF-32? Convert this file to ASCII\n\n" 1>&2 && exit 1;
 			done
 			IFS=$SAVEIFS

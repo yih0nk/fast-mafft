@@ -8081,6 +8081,655 @@ void fixed_musclesupg_double_realloc_nobk_halfmtx_memsave( int nseq, double **ef
 	free( mindisfrom );
 	free( nearest );
 }
+/* fast-mafft (overhead lever): the same guide tree as
+   fixed_musclesupg_double_realloc_nobk_halfmtx_memsave() above, bit for bit, built faster.
+   - The active nodes are kept in an ascending array (act[]) instead of the linked list ac[],
+     so the scans are array loops rather than pointer chases. Each scan visits the same
+     nodes in the same order as the list walk it replaces.
+   - The recheck loop (a full setnearest() for every i with nearest[i]==im whose distance to
+     im grew) is folded into the update loop: its condition only involves i's own values,
+     which are final once i has been updated, so the candidates are collected there and
+     rescanned after jm has been removed, as before. Each rescan only writes its own i.
+   - With nthread > 1, the initial setnearest() pass, the update loop and the rescans run
+     on a small pool of threads over chunks of act[]. Each chunk computes a running
+     minimum with the original strict < from 999.9 over its part of the scan order, and the
+     chunk results are combined in scan order with strict <, which reproduces the serial
+     running minimum and its first-index-wins tie rule. The minimum over mindisfrom[] that
+     picks im is combined the same way (lowest index wins ties; the last active node is
+     still skipped). Nothing depends on which thread does which chunk.
+   - Every distance is still produced by the same cluster function call on the same two
+     values (cluster_mix_double(): MIN(d1,d2)*sueff1 + (d1+d2)*sueff05, one statement). */
+
+#ifndef UPG_SERIALBELOW
+#define UPG_SERIALBELOW 1024 /* fewer active nodes than this: no threads */
+#endif
+#ifndef UPG_MINCHUNK
+#define UPG_MINCHUNK 256
+#endif
+#ifndef UPG_INITCHUNK
+#define UPG_INITCHUNK 16
+#endif
+#ifndef UPG_MAXTHREADS
+#define UPG_MAXTHREADS 8
+#endif
+#define UPG_KIND_INIT 0
+#define UPG_KIND_UPDATE 1
+#define UPG_KIND_RECHECK 2
+#define UPG_KIND_QUIT 3
+
+typedef struct
+{
+	int nseq;
+	double **eff;
+	int *act, nact;
+	double *mindisfrom;
+	int *nearest;
+	double (*clusterfunc)(double,double);
+	int im, jm;
+	int chunksize;
+	/* update phase, per chunk */
+	int *cand;              /* the candidates of a chunk are stored from its first act[] index */
+	int *ccnt;
+	double *cv; int *cj;    /* partial minimum for mindisfrom[im] */
+	/* recheck phase */
+	int ncand, *candlist, *candpos, candcap;
+	char *iscand;
+	double *p1v, *p2v; int *p1j, *p2j; /* [candidate * nchunks + chunk] */
+	double *mv; int *mi;    /* partial minimum of mindisfrom[] for the next im */
+	int nchunks;
+	/* pool */
+	int nth;
+	unsigned long long next; /* gen(22) | kind(2) | nchunks(20) | next chunk(20) */
+	int done;
+	int gen;
+#ifdef enablemultithread
+	pthread_t *handle;
+#endif
+} upg_t;
+
+static int upg_findpos( const int *act, int nact, int pos )
+{
+	int lo = 0, hi = nact - 1, mid;
+	while( lo <= hi )
+	{
+		mid = ( lo + hi ) / 2;
+		if( act[mid] == pos ) return( mid );
+		if( act[mid] < pos ) lo = mid + 1;
+		else hi = mid - 1;
+	}
+	reporterr( "upg_findpos: %d is not active\n", pos );
+	exit( 1 );
+	return( -1 );
+}
+
+static void upg_setnearest_arr( double **eff, const int *act, int nact, int pos, double *mindisfrompt, int *nearestpt )
+{
+	int q, j, p;
+	double m = 999.9, t;
+	int n = -1;
+	double *rowpos = eff[pos];
+
+	p = upg_findpos( act, nact, pos );
+	for( q=p+1; q<nact; q++ ) // j > pos, ascending (the first loop of setnearest())
+	{
+		j = act[q];
+		if( ( t = rowpos[j-pos] ) < m )
+		{
+			m = t;
+			n = j;
+		}
+	}
+	for( q=0; q<p; q++ ) // j < pos, ascending (the second loop of setnearest())
+	{
+		j = act[q];
+		if( ( t = eff[j][pos-j] ) < m )
+		{
+			m = t;
+			n = j;
+		}
+	}
+	*mindisfrompt = m;
+	*nearestpt = n;
+}
+
+/* The update loop body of the original over act[a..b), except that the running minimum for
+   mindisfrom[im]/nearest[im] is kept locally (from 999.9) and returned. */
+static int upg_updaterange( upg_t *u, int a, int b, int *cand, double *lvp, int *ljp )
+{
+	double **eff = u->eff;
+	double *mindisfrom = u->mindisfrom;
+	int *nearest = u->nearest;
+	const int *act = u->act;
+	int im = u->im, jm = u->jm;
+	int q, i, miniim, maxiim, minijm, maxijm, n = 0, lj = -1;
+	double eff0, eff1, tmpdouble, lv = 999.9;
+
+	for( q=a; q<b; q++ )
+	{
+		i = act[q];
+		if( i != im && i != jm )
+		{
+			if( i < im )
+			{
+				 miniim = i;
+				 maxiim = im;
+				 minijm = i;
+				 maxijm = jm;
+			}
+			else if( i < jm )
+			{
+				 miniim = im;
+				 maxiim = i;
+				 minijm = i;
+				 maxijm = jm;
+			}
+			else
+			{
+				 miniim = im;
+				 maxiim = i;
+				 minijm = jm;
+				 maxijm = i;
+			}
+			eff0 = eff[miniim][maxiim-miniim];
+			eff1 = eff[minijm][maxijm-minijm];
+			tmpdouble = eff[miniim][maxiim-miniim] =
+			(u->clusterfunc)( eff0, eff1 );
+			if( tmpdouble < mindisfrom[i]  )
+			{
+				mindisfrom[i] = tmpdouble;
+				nearest[i] = im;
+			}
+			if( tmpdouble < lv  ) // mindisfrom[im] in the original
+			{
+				lv = tmpdouble;
+				lj = i;
+			}
+			if( nearest[i] == jm )
+			{
+				nearest[i] = im;
+			}
+			// the condition of the original recheck loop, on i's final values
+			if( nearest[i] == im && tmpdouble > mindisfrom[i] ) cand[n++] = i;
+		}
+	}
+	*lvp = lv;
+	*ljp = lj;
+	return( n );
+}
+
+static void upg_initchunk( upg_t *u, int c )
+{
+	int i, a = c * UPG_INITCHUNK, b = MIN( u->nseq, a + UPG_INITCHUNK );
+	for( i=a; i<b; i++ ) upg_setnearest_arr( u->eff, u->act, u->nact, i, u->mindisfrom+i, u->nearest+i );
+}
+
+static void upg_updatechunk( upg_t *u, int c )
+{
+	int a = c * u->chunksize, b = MIN( u->nact, a + u->chunksize );
+	u->ccnt[c] = upg_updaterange( u, a, b, u->cand + a, u->cv + c, u->cj + c );
+}
+
+static void upg_recheckchunk( upg_t *u, int c )
+{
+	double **eff = u->eff;
+	const int *act = u->act;
+	int nch = u->nchunks;
+	int a = c * u->chunksize, b = MIN( u->nact, a + u->chunksize );
+	int x, q, j, pos, p, n, e;
+	double m, t, *rowpos;
+
+	for( x=0; x<u->ncand; x++ )
+	{
+		pos = u->candlist[x];
+		p = u->candpos[x];
+		rowpos = eff[pos];
+		m = 999.9; n = -1;
+		for( q=MAX( a, p+1 ); q<b; q++ ) // part of the first loop of setnearest()
+		{
+			j = act[q];
+			if( ( t = rowpos[j-pos] ) < m )
+			{
+				m = t;
+				n = j;
+			}
+		}
+		u->p1v[x*nch+c] = m; u->p1j[x*nch+c] = n;
+		m = 999.9; n = -1;
+		e = MIN( b, p );
+		for( q=a; q<e; q++ ) // part of the second loop of setnearest()
+		{
+			j = act[q];
+			if( ( t = eff[j][pos-j] ) < m )
+			{
+				m = t;
+				n = j;
+			}
+		}
+		u->p2v[x*nch+c] = m; u->p2j[x*nch+c] = n;
+	}
+
+	// partial minimum for the next im: act[a..b) without the last active node and without the
+	// candidates (their mindisfrom[] is final only after the combination)
+	m = 999.9; n = -1;
+	e = MIN( b, u->nact-1 );
+	for( q=a; q<e; q++ )
+	{
+		j = act[q];
+		if( !u->iscand[j] && u->mindisfrom[j] < m )
+		{
+			m = u->mindisfrom[j];
+			n = j;
+		}
+	}
+	u->mv[c] = m; u->mi[c] = n;
+}
+
+#ifdef enablemultithread
+#include <sched.h>
+#define UPG_WORD( gen, kind, nch, idx ) ( ( (unsigned long long)( (gen) & 0x3fffff ) << 42 ) | ( (unsigned long long)(kind) << 40 ) | ( (unsigned long long)(nch) << 20 ) | (unsigned long long)(idx) )
+#define UPG_KIND( w ) ( (int)( ( (w) >> 40 ) & 3 ) )
+#define UPG_NCH( w ) ( (int)( ( (w) >> 20 ) & 0xfffff ) )
+#define UPG_IDX( w ) ( (int)( (w) & 0xfffff ) )
+
+static void upg_relax( void )
+{
+#if defined(__aarch64__) || defined(__arm64__)
+	__asm__ __volatile__( "yield" );
+#elif defined(__x86_64__) || defined(__i386__)
+	__asm__ __volatile__( "pause" );
+#endif
+}
+
+/* Claims chunks of the phase published in u->next until none is left. The kind and the
+   number of chunks come from the same atomic word as the claim, so a thread can never mix
+   up two phases. */
+static void upg_claim( upg_t *u )
+{
+	unsigned long long w;
+	int kind, c;
+	for( ;; )
+	{
+		w = __atomic_load_n( &u->next, __ATOMIC_ACQUIRE );
+		kind = UPG_KIND( w );
+		c = UPG_IDX( w );
+		if( kind == UPG_KIND_QUIT || c >= UPG_NCH( w ) ) return;
+		if( !__atomic_compare_exchange_n( &u->next, &w, w+1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ) ) continue;
+		if( kind == UPG_KIND_INIT ) upg_initchunk( u, c );
+		else if( kind == UPG_KIND_UPDATE ) upg_updatechunk( u, c );
+		else upg_recheckchunk( u, c );
+		__atomic_fetch_add( &u->done, 1, __ATOMIC_RELEASE );
+	}
+}
+
+static void *upg_worker( void *arg )
+{
+	upg_t *u = (upg_t *)arg;
+	unsigned long long w;
+	int spins = 0;
+	for( ;; )
+	{
+		w = __atomic_load_n( &u->next, __ATOMIC_ACQUIRE );
+		if( UPG_KIND( w ) == UPG_KIND_QUIT ) break;
+		if( UPG_IDX( w ) < UPG_NCH( w ) )
+		{
+			upg_claim( u );
+			spins = 0;
+			continue;
+		}
+		if( ++spins < 20000 ) upg_relax();
+		else sched_yield();
+	}
+	return( NULL );
+}
+
+/* Runs one phase on all threads (the calling thread included) and waits for it. */
+static void upg_phase( upg_t *u, int kind, int nchunks )
+{
+	int spins = 0;
+	u->gen++;
+	__atomic_store_n( &u->done, 0, __ATOMIC_RELAXED );
+	__atomic_store_n( &u->next, UPG_WORD( u->gen, kind, nchunks, 0 ), __ATOMIC_RELEASE );
+	upg_claim( u );
+	while( __atomic_load_n( &u->done, __ATOMIC_ACQUIRE ) < nchunks )
+	{
+		if( ++spins < 20000 ) upg_relax();
+		else sched_yield();
+	}
+}
+#endif
+
+void fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_mt( int nseq, double **eff, int ***topol, double **len, Treedep *dep, int progressout, int efffree, int nthread )
+{
+	int i, j, k, q, c, x, p;
+	int *intpt;
+	double *tmptmplen = NULL;
+	int *hist = NULL;
+	int im = -1, jm = -1;
+	int prevnode;
+	int *pt1, *pt2, *pt11;
+	int *nmemar;
+	int nmemim, nmemjm;
+	double minscore, bv, lv;
+	int bi, lj;
+	int *nearest = NULL;
+	double *mindisfrom = NULL;
+	double (*clusterfuncpt[1])(double,double);
+	int parallel, havemin, maxchunks;
+	upg_t u;
+
+	sueff1 = 1 - (double)sueff_global;
+	sueff05 = (double)sueff_global * 0.5;
+	if ( treemethod == 'X' )
+		clusterfuncpt[0] = cluster_mix_double;
+	else if ( treemethod == 'E' )
+		clusterfuncpt[0] = cluster_average_double;
+	else if ( treemethod == 'q' )
+		clusterfuncpt[0] = cluster_minimum_double;
+	else
+	{
+		reporterr(       "Unknown treemethod, %c\n", treemethod );
+		exit( 1 );
+	}
+
+	hist = AllocateIntVec( njob );
+	tmptmplen = AllocateFloatVec( njob );
+	nmemar = AllocateIntVec( njob );
+	mindisfrom = AllocateFloatVec( njob );
+	nearest = AllocateIntVec( njob );
+
+	memset( &u, 0, sizeof( upg_t ) );
+	u.nseq = nseq;
+	u.eff = eff;
+	u.mindisfrom = mindisfrom;
+	u.nearest = nearest;
+	u.clusterfunc = clusterfuncpt[0];
+	u.act = AllocateIntVec( nseq );
+	u.cand = AllocateIntVec( nseq );
+	u.candlist = AllocateIntVec( nseq );
+	for( i=0; i<nseq; i++ ) u.act[i] = i;
+	u.nact = nseq;
+
+#ifdef enablemultithread
+	u.nth = ( nthread > 1 ) ? nthread : 1;
+	/* The phases are short (tens of microseconds) and the waiting threads spin, so never run
+	   more threads than there are cores; and this loop is memory-bound and stops scaling at
+	   3-4 threads, so more than UPG_MAXTHREADS only adds spinning. The tree does not depend
+	   on the number of threads. */
+	if( u.nth > UPG_MAXTHREADS ) u.nth = UPG_MAXTHREADS;
+#if !defined(mingw) && !defined(_MSC_VER)
+	{
+		long ncpu = sysconf( _SC_NPROCESSORS_ONLN );
+		if( ncpu > 0 && u.nth > ncpu ) u.nth = (int)ncpu;
+	}
+#endif
+#else
+	u.nth = 1;
+#endif
+	parallel = ( u.nth > 1 && nseq >= UPG_SERIALBELOW );
+	maxchunks = 4 * u.nth;
+	if( parallel )
+	{
+		u.ccnt = AllocateIntVec( maxchunks );
+		u.cv = AllocateFloatVec( maxchunks );
+		u.cj = AllocateIntVec( maxchunks );
+		u.mv = AllocateFloatVec( maxchunks );
+		u.mi = AllocateIntVec( maxchunks );
+		u.candpos = AllocateIntVec( nseq );
+		u.iscand = AllocateCharVec( nseq );
+		for( i=0; i<nseq; i++ ) u.iscand[i] = 0;
+	}
+#ifdef enablemultithread
+	if( parallel )
+	{
+		u.next = UPG_WORD( 0, UPG_KIND_INIT, 0, 0 ); // nothing to claim yet
+		u.handle = calloc( u.nth, sizeof( pthread_t ) );
+		for( i=1; i<u.nth; i++ ) pthread_create( u.handle+i, NULL, upg_worker, (void *)&u );
+		upg_phase( &u, UPG_KIND_INIT, ( nseq + UPG_INITCHUNK - 1 ) / UPG_INITCHUNK );
+	}
+	else
+#endif
+	{
+		for( i=0; i<nseq; i++ ) upg_setnearest_arr( eff, u.act, u.nact, i, mindisfrom+i, nearest+i ); // muscle
+	}
+
+	for( i=0; i<nseq; i++ ) tmptmplen[i] = 0.0;
+	for( i=0; i<nseq; i++ ) 
+	{
+		hist[i] = -1;
+		nmemar[i] = 1;
+	}
+
+	havemin = 0;
+	minscore = 999.9;
+	if( progressout ) reporterr(       "\n" );
+	for( k=0; k<nseq-1; k++ )
+	{
+		if( progressout && k % 10 == 0 ) reporterr(       "\r% 5d / %d", k, nseq );
+
+#ifdef enablemultithread
+		if( parallel && u.nact < UPG_SERIALBELOW ) // the rest is too small for threads
+		{
+			__atomic_store_n( &u.next, UPG_WORD( u.gen+1, UPG_KIND_QUIT, 0, 0 ), __ATOMIC_RELEASE );
+			for( i=1; i<u.nth; i++ ) pthread_join( u.handle[i], NULL );
+			parallel = 0;
+		}
+#endif
+
+		if( !havemin ) // otherwise im and minscore were combined from the recheck phase
+		{
+			minscore = 999.9;
+			for( q=0; q<u.nact-1; q++ ) // all active nodes but the last one, as in the list walk
+			{
+				i = u.act[q];
+				if( mindisfrom[i] < minscore ) // muscle
+				{
+					im = i;
+					minscore = mindisfrom[i];
+				}
+			}
+		}
+		havemin = 0;
+		jm = nearest[im];
+		if( jm < im ) 
+		{
+			j=jm; jm=im; im=j;
+		}
+
+
+		prevnode = hist[im];
+		if( dep ) dep[k].child0 = prevnode;
+		nmemim = nmemar[im];
+		intpt = topol[k][0] = (int *)realloc( topol[k][0], ( 2 ) * sizeof( int ) ); // memsave
+		if( prevnode == -1 )
+		{
+			*intpt++ = im;
+			*intpt = -1;
+		}
+		else
+		{
+			pt1 = topol[prevnode][0];
+			pt2 = topol[prevnode][1];
+			if( *pt1 > *pt2 )
+				pt11 = pt2;
+			else
+				pt11 = pt1;
+			*intpt++ = *pt11;
+			*intpt = -1;
+		}
+
+		prevnode = hist[jm];
+		if( dep ) dep[k].child1 = prevnode;
+		nmemjm = nmemar[jm];
+		intpt = topol[k][1] = (int *)realloc( topol[k][1], ( 2 ) * sizeof( int ) );
+		if( !intpt )
+		{
+			reporterr(       "Cannot reallocate topol\n" );
+			exit( 1 );
+		}
+		if( prevnode == -1 )
+		{
+			*intpt++ = jm;
+			*intpt = -1;
+		}
+		else
+		{
+			pt1 = topol[prevnode][0];
+			pt2 = topol[prevnode][1];
+			if( *pt1 > *pt2 )
+				pt11 = pt2;
+			else
+				pt11 = pt1;
+			*intpt++ = *pt11;
+			*intpt = -1;
+		}
+
+		minscore *= 0.5;
+
+		len[k][0] = ( minscore - tmptmplen[im] );
+		len[k][1] = ( minscore - tmptmplen[jm] );
+
+		if( dep ) dep[k].distfromtip = minscore;
+
+		tmptmplen[im] = minscore;
+
+		hist[im] = k;
+		nmemar[im] = nmemim + nmemjm;
+
+		// update loop
+		u.im = im;
+		u.jm = jm;
+		mindisfrom[im] = 999.9;
+		u.ncand = 0;
+#ifdef enablemultithread
+		if( parallel )
+		{
+			u.chunksize = MAX( UPG_MINCHUNK, ( u.nact + maxchunks - 1 ) / maxchunks );
+			u.nchunks = ( u.nact + u.chunksize - 1 ) / u.chunksize;
+			upg_phase( &u, UPG_KIND_UPDATE, u.nchunks );
+			for( c=0; c<u.nchunks; c++ )
+			{
+				if( u.cv[c] < mindisfrom[im] ) // chunk order = list order
+				{
+					mindisfrom[im] = u.cv[c];
+					nearest[im] = u.cj[c];
+				}
+				memcpy( u.candlist + u.ncand, u.cand + c * u.chunksize, u.ccnt[c] * sizeof( int ) );
+				u.ncand += u.ccnt[c];
+			}
+		}
+		else
+#endif
+		{
+			u.ncand = upg_updaterange( &u, 0, u.nact, u.candlist, &lv, &lj );
+			if( lv < mindisfrom[im] )
+			{
+				mindisfrom[im] = lv;
+				nearest[im] = lj;
+			}
+		}
+
+		// unlink jm
+		p = upg_findpos( u.act, u.nact, jm );
+		memmove( u.act+p, u.act+p+1, ( u.nact-p-1 ) * sizeof( int ) );
+		u.nact--;
+		if( efffree )
+		{
+			free( (void *)eff[jm] ); eff[jm] = NULL;
+		}
+
+		// recheck (muscle seems to miss this.)
+#ifdef enablemultithread
+		if( parallel && u.ncand > 0 )
+		{
+			u.chunksize = MAX( UPG_MINCHUNK, ( u.nact + maxchunks - 1 ) / maxchunks );
+			u.nchunks = ( u.nact + u.chunksize - 1 ) / u.chunksize;
+			if( u.ncand * u.nchunks > u.candcap )
+			{
+				u.candcap = u.ncand * u.nchunks * 2;
+				free( u.p1v ); free( u.p2v ); free( u.p1j ); free( u.p2j );
+				u.p1v = AllocateFloatVec( u.candcap );
+				u.p2v = AllocateFloatVec( u.candcap );
+				u.p1j = AllocateIntVec( u.candcap );
+				u.p2j = AllocateIntVec( u.candcap );
+			}
+			for( x=0; x<u.ncand; x++ )
+			{
+				u.candpos[x] = upg_findpos( u.act, u.nact, u.candlist[x] );
+				u.iscand[u.candlist[x]] = 1;
+			}
+			upg_phase( &u, UPG_KIND_RECHECK, u.nchunks );
+			for( x=0; x<u.ncand; x++ )
+			{
+				bv = 999.9; bi = -1;
+				for( c=0; c<u.nchunks; c++ ) // j > pos first, in list order
+				{
+					if( u.p1v[x*u.nchunks+c] < bv )
+					{
+						bv = u.p1v[x*u.nchunks+c];
+						bi = u.p1j[x*u.nchunks+c];
+					}
+				}
+				for( c=0; c<u.nchunks; c++ ) // then j < pos
+				{
+					if( u.p2v[x*u.nchunks+c] < bv )
+					{
+						bv = u.p2v[x*u.nchunks+c];
+						bi = u.p2j[x*u.nchunks+c];
+					}
+				}
+				mindisfrom[u.candlist[x]] = bv;
+				nearest[u.candlist[x]] = bi;
+			}
+			// the next im: the smallest mindisfrom[] among the active nodes but the last one,
+			// the lowest index winning ties (the running minimum of the list walk)
+			bv = 999.9; bi = -1;
+			for( c=0; c<u.nchunks; c++ )
+			{
+				if( u.mv[c] < bv ) // chunk c covers larger indices than chunk c-1
+				{
+					bv = u.mv[c];
+					bi = u.mi[c];
+				}
+			}
+			for( x=0; x<u.ncand; x++ )
+			{
+				i = u.candlist[x];
+				u.iscand[i] = 0;
+				if( u.candpos[x] >= u.nact-1 ) continue; // the last active node
+				if( mindisfrom[i] < bv || ( bi != -1 && mindisfrom[i] == bv && i < bi ) )
+				{
+					bv = mindisfrom[i];
+					bi = i;
+				}
+			}
+			minscore = bv;
+			if( bi != -1 ) im = bi;
+			havemin = 1;
+		}
+		else
+#endif
+		{
+			for( x=0; x<u.ncand; x++ )
+				upg_setnearest_arr( eff, u.act, u.nact, u.candlist[x], mindisfrom+u.candlist[x], nearest+u.candlist[x] );
+		}
+    }
+#ifdef enablemultithread
+	if( parallel )
+	{
+		__atomic_store_n( &u.next, UPG_WORD( u.gen+1, UPG_KIND_QUIT, 0, 0 ), __ATOMIC_RELEASE );
+		for( i=1; i<u.nth; i++ ) pthread_join( u.handle[i], NULL );
+	}
+	free( u.handle );
+#endif
+	free( (void *)tmptmplen ); tmptmplen = NULL;
+	free( hist ); hist = NULL;
+	free( (void *)nmemar ); nmemar = NULL;
+	free( mindisfrom );
+	free( nearest );
+	free( u.act ); free( u.cand ); free( u.candlist ); free( u.candpos ); free( u.iscand );
+	free( u.ccnt ); free( u.cv ); free( u.cj ); free( u.mv ); free( u.mi );
+	free( u.p1v ); free( u.p2v ); free( u.p1j ); free( u.p2j );
+}
 void fixed_musclesupg_double_realloc_nobk_halfmtx( int nseq, double **eff, int ***topol, double **len, Treedep *dep, int progressout, int efffree )
 {
 	int i, j, k, miniim, maxiim, minijm, maxijm;

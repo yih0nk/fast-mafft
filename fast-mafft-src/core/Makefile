@@ -58,7 +58,7 @@ PROGS = dvtditr dndfast7 dndblast sextet5 mafft-distance pairlocalalign \
 		multi2hat3s pairash addsingle maffttext2hex hex2maffttext \
         splittbfast disttbfast tbfast nodepair mafft-profile f2cl mccaskillwrap contrafoldwrap countlen \
 		seq2regtable regtable2seq score getlag dndpre setcore filter replaceu restoreu setdirection makedirectionlist version \
-		$(DASH_CLIENT)
+		crtolf $(DASH_CLIENT)
 SOS = libdisttbfast.so
 DLLS = libdisttbfast.dll
 DYLIBS = libdisttbfast.dylib
@@ -226,6 +226,9 @@ setcore : $(OBJSETCORE)
 
 countlen : $(OBJCOUNTLEN)
 	$(CC) -o $@ $(OBJCOUNTLEN) $(MYCFLAGS) $(LDFLAGS) $(LIBS)
+
+crtolf : crtolf.o
+	$(CC) -o $@ crtolf.o $(MYCFLAGS) $(LDFLAGS)
 
 seq2regtable : $(OBJSEQ2REGTABLE)
 	$(CC) -o $@ $(OBJSEQ2REGTABLE) $(MYCFLAGS) $(LDFLAGS) $(LIBS)
@@ -440,6 +443,9 @@ dndpre.o : dndpre.c $(HEADER)
 
 countlen.o : countlen.c $(HEADER)
 	$(CC) $(MYCFLAGS) -c countlen.c
+
+crtolf.o : crtolf.c
+	$(CC) $(MYCFLAGS) -c crtolf.c
 
 seq2regtable.o : seq2regtable.c $(HEADER)
 	$(CC) $(MYCFLAGS) -c seq2regtable.c

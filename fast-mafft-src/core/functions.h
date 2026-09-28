@@ -321,6 +321,7 @@ void makegrouprna( RNApair ***group, RNApair ***all, int *memlist );
 void makegrouprnait( RNApair ***group, RNApair ***all, char *pair, int s );
 extern void fixed_musclesupg_double_realloc_nobk_halfmtx( int nseq, double **eff, int ***topol, double **len, Treedep *, int progressout, int efffree );
 extern void fixed_musclesupg_double_realloc_nobk_halfmtx_memsave( int nseq, double **eff, int ***topol, double **len, Treedep *, int progressout, int efffree );
+extern void fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_mt( int nseq, double **eff, int ***topol, double **len, Treedep *, int progressout, int efffree, int nthread ); // fast-mafft
 extern void loadtop( int nseq, double **mtx, int ***topol, double **len, char **name, int *nlen, Treedep * );
 extern void loadtree( int nseq, int ***topol, double **len, char **name, int *nlen, Treedep *, int treeout );
 extern int check_guidetreefile( int *seed, int *npick, double *limitram );

@@ -5,6 +5,27 @@ static int upperCase = 0;
 #define DEBUG   0
 #define IODEBUG 0
 
+/* fast-mafft (overhead lever): the sequence readers below read the input one byte at a time.
+   getc() takes the FILE lock on every call, which dominated f2cl (about 90% of its samples)
+   and disttbfast's input parsing. They now take the lock once per call (flockfile) and read
+   with getc_unlocked(), which returns exactly the same bytes. */
+#if defined(mingw) || defined(_MSC_VER) || defined(_WIN32)
+#define MAFFT_GETC( fp ) getc( fp )
+#define MAFFT_LOCKFILE( fp )
+#define MAFFT_UNLOCKFILE( fp )
+#else
+/* POSIX.1c functions; declared here because mltaln.h's bare _XOPEN_SOURCE hides them under
+   -std=c99 on glibc (macOS declares them anyway) */
+#ifndef getc_unlocked
+extern int getc_unlocked( FILE * );
+#endif
+extern void flockfile( FILE * );
+extern void funlockfile( FILE * );
+#define MAFFT_GETC( fp ) getc_unlocked( fp )
+#define MAFFT_LOCKFILE( fp ) flockfile( fp )
+#define MAFFT_UNLOCKFILE( fp ) funlockfile( fp )
+#endif
+
 char creverse( char f )
 {
 	static TLS char *table = NULL;
@@ -1086,12 +1107,14 @@ char    s[] ; int l ; FILE *fp ;
 
 		if( feof( fp ) ) return( 1 );
 
-		for( i=0; i<l && ( c=getc( fp ) ) != '\n'; i++ ) 
+		MAFFT_LOCKFILE( fp );
+		for( i=0; i<l && ( c=MAFFT_GETC( fp ) ) != '\n'; i++ ) 
         	*s++ = c;
         *s = '\0' ;
 		if( c != '\n' ) 
-			while( getc(fp) != '\n' )
+			while( MAFFT_GETC(fp) != '\n' )
 				;
+		MAFFT_UNLOCKFILE( fp );
 		return( 0 );
 }
 
@@ -1273,12 +1296,14 @@ static int countKUorWA( FILE *fp )
 
 	value= 0;
 	b = '\n';
-	while( ( c = getc( fp ) ) != EOF )
+	MAFFT_LOCKFILE( fp );
+	while( ( c = MAFFT_GETC( fp ) ) != EOF )
 	{
 		if( b == '\n' && ( c == '>' ) )
 			value++;
 		b = c;
 	}
+	MAFFT_UNLOCKFILE( fp );
 	rewind( fp );
 	return( value );
 }
@@ -1287,8 +1312,10 @@ void searchKUorWA( FILE *fp )
 {
 	int c, b;
 	b = '\n';
-	while( !( ( ( c = getc( fp ) ) == '>' || c == EOF ) && b == '\n' ) )
+	MAFFT_LOCKFILE( fp );
+	while( !( ( ( c = MAFFT_GETC( fp ) ) == '>' || c == EOF ) && b == '\n' ) )
 		b = c;
+	MAFFT_UNLOCKFILE( fp );
 	ungetc( c, fp );
 }
 
@@ -1395,7 +1422,8 @@ char *load1SeqWithoutName_realloc_casepreserve( FILE *fpp )
 	cbuf = val;
 
 	b = '\n';
-	while( ( c = getc( fpp ) ) != EOF &&           
+	MAFFT_LOCKFILE( fpp );
+	while( ( c = MAFFT_GETC( fpp ) ) != EOF &&           
           !( ( c == '>' || c == EOF ) && b == '\n' ) )
 	{
 		*cbuf++ = (char)c;  /* 長すぎてもしらない */
@@ -1414,6 +1442,7 @@ char *load1SeqWithoutName_realloc_casepreserve( FILE *fpp )
 		}
 		b = c;
 	}
+	MAFFT_UNLOCKFILE( fpp );
 	ungetc( c, fpp );
 	*cbuf = 0;
 //	onlyGraph( val );
@@ -1433,7 +1462,8 @@ char *load1SeqWithoutName_realloc( FILE *fpp )
 	cbuf = val;
 
 	b = '\n';
-	while( ( c = getc( fpp ) ) != EOF &&           
+	MAFFT_LOCKFILE( fpp );
+	while( ( c = MAFFT_GETC( fpp ) ) != EOF &&           
           !( ( c == '>' || c == EOF ) && b == '\n' ) )
 	{
 		*cbuf++ = (char)c;  /* 長すぎてもしらない */
@@ -1452,6 +1482,7 @@ char *load1SeqWithoutName_realloc( FILE *fpp )
 		}
 		b = c;
 	}
+	MAFFT_UNLOCKFILE( fpp );
 	ungetc( c, fpp );
 	*cbuf = 0;
 
@@ -5460,6 +5491,8 @@ void writeData_reorder_pointer( FILE *fp, int locnjob, char **name, int *nlen, c
 {
 	int i, j, k;
 	int nalen;
+	char *obuf = NULL; /* fast-mafft: one wrapped record per fwrite */
+	size_t obufsize = 0, opos, w;
 
 	for( i=0; i<locnjob; i++ )
 	{
@@ -5474,12 +5507,40 @@ void writeData_reorder_pointer( FILE *fp, int locnjob, char **name, int *nlen, c
 		else
 		{
 			nalen = strlen( aseq[k] );
+#if 0 // original: one fprintf per line
 			for( j=0; j<nalen; j=j+LineLengthInFASTA ) fprintf( fp, "%.*s\n", LineLengthInFASTA, aseq[k]+j );
+#else
+			/* fast-mafft (overhead lever): the same bytes, "%.*s\n" per line of at most
+			   LineLengthInFASTA characters (aseq[k] has no NUL before nalen), gathered into one
+			   buffer and written with one fwrite per sequence instead of one fprintf per line. */
+			w = (size_t)nalen + (size_t)nalen / LineLengthInFASTA + 2;
+			if( w > obufsize )
+			{
+				free( obuf );
+				obufsize = w;
+				obuf = malloc( obufsize );
+				if( obuf == NULL )
+				{
+					fprintf( stderr, "Cannot allocate the output buffer\n" );
+					exit( 1 );
+				}
+			}
+			opos = 0;
+			for( j=0; j<nalen; j=j+LineLengthInFASTA )
+			{
+				w = ( nalen - j < LineLengthInFASTA ) ? (size_t)( nalen - j ) : (size_t)LineLengthInFASTA;
+				memcpy( obuf+opos, aseq[k]+j, w );
+				opos += w;
+				obuf[opos++] = '\n';
+			}
+			if( opos ) fwrite( obuf, 1, opos, fp );
+#endif
 		}
 #else
 		fprintf( fp, "%s\n", aseq[k] );
 #endif
 	}
+	free( obuf );
 }
 void writeData_reorder( FILE *fp, int locnjob, char name[][B], int nlen[], char **aseq, int *order )
 {

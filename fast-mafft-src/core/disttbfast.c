@@ -3866,6 +3866,65 @@ static double **preparepartmtx( int nseq )
 	return( val );
 }
 
+/* fast-mafft (overhead lever): the 6-mer count -> distance conversion, one row per call.
+   The statements are those of the original serial loop in disttbfast(), unchanged (the lenfac
+   statement is compiled to the same fmadd); every mtx[i][j-i] depends only on its own count
+   and the diagonal entries mtx[i][0], mtx[j][0], which the loop never writes, so rows can be
+   converted in any order, or at the same time. */
+static void dist6conv_row( double **mtx, int *nogaplen, int njob, int i )
+{
+	int j;
+	double longer, shorter;
+	double lenfac;
+	double bunbo;
+	for( j=i+1; j<njob; j++ ) 
+	{
+		if( nogaplen[i] > nogaplen[j] )
+		{
+			longer=(double)nogaplen[i];
+			shorter=(double)nogaplen[j];
+		}
+		else
+		{
+			longer=(double)nogaplen[j];
+			shorter=(double)nogaplen[i];
+		}
+		lenfac = 1.0 / ( shorter / longer * lenfacd + lenfacb / ( longer + lenfacc ) + lenfaca );
+		bunbo = MIN( mtx[i][0], mtx[j][0] );
+		if( bunbo == 0.0 )
+			mtx[i][j-i] = 2.0; // 2013/Oct/17 -> 2bai
+		else
+			mtx[i][j-i] = ( 1.0 - mtx[i][j-i] / bunbo ) * lenfac * 2.0; // 2013/Oct/17 -> 2bai
+	}
+}
+
+#ifdef enablemultithread
+typedef struct
+{
+	double **mtx;
+	int *nogaplen;
+	int njob;
+	int *jobpospt;
+	pthread_mutex_t *mutex;
+} dist6convthread_arg_t;
+
+static void *dist6convthread( void *arg )
+{
+	dist6convthread_arg_t *targ = (dist6convthread_arg_t *)arg;
+	int i, i0, i1;
+	while( 1 )
+	{
+		pthread_mutex_lock( targ->mutex );
+		i0 = *targ->jobpospt;
+		i1 = MIN( i0 + 32, targ->njob-1 );
+		*targ->jobpospt = i1;
+		pthread_mutex_unlock( targ->mutex );
+		if( i0 >= targ->njob-1 ) return( NULL );
+		for( i=i0; i<i1; i++ ) dist6conv_row( targ->mtx, targ->nogaplen, targ->njob, i );
+	}
+}
+#endif
+
 int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, char **argv, int (*callback)(int, int, char*))
 {
 	int  *nlen = NULL;	
@@ -4479,33 +4538,35 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			reporterr(       "\ndone.\n\n" );
 			ien = njob-1;
 	
-			for( i=0; i<ien; i++ )
+			// fast-mafft (overhead lever): the original loop, row by row (dist6conv_row), on
+			// nthreadpair threads when there are enough rows
+#ifdef enablemultithread
+			if( nthreadpair > 1 && njob >= 1000 )
 			{
-				for( j=i+1; j<njob; j++ ) 
+				dist6convthread_arg_t *ctarg;
+				pthread_t *chandle;
+				pthread_mutex_t cmutex;
+				int cjobpos = 0;
+				ctarg = calloc( nthreadpair, sizeof( dist6convthread_arg_t ) );
+				chandle = calloc( nthreadpair, sizeof( pthread_t ) );
+				pthread_mutex_init( &cmutex, NULL );
+				for( i=0; i<nthreadpair; i++ )
 				{
-					if( nogaplen[i] > nogaplen[j] )
-					{
-						longer=(double)nogaplen[i];
-						shorter=(double)nogaplen[j];
-					}
-					else
-					{
-						longer=(double)nogaplen[j];
-						shorter=(double)nogaplen[i];
-					}
-//					if( tuplesize == 6 )
-					lenfac = 1.0 / ( shorter / longer * lenfacd + lenfacb / ( longer + lenfacc ) + lenfaca );
-//					else
-//						lenfac = 1.0;
-//					reporterr(       "lenfac = %f (%.0f,%.0f)\n", lenfac, longer, shorter );
-					bunbo = MIN( mtx[i][0], mtx[j][0] );
-					if( bunbo == 0.0 )
-						mtx[i][j-i] = 2.0; // 2013/Oct/17 -> 2bai
-					else
-						mtx[i][j-i] = ( 1.0 - mtx[i][j-i] / bunbo ) * lenfac * 2.0; // 2013/Oct/17 -> 2bai
-//					reporterr(       "##### mtx = %f, mtx[i][0]=%f, mtx[j][0]=%f, bunbo=%f\n", mtx[i][j-i], mtx[i][0], mtx[j][0], bunbo );
+					ctarg[i].mtx = mtx;
+					ctarg[i].nogaplen = nogaplen;
+					ctarg[i].njob = njob;
+					ctarg[i].jobpospt = &cjobpos;
+					ctarg[i].mutex = &cmutex;
+					pthread_create( chandle+i, NULL, dist6convthread, (void *)(ctarg+i) );
 				}
+				for( i=0; i<nthreadpair; i++ ) pthread_join( chandle[i], NULL );
+				pthread_mutex_destroy( &cmutex );
+				free( chandle );
+				free( ctarg );
 			}
+			else
+#endif
+			for( i=0; i<ien; i++ ) dist6conv_row( mtx, nogaplen, njob, i );
 			if( disopt )
 			{
 				for( i=0; i<njob; i++ ) 
@@ -4679,7 +4740,11 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			else
 			{
 				reporterr(       "Constructing a UPGMA tree (efffree=%d) ... ", !calcpairdists );
-				fixed_musclesupg_double_realloc_nobk_halfmtx_memsave( njob, mtx, topol, len, dep, 1, !calcpairdists );
+#ifdef enablemultithread
+				fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_mt( njob, mtx, topol, len, dep, 1, !calcpairdists, nthreadpair ); // fast-mafft: same tree, faster (mltaln9.c)
+#else
+				fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_mt( njob, mtx, topol, len, dep, 1, !calcpairdists, 1 ); // fast-mafft: same tree, faster (mltaln9.c)
+#endif
 				if( !calcpairdists )
 				{
 					FreeFloatHalfMtx( mtx, njob ); mtx = NULL;
@@ -5744,7 +5809,14 @@ chudan:
 
 int main( int argc, char **argv )
 {
-	int res = disttbfast( 0, 0, NULL, NULL, argc, argv, NULL );
+	int res;
+#if !defined(mingw) && !defined(_MSC_VER)
+	/* fast-mafft (overhead lever): read the input and write the alignment through 1 MB stdio
+	   buffers instead of one read()/write() per 4 KB block; the bytes are the same. */
+	if( !isatty( fileno( stdin ) ) ) setvbuf( stdin, NULL, _IOFBF, 1<<20 );
+	if( !isatty( fileno( stdout ) ) ) setvbuf( stdout, NULL, _IOFBF, 1<<20 );
+#endif
+	res = disttbfast( 0, 0, NULL, NULL, argc, argv, NULL );
 	if( res == GUI_CANCEL ) res = 0; // treeout de goto chudan wo riyousuru
 	return res;
 }
