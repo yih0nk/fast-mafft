@@ -1880,6 +1880,607 @@ static void *distancematrixthread( void *arg )
 }
 #endif // enablemultithread
 
+/*
+ * fast-mafft (work/sextet): exact fast replacement for the pair loop of the
+ * "Making a distance matrix .." (6-mer) stage.
+ *
+ * The original loop stores, for every pair j >= i,
+ *     mtx[i][j-i] = (double)commonsextet_p( table_i, pointt[j] )
+ * where table_i[p] = c_i(p) is the number of times tuple p occurs in pointt[i]
+ * and commonsextet_p() returns the int  sum over p of min( c_i(p), c_j(p) )
+ * (0 when pointt[j] is the short-sequence marker -1; table_i is all zero when
+ * pointt[i] is).  Only this integer is computed differently here.  The serial
+ * conversion loop that follows (count -> distance with lenfac and
+ * bunbo = MIN( mtx[i][0], mtx[j][0] )) is done per pair by the worker threads
+ * right after the count, with the same statements on the same double values
+ * (so the same fmadd contraction and rounding), and the original loop is
+ * skipped.  The diagonal mtx[i][0] is the number of tuples of i.
+ *
+ * DNA (tsize 4096): each row is a dense table t_i[p] = min( c_i(p), 255 ) of
+ * 4096 bytes.  With T_i = sum_p t_i(p),
+ *     sum_p min( t_i, t_j ) = ( T_i + T_j - sum_p |t_i - t_j| ) / 2
+ * and the absolute-difference sum is one NEON uaba per 16 tuples per pair,
+ * computed for 4x4 blocks of rows so each loaded vector is used 4 times.  The
+ * uaba bytes are widened into u16 lanes every K = 255/mc 16-tuple chunks,
+ * mc = largest count in the 8 rows, so no byte overflows; the u16 lanes hold
+ * at most 2*256*mc, so this path needs mc <= 127.  Blocks with a larger count
+ * use a plain loop over min( t_i, t_j ).  Saturation: min( t_i, t_j ) equals
+ * min( c_i, c_j ) unless both counts are >= 255; for those tuples the exact
+ * counts are kept in a per-row list and  min( c_i, c_j ) - 255  is added.
+ * Rows are handed out 16 at a time (a "super-row"); for each group of 4
+ * columns the 4 column tables are loaded once for all 4 row blocks.
+ *
+ * Amino acids (tsize 46656): each row keeps its list of distinct tuples with
+ * their counts (u16).  For row i a dense u16 table of c_i is filled once and
+ * each j sums min( table[p], c_j(p) ) over j's list.  If any count exceeds
+ * 65535 the original code is used.  Other tuple sizes use the original code.
+ *
+ * Debug (environment):
+ *   MAFFT_SEXTET=ref     original loop
+ *   MAFFT_SEXTET=check   also run commonsextet_p() for every pair and exit(1)
+ *                        on any bitwise difference of the stored double
+ *   MAFFT_SEXTET=scalar  DNA: skip the NEON block path (plain loop + overflow lists)
+ *   MAFFT_SEXTET=list    DNA: use the list path
+ *   MAFFT_SEXTET=counts  store counts only; the original conversion loop runs
+ *   MAFFT_SEXTET=nolftab compute lenfac for every pair (no length table)
+ *   MAFFT_SEXTET=time    print the time of each phase
+ *   MAFFT_SEXTET_DUMP=f  write the finished distance matrix (row i, j>=i, doubles)
+ *   (these combine, e.g. "scalar,check")
+ */
+/* BEGIN sextetfast kernel */
+#include <stdint.h>
+#include <sys/time.h>
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define SEXTET_NEON 1
+#else
+#define SEXTET_NEON 0
+#endif
+
+#define SEXTET_DW 4096 // DNA 6-mer table width (4^6)
+#define SEXTET_SR 16   // rows per job on the DNA path (a multiple of 4)
+#define SEXTET_LR 4    // rows per job on the list path
+#define SEXTET_LFMAX 512 // largest span of lengths for the lenfac table
+
+typedef struct _sextetfast
+{
+	int n, npad;
+	int kind;        // 1: dense DNA tables, 2: tuple lists
+	int check, scalar, timing;
+	int **pointt;
+	double **mtx;
+	int *nogaplen;
+	double *self;    // per row: number of tuples = the diagonal count mtx[i][0]
+	int convert;     // 1: store distances (the conversion of the original code), 0: counts
+	double *lftab;   // lftab[(li-lflo)*lfn + (lj-lflo)] = sextet_lenfac( li, lj ), or NULL
+	int lflo, lfn;
+	int tw;          // table width (tsize)
+	/* dense path */
+	uint8_t *tab;    // npad rows of SEXTET_DW bytes, min( count, 255 ); rows >= n stay zero
+	int *tot;        // per row: sum of the saturated counts
+	unsigned char *mc; // per row: largest saturated count
+	int *ovn;        // per row: number of tuples with count >= 255 (almost always 0)
+	int **ovp, **ovc;  // their tuples (ascending) and exact counts
+	/* list path */
+	int *ln;         // per row: number of distinct tuples
+	size_t *off;     // per row: offset into lp/lc
+	uint16_t *lp, *lc; // tuple, count
+	/* jobs */
+	int phase;       // 0: build tables/lists, 1: pairs
+	int jobpos;
+	int bad;         // list path: a count does not fit in u16
+#ifdef enablemultithread
+	pthread_mutex_t *mutex;
+#endif
+} sextetfast_t;
+
+static double sextet_now( void )
+{
+	struct timeval tv;
+	gettimeofday( &tv, NULL );
+	return( tv.tv_sec + 1e-6 * tv.tv_usec );
+}
+
+static int sextet_claim( sextetfast_t *s, int step )
+{
+	int i;
+#ifdef enablemultithread
+	if( s->mutex ) pthread_mutex_lock( s->mutex );
+#endif
+	i = s->jobpos;
+	if( i < s->n ) s->jobpos = i + step;
+#ifdef enablemultithread
+	if( s->mutex ) pthread_mutex_unlock( s->mutex );
+#endif
+	return( i );
+}
+
+static void sextet_buildrow( sextetfast_t *s, int i, int *cnt )
+{
+	int *p = s->pointt[i];
+	int k, m, point, tot, mc;
+
+	m = 0;
+	if( *p != -1 ) while( p[m] != END_OF_VEC ) m++;
+	s->self[i] = (double)m; // commonsextet_p( table_i, pointt[i] ) counts every tuple of i
+
+	if( s->kind == 1 )
+	{
+		uint8_t *t = s->tab + (size_t)i * SEXTET_DW;
+		if( *p != -1 ) for( ; ( point = *p ) != END_OF_VEC; p++ ) if( t[point] != 255 ) t[point]++;
+		tot = mc = 0;
+		for( k=0; k<SEXTET_DW; k++ )
+		{
+			tot += t[k];
+			if( t[k] > mc ) mc = t[k];
+		}
+		s->tot[i] = tot;
+		s->mc[i] = mc;
+		if( mc == 255 ) // exact counts of the saturated tuples
+		{
+			for( p=s->pointt[i]; ( point = *p ) != END_OF_VEC; p++ ) cnt[point]++;
+			for( m=0, k=0; k<SEXTET_DW; k++ ) if( cnt[k] >= 255 ) m++;
+			s->ovn[i] = m;
+			s->ovp[i] = calloc( m, sizeof( int ) );
+			s->ovc[i] = calloc( m, sizeof( int ) );
+			for( m=0, k=0; k<SEXTET_DW; k++ )
+			{
+				if( cnt[k] >= 255 )
+				{
+					s->ovp[i][m] = k;
+					s->ovc[i][m] = cnt[k];
+					m++;
+				}
+				cnt[k] = 0;
+			}
+		}
+	}
+	else
+	{
+		uint16_t *lp = s->lp + s->off[i], *lc = s->lc + s->off[i];
+		m = 0;
+		if( *p != -1 ) for( ; ( point = *p ) != END_OF_VEC; p++ ) if( cnt[point]++ == 0 ) lp[m++] = point;
+		for( k=0; k<m; k++ )
+		{
+			if( cnt[lp[k]] > 65535 ) s->bad = 1;
+			lc[k] = cnt[lp[k]];
+			cnt[lp[k]] = 0;
+		}
+		s->ln[i] = m;
+	}
+}
+
+static int sextet_ovcorr( sextetfast_t *s, int i, int j )
+{
+	int a = 0, b = 0, v = 0;
+	int na = s->ovn[i], nb = s->ovn[j];
+	int *pa = s->ovp[i], *pb = s->ovp[j], *ca = s->ovc[i], *cb = s->ovc[j];
+	while( a < na && b < nb )
+	{
+		if( pa[a] < pb[b] ) a++;
+		else if( pa[a] > pb[b] ) b++;
+		else
+		{
+			v += MIN( ca[a], cb[b] ) - 255;
+			a++; b++;
+		}
+	}
+	return( v );
+}
+
+static int sextet_pairslow( sextetfast_t *s, int i, int j )
+{
+	const uint8_t *a = s->tab + (size_t)i * SEXTET_DW;
+	const uint8_t *b = s->tab + (size_t)j * SEXTET_DW;
+	unsigned int v = 0;
+	int k;
+	for( k=0; k<SEXTET_DW; k++ ) v += ( a[k] < b[k] ) ? a[k] : b[k];
+	if( s->ovn[i] && s->ovn[j] ) v += sextet_ovcorr( s, i, j );
+	return( (int)v );
+}
+
+#if SEXTET_NEON
+// d[4r+c] = sum_p | ti[r][p] - tj[c][p] |  for 4 rows ti (consecutive tables) and 4 columns tj;
+// every count is <= mc <= 127
+static void sextet_absdiff4x4( const uint8_t *ti, const uint8_t *tj, int mc, uint32_t *d )
+{
+	const uint8_t *i0 = ti, *i1 = ti + SEXTET_DW, *i2 = ti + 2 * SEXTET_DW, *i3 = ti + 3 * SEXTET_DW;
+	const uint8_t *j0 = tj, *j1 = tj + SEXTET_DW, *j2 = tj + 2 * SEXTET_DW, *j3 = tj + 3 * SEXTET_DW;
+	int K = ( mc > 0 ) ? 255 / mc : SEXTET_DW / 16; // 16-byte chunks per u8 accumulation
+	int g, e, k;
+	uint16x8_t w00 = vdupq_n_u16( 0 ), w01 = w00, w02 = w00, w03 = w00, w10 = w00, w11 = w00, w12 = w00, w13 = w00,
+	           w20 = w00, w21 = w00, w22 = w00, w23 = w00, w30 = w00, w31 = w00, w32 = w00, w33 = w00;
+	for( g=0; g<SEXTET_DW/16; g+=K )
+	{
+		uint8x16_t a00 = vdupq_n_u8( 0 ), a01 = a00, a02 = a00, a03 = a00, a10 = a00, a11 = a00, a12 = a00, a13 = a00,
+		           a20 = a00, a21 = a00, a22 = a00, a23 = a00, a30 = a00, a31 = a00, a32 = a00, a33 = a00;
+		e = g + K;
+		if( e > SEXTET_DW/16 ) e = SEXTET_DW/16;
+		for( k=g*16; k<e*16; k+=16 )
+		{
+			uint8x16_t x0 = vld1q_u8( i0 + k ), x1 = vld1q_u8( i1 + k ), x2 = vld1q_u8( i2 + k ), x3 = vld1q_u8( i3 + k );
+			uint8x16_t y0 = vld1q_u8( j0 + k ), y1 = vld1q_u8( j1 + k ), y2 = vld1q_u8( j2 + k ), y3 = vld1q_u8( j3 + k );
+			a00 = vabaq_u8( a00, x0, y0 ); a01 = vabaq_u8( a01, x0, y1 ); a02 = vabaq_u8( a02, x0, y2 ); a03 = vabaq_u8( a03, x0, y3 );
+			a10 = vabaq_u8( a10, x1, y0 ); a11 = vabaq_u8( a11, x1, y1 ); a12 = vabaq_u8( a12, x1, y2 ); a13 = vabaq_u8( a13, x1, y3 );
+			a20 = vabaq_u8( a20, x2, y0 ); a21 = vabaq_u8( a21, x2, y1 ); a22 = vabaq_u8( a22, x2, y2 ); a23 = vabaq_u8( a23, x2, y3 );
+			a30 = vabaq_u8( a30, x3, y0 ); a31 = vabaq_u8( a31, x3, y1 ); a32 = vabaq_u8( a32, x3, y2 ); a33 = vabaq_u8( a33, x3, y3 );
+		}
+		w00 = vpadalq_u8( w00, a00 ); w01 = vpadalq_u8( w01, a01 ); w02 = vpadalq_u8( w02, a02 ); w03 = vpadalq_u8( w03, a03 );
+		w10 = vpadalq_u8( w10, a10 ); w11 = vpadalq_u8( w11, a11 ); w12 = vpadalq_u8( w12, a12 ); w13 = vpadalq_u8( w13, a13 );
+		w20 = vpadalq_u8( w20, a20 ); w21 = vpadalq_u8( w21, a21 ); w22 = vpadalq_u8( w22, a22 ); w23 = vpadalq_u8( w23, a23 );
+		w30 = vpadalq_u8( w30, a30 ); w31 = vpadalq_u8( w31, a31 ); w32 = vpadalq_u8( w32, a32 ); w33 = vpadalq_u8( w33, a33 );
+	}
+	d[0]  = vaddlvq_u16( w00 ); d[1]  = vaddlvq_u16( w01 ); d[2]  = vaddlvq_u16( w02 ); d[3]  = vaddlvq_u16( w03 );
+	d[4]  = vaddlvq_u16( w10 ); d[5]  = vaddlvq_u16( w11 ); d[6]  = vaddlvq_u16( w12 ); d[7]  = vaddlvq_u16( w13 );
+	d[8]  = vaddlvq_u16( w20 ); d[9]  = vaddlvq_u16( w21 ); d[10] = vaddlvq_u16( w22 ); d[11] = vaddlvq_u16( w23 );
+	d[12] = vaddlvq_u16( w30 ); d[13] = vaddlvq_u16( w31 ); d[14] = vaddlvq_u16( w32 ); d[15] = vaddlvq_u16( w33 );
+}
+#endif
+
+// lenfac of the conversion loop of the original code (below the pair loop in
+// disttbfast()) for nogaplen[i] = li, nogaplen[j] = lj; same statements
+static double sextet_lenfac( int li, int lj )
+{
+	double longer, shorter;
+	double lenfac;
+
+	if( li > lj )
+	{
+		longer=(double)li;
+		shorter=(double)lj;
+	}
+	else
+	{
+		longer=(double)lj;
+		shorter=(double)li;
+	}
+	lenfac = 1.0 / ( shorter / longer * lenfacd + lenfacb / ( longer + lenfacc ) + lenfaca );
+	return( lenfac );
+}
+
+// Stores the count of pair (i,j), j >= i.  With s->convert, j > i gets the
+// distance, computed by the same statements as the conversion loop of the
+// original code, where mtx[i][j-i] holds (double)cnt and mtx[i][0], mtx[j][0]
+// hold the diagonal counts.  lenfac depends only on the two lengths; when they
+// span at most SEXTET_LFMAX values it is read from a table filled by
+// sextet_lenfac() (the same double), which saves 3 of the 4 divisions.
+static void sextet_store( sextetfast_t *s, int i, int j, int cnt )
+{
+	double lenfac;
+	double bunbo;
+	double **mtx = s->mtx;
+
+	mtx[i][j-i] = (double)cnt;
+	if( j == i || !s->convert ) return;
+
+	if( s->lftab )
+		lenfac = s->lftab[( s->nogaplen[i] - s->lflo ) * s->lfn + ( s->nogaplen[j] - s->lflo )];
+	else
+		lenfac = sextet_lenfac( s->nogaplen[i], s->nogaplen[j] );
+	bunbo = MIN( s->self[i], s->self[j] );
+	if( bunbo == 0.0 )
+		mtx[i][j-i] = 2.0; // 2013/Oct/17 -> 2bai
+	else
+		mtx[i][j-i] = ( 1.0 - mtx[i][j-i] / bunbo ) * lenfac * 2.0; // 2013/Oct/17 -> 2bai
+}
+
+// rows i0 .. i0+SEXTET_SR-1, every j >= i
+static void sextet_densejob( sextetfast_t *s, int i0 )
+{
+	int n = s->n;
+	int i1 = MIN( i0 + SEXTET_SR, n );
+	int ib, jb, r, c, i, j, mcb, mcj;
+#if SEXTET_NEON
+	uint32_t d[16];
+#endif
+
+	for( jb=i0; jb<n; jb+=4 )
+	{
+		mcj = MAX( MAX( s->mc[jb], s->mc[jb+1] ), MAX( s->mc[jb+2], s->mc[jb+3] ) );
+		for( ib=i0; ib<i1 && ib<=jb; ib+=4 )
+		{
+			mcb = MAX( mcj, MAX( MAX( s->mc[ib], s->mc[ib+1] ), MAX( s->mc[ib+2], s->mc[ib+3] ) ) );
+#if SEXTET_NEON
+			if( mcb <= 127 && !s->scalar )
+			{
+				sextet_absdiff4x4( s->tab + (size_t)ib * SEXTET_DW, s->tab + (size_t)jb * SEXTET_DW, mcb, d );
+				for( r=0; r<4; r++ ) for( c=0; c<4; c++ )
+				{
+					i = ib + r; j = jb + c;
+					if( i < n && j < n && j >= i )
+						sextet_store( s, i, j, ( s->tot[i] + s->tot[j] - (int)d[r*4+c] ) / 2 );
+				}
+				continue;
+			}
+#endif
+			for( r=0; r<4; r++ ) for( c=0; c<4; c++ )
+			{
+				i = ib + r; j = jb + c;
+				if( i < n && j < n && j >= i )
+					sextet_store( s, i, j, sextet_pairslow( s, i, j ) );
+			}
+		}
+	}
+}
+
+static void sextet_listrow( sextetfast_t *s, int i, uint16_t *tab )
+{
+	int n = s->n;
+	int j, k, m;
+	uint16_t *lp = s->lp + s->off[i], *lc = s->lc + s->off[i];
+
+	m = s->ln[i];
+	for( k=0; k<m; k++ ) tab[lp[k]] = lc[k];
+	for( j=i; j<n; j++ )
+	{
+		const uint16_t *p = s->lp + s->off[j], *c = s->lc + s->off[j];
+		unsigned int v0 = 0, v1 = 0, a, b;
+		int mj = s->ln[j];
+		for( k=0; k+1<mj; k+=2 )
+		{
+			a = tab[p[k]];   b = c[k];   v0 += ( a < b ) ? a : b;
+			a = tab[p[k+1]]; b = c[k+1]; v1 += ( a < b ) ? a : b;
+		}
+		if( k < mj )
+		{
+			a = tab[p[k]]; b = c[k]; v0 += ( a < b ) ? a : b;
+		}
+		sextet_store( s, i, j, (int)( v0 + v1 ) );
+	}
+	for( k=0; k<m; k++ ) tab[lp[k]] = 0;
+}
+
+// Reference for the check: the original count (commonsextet_p) and, with
+// s->convert, the original conversion statements applied to it.
+static void sextet_checkrow( sextetfast_t *s, int i )
+{
+	int j;
+	double v;
+	double longer, shorter;
+	double lenfac;
+	double bunbo;
+	int *nogaplen = s->nogaplen;
+	int *table1 = (int *)calloc( s->tw, sizeof( int ) );
+	if( !table1 ) ErrorExit( "Cannot allocate table1\n" );
+	makecompositiontable_p( table1, s->pointt[i] );
+	for( j=i; j<s->n; j++ )
+	{
+		v = (double)commonsextet_p( table1, s->pointt[j] );
+		if( j == i && memcmp( &v, &s->self[i], sizeof( double ) ) )
+		{
+			reporterr( "\nsextetfast check FAILED: self count of %d: original=%.17g fast=%.17g\n", i, v, s->self[i] );
+			exit( 1 );
+		}
+		if( j > i && s->convert )
+		{
+			if( nogaplen[i] > nogaplen[j] )
+			{
+				longer=(double)nogaplen[i];
+				shorter=(double)nogaplen[j];
+			}
+			else
+			{
+				longer=(double)nogaplen[j];
+				shorter=(double)nogaplen[i];
+			}
+			lenfac = 1.0 / ( shorter / longer * lenfacd + lenfacb / ( longer + lenfacc ) + lenfaca );
+			bunbo = MIN( s->self[i], s->self[j] );
+			if( bunbo == 0.0 )
+				v = 2.0;
+			else
+				v = ( 1.0 - v / bunbo ) * lenfac * 2.0;
+		}
+		if( memcmp( &v, &s->mtx[i][j-i], sizeof( double ) ) )
+		{
+			reporterr( "\nsextetfast check FAILED: i=%d j=%d original=%.17g fast=%.17g (kind %d, %s)\n", i, j, v, s->mtx[i][j-i], s->kind, s->convert ? "distance" : "count" );
+			exit( 1 );
+		}
+	}
+	free( table1 );
+}
+
+static void *sextet_thread( void *arg )
+{
+	sextetfast_t *s = (sextetfast_t *)arg;
+	int i, i0, i1, step;
+	int *cnt;
+	uint16_t *tab = NULL;
+
+	if( s->phase == 0 )
+	{
+		cnt = (int *)calloc( s->tw, sizeof( int ) );
+		if( !cnt ) ErrorExit( "Cannot allocate cnt\n" );
+		while( ( i0 = sextet_claim( s, 64 ) ) < s->n )
+		{
+			i1 = MIN( i0 + 64, s->n );
+			for( i=i0; i<i1; i++ ) sextet_buildrow( s, i, cnt );
+		}
+		free( cnt );
+		return( NULL );
+	}
+
+	step = ( s->kind == 1 ) ? SEXTET_SR : SEXTET_LR;
+	if( s->kind == 2 )
+	{
+		tab = (uint16_t *)calloc( s->tw, sizeof( uint16_t ) );
+		if( !tab ) ErrorExit( "Cannot allocate tab\n" );
+	}
+	while( ( i0 = sextet_claim( s, step ) ) < s->n )
+	{
+		i1 = MIN( i0 + step, s->n );
+		if( i0 % 100 == 0 || i0 / 100 != ( i1 - 1 ) / 100 ) reporterr( "\r% 5d / %d", i1, s->n );
+		if( s->kind == 1 ) sextet_densejob( s, i0 );
+		else for( i=i0; i<i1; i++ ) sextet_listrow( s, i, tab );
+		if( s->check ) for( i=i0; i<i1; i++ ) sextet_checkrow( s, i );
+	}
+	if( s->check ) commonsextet_p( NULL, NULL );
+	free( tab );
+	return( NULL );
+}
+
+static void sextetfast_free( sextetfast_t *s )
+{
+	int i;
+	if( s->ovp ) for( i=0; i<s->npad; i++ )
+	{
+		free( s->ovp[i] );
+		free( s->ovc[i] );
+	}
+	free( s->tab ); free( s->tot ); free( s->mc ); free( s->ovn ); free( s->ovp ); free( s->ovc );
+	free( s->ln ); free( s->off ); free( s->lp ); free( s->lc );
+	free( s->self );
+	free( s->lftab );
+}
+
+// Fills mtx[i][j-i] (j >= i) with the common tuple counts that the original
+// pair loop stores and returns 1, or also converts them to distances, exactly
+// as the conversion loop that follows it, and returns 2 (then that loop must
+// be skipped).  Returns 0, with mtx untouched, when the original code must be used.
+static int sextetfast_run( int njob, int **pointt, double **mtx, int *nogaplen )
+{
+	sextetfast_t s;
+	const char *mode = getenv( "MAFFT_SEXTET" );
+	int i, m, t, nthr = 1;
+	int *p;
+	double t0, t1, t2;
+#ifdef enablemultithread
+	pthread_t *handle = NULL;
+	pthread_mutex_t mutex;
+#endif
+
+	if( mode && strstr( mode, "ref" ) ) return( 0 );
+	if( njob < 1 ) return( 0 );
+	memset( &s, 0, sizeof( s ) );
+	s.n = njob;
+	s.npad = ( njob + 3 ) & ~3;
+	s.pointt = pointt;
+	s.mtx = mtx;
+	s.nogaplen = nogaplen;
+	s.convert = !( mode && strstr( mode, "counts" ) );
+	s.tw = tsize;
+	s.check = ( mode && strstr( mode, "check" ) );
+	s.scalar = ( mode && strstr( mode, "scalar" ) );
+	s.timing = ( mode && strstr( mode, "time" ) );
+	if( tsize == SEXTET_DW && !( mode && strstr( mode, "list" ) ) ) s.kind = 1;
+	else if( tsize == SEXTET_DW || tsize == 46656 ) s.kind = 2;
+	else return( 0 );
+
+	t0 = sextet_now();
+	s.self = calloc( s.npad, sizeof( double ) );
+	if( !s.self ) return( 0 );
+	if( s.convert && !( mode && strstr( mode, "nolftab" ) ) )
+	{
+		int lo = nogaplen[0], hi = nogaplen[0], a, b;
+		for( i=1; i<njob; i++ )
+		{
+			if( nogaplen[i] < lo ) lo = nogaplen[i];
+			if( nogaplen[i] > hi ) hi = nogaplen[i];
+		}
+		if( hi - lo < SEXTET_LFMAX && ( s.lftab = malloc( sizeof( double ) * ( hi - lo + 1 ) * ( hi - lo + 1 ) ) ) )
+		{
+			s.lflo = lo;
+			s.lfn = hi - lo + 1;
+			for( a=0; a<s.lfn; a++ ) for( b=0; b<s.lfn; b++ ) s.lftab[a*s.lfn+b] = sextet_lenfac( lo + a, lo + b );
+		}
+	}
+	if( s.kind == 1 )
+	{
+		if( posix_memalign( (void **)&s.tab, 128, (size_t)s.npad * SEXTET_DW ) )
+		{
+			s.tab = NULL;
+			sextetfast_free( &s );
+			return( 0 );
+		}
+		memset( s.tab, 0, (size_t)s.npad * SEXTET_DW );
+		s.tot = calloc( s.npad, sizeof( int ) );
+		s.mc = calloc( s.npad, 1 );
+		s.ovn = calloc( s.npad, sizeof( int ) );
+		s.ovp = calloc( s.npad, sizeof( int * ) );
+		s.ovc = calloc( s.npad, sizeof( int * ) );
+		if( !s.tot || !s.mc || !s.ovn || !s.ovp || !s.ovc )
+		{
+			sextetfast_free( &s );
+			return( 0 );
+		}
+	}
+	else
+	{
+		s.ln = calloc( njob, sizeof( int ) );
+		s.off = calloc( njob + 1, sizeof( size_t ) );
+		if( !s.ln || !s.off )
+		{
+			sextetfast_free( &s );
+			return( 0 );
+		}
+		for( i=0; i<njob; i++ )
+		{
+			p = pointt[i];
+			m = 0;
+			if( *p != -1 ) while( *p++ != END_OF_VEC ) m++;
+			s.off[i+1] = s.off[i] + m;
+		}
+		s.lp = malloc( ( s.off[njob] + 1 ) * sizeof( uint16_t ) );
+		s.lc = malloc( ( s.off[njob] + 1 ) * sizeof( uint16_t ) );
+		if( !s.lp || !s.lc )
+		{
+			sextetfast_free( &s );
+			return( 0 );
+		}
+	}
+
+#ifdef enablemultithread
+	if( nthreadpair > 1 )
+	{
+		nthr = nthreadpair;
+		pthread_mutex_init( &mutex, NULL );
+		s.mutex = &mutex;
+		handle = calloc( nthr, sizeof( pthread_t ) );
+	}
+#endif
+	t1 = t0;
+	for( s.phase=0; s.phase<2; s.phase++ )
+	{
+		s.jobpos = 0;
+#ifdef enablemultithread
+		if( nthr > 1 )
+		{
+			for( t=0; t<nthr; t++ ) pthread_create( handle+t, NULL, sextet_thread, (void *)&s );
+			for( t=0; t<nthr; t++ ) pthread_join( handle[t], NULL );
+		}
+		else
+#endif
+			sextet_thread( (void *)&s );
+		if( s.phase == 0 )
+		{
+			t1 = sextet_now();
+			if( s.bad ) break;
+		}
+	}
+	t2 = sextet_now();
+#ifdef enablemultithread
+	if( nthr > 1 )
+	{
+		pthread_mutex_destroy( &mutex );
+		free( handle );
+	}
+#endif
+	sextetfast_free( &s );
+	if( s.bad ) return( 0 ); // a list count did not fit; mtx was not written
+	if( s.timing ) reporterr( "\nsextetfast: kind %d, %d threads, tables %.3f s, pairs %.3f s\n", s.kind, nthr, t1 - t0, t2 - t1 );
+	if( s.check ) reporterr( "\nsextetfast check passed: kind %d, %d rows, every pair's %s bitwise identical\n", s.kind, njob, s.convert ? "distance" : "count" );
+	return( s.convert ? 2 : 1 );
+}
+// MAFFT_SEXTET_DUMP: the 6-mer distance matrix, row i = mtx[i][0..n-1-i] as raw doubles
+static void sextet_dump( const char *fn, int n, double **mtx )
+{
+	int i;
+	FILE *fp = fopen( fn, "wb" );
+	if( !fp ) return;
+	for( i=0; i<n; i++ ) fwrite( mtx[i], sizeof( double ), n - i, fp );
+	fclose( fp );
+}
+/* END sextetfast kernel */
+
 static void recountpositions( ExtAnch *pairanch, int n1, int n2, char **seq1, char **seq2 ) // loop no junban kentou
 {
 	int i, j, k, len, pos;
@@ -3947,6 +4548,7 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 	double longer, shorter;
 	double lenfac;
 	double bunbo;
+	int sextetdone = 0; // fast-mafft (work/sextet)
 
 	FILE *orderfp = NULL, *hat2p = NULL;
 	int *grpseq = NULL;
@@ -4481,6 +5083,8 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 		}
 		else
 		{
+			sextetdone = callback ? 0 : sextetfast_run( njob, pointt, mtx, nogaplen ); // fast-mafft (work/sextet)
+			if( !sextetdone ) {
 #ifdef enablemultithread
 			if( nthreadpair > 0 )
 			{
@@ -4535,11 +5139,15 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 					free( table1 ); table1 = NULL;
 				}
 			}
+			} // fast-mafft (work/sextet)
 			reporterr(       "\ndone.\n\n" );
 			ien = njob-1;
-	
+
 			// fast-mafft (overhead lever): the original loop, row by row (dist6conv_row), on
-			// nthreadpair threads when there are enough rows
+			// nthreadpair threads when there are enough rows.
+			// fast-mafft (merge): skipped when work/sextet already stored final distances (sextetdone == 2)
+			if( sextetdone != 2 )
+			{
 #ifdef enablemultithread
 			if( nthreadpair > 1 && njob >= 1000 )
 			{
@@ -4567,6 +5175,7 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			else
 #endif
 			for( i=0; i<ien; i++ ) dist6conv_row( mtx, nogaplen, njob, i );
+			} // fast-mafft (merge): end sextetdone != 2
 			if( disopt )
 			{
 				for( i=0; i<njob; i++ ) 
@@ -4575,6 +5184,7 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 					strins( b, name[i] );
 				}
 			}
+			if( getenv( "MAFFT_SEXTET_DUMP" ) ) sextet_dump( getenv( "MAFFT_SEXTET_DUMP" ), njob, mtx ); // fast-mafft (work/sextet)
 			FreeIntMtx( pointt ); pointt = NULL;
 			commonsextet_p( NULL, NULL );
 		}
