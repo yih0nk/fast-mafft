@@ -1,5 +1,6 @@
 #include "mltaln.h"
 #include "progtiming.h"
+#include "dphelp.h"
 #ifdef PROGTIMING
 typedef struct { int l, thread, clus1, clus2, len1, len2, c0, c1; double t[8]; double acc[PT_NACC]; } ptrec_t;
 static ptrec_t *ptlog = NULL;
@@ -2819,9 +2820,13 @@ typedef struct _tbsched
 	int *heap;     // ready steps, max-heap on prio (ties: smaller index first)
 	int nheap;
 	int ntaken;    // steps handed out so far
+	int ndone;     // steps finished (work/prog2: idle threads stay until all are done, to help)
 	int *parent;   // parent step of each step, -1 for the root
 	double *prio;
-	int inorder;   // 1: original in-order dispatch (A/B testing only)
+	int inorder;   // 1: original in-order dispatch
+	int optimistic; // work/prog2: ready queue while the memsave switch has not fired; abort on it (see below)
+	int abort;     // work/prog2: set when a step finds a child longer than 30000 columns
+	char *started; // work/prog2: step handed out (for the clean-up after an abort)
 } tbsched_t;
 
 static int tbsched_before( tbsched_t *sc, int a, int b )
@@ -2862,16 +2867,20 @@ static int tbsched_isready( Treedep *dep, int l )
 	return( ( dep[l].child0 == -1 || dep[dep[l].child0].done ) && ( dep[l].child1 == -1 || dep[dep[l].child1].done ) );
 }
 
-static void tbsched_init( tbsched_t *sc, int njob, Treedep *dep, int inorder )
+static void tbsched_init( tbsched_t *sc, int njob, Treedep *dep, int inorder, int optimistic )
 {
 	int l, nstep = njob - 1;
 	double *size = calloc( nstep, sizeof( double ) );
 	sc->heap = calloc( nstep, sizeof( int ) );
 	sc->parent = calloc( nstep, sizeof( int ) );
 	sc->prio = calloc( nstep, sizeof( double ) );
+	sc->started = calloc( nstep, sizeof( char ) );
 	sc->nheap = 0;
 	sc->ntaken = 0;
+	sc->ndone = 0;
 	sc->inorder = inorder;
+	sc->optimistic = optimistic && !inorder;
+	sc->abort = 0;
 #ifdef PROGTIMING
 	if( getenv( "MAFFT_INORDER" ) ) sc->inorder = 1;
 #endif
@@ -2891,6 +2900,7 @@ static void tbsched_init( tbsched_t *sc, int njob, Treedep *dep, int inorder )
 
 static void tbsched_free( tbsched_t *sc )
 {
+	free( sc->started );
 	free( sc->heap );
 	free( sc->parent );
 	free( sc->prio );
@@ -2899,7 +2909,24 @@ static void tbsched_free( tbsched_t *sc )
 static void tbsched_done( tbsched_t *sc, Treedep *dep, int l ) // call with the mutex held, after dep[l].done = 1
 {
 	int p = sc->parent[l];
+	sc->ndone++;
 	if( p != -1 && tbsched_isready( dep, p ) ) tbsched_push( sc, p );
+}
+
+/* work/prog2: copying the member rows in and out of the local copies, split among idle helpers
+   for large groups (each row is copied by exactly one thread; strcpy as before). */
+typedef struct { char **dst, **src; int *mem; } rowcopy_t;
+static void rowcopy_body( void *vctx, int lo, int hi )
+{
+	rowcopy_t *c = (rowcopy_t *)vctx;
+	int i;
+	for( i=lo; i<hi; i++ ) strcpy( c->dst[c->mem[i]], c->src[c->mem[i]] );
+}
+static void rowcopy_all( char **dst, char **src, int *mem, int n, int rowlen )
+{
+	rowcopy_t c;
+	c.dst = dst; c.src = src; c.mem = mem;
+	dphelp_for( n, MAX( 32, n / 32 ), (double)n * rowlen, 8.0e6, rowcopy_body, &c );
 }
 
 static void *treebasethread( void *arg )
@@ -2946,6 +2973,8 @@ static void *treebasethread( void *arg )
 	double orieff1, orieff2;
 	ExtAnch *pairanch = NULL;
 	int localcopylen = 0;
+	char *lcblk = NULL; // work/prog2: per-thread block holding the local copies of the member rows
+	size_t lccap = 0;
 #if SKIP
 	int **skiptable1 = NULL, **skiptable2 = NULL;
 #endif
@@ -2990,15 +3019,30 @@ static void *treebasethread( void *arg )
 		if( targ->sched && !targ->sched->inorder )
 		{
 			tbsched_t *sc = targ->sched;
-			while( sc->nheap == 0 && sc->ntaken < njob-1 )
+			/* work/prog2: a thread with no ready step helps with posted jobs (large alignments of
+			   other threads, see dphelp.h) and stays until every step is finished, so that the
+			   last merges at the root still find helpers.  Without a pool it leaves as soon as
+			   every step has been handed out, as before. */
+			while( 1 )
+			{
+				if( sc->abort ) break; // work/prog2: the pass is being restarted in order (see below)
+				if( sc->nheap > 0 ) break;
+				if( dphelppool && dphelp_serve_locked() ) continue;
+				if( dphelppool ? ( sc->ndone == njob-1 ) : ( sc->ntaken == njob-1 ) ) break;
+				if( dphelppool ) dphelppool->nidle++;
 				pthread_cond_wait( targ->treecond, targ->mutex );
-			if( sc->ntaken == njob-1 )
+				if( dphelppool ) dphelppool->nidle--;
+			}
+			if( sc->nheap == 0 || sc->abort )
+			{
 				l = njob-1; // nothing left: exit below
+				pthread_cond_broadcast( targ->treecond ); // wake idle threads so they can exit
+			}
 			else
 			{
 				l = tbsched_pop( sc );
 				sc->ntaken++;
-				if( sc->ntaken == njob-1 ) pthread_cond_broadcast( targ->treecond ); // wake idle threads so they can exit
+				sc->started[l] = 1;
 			}
 		}
 		else
@@ -3024,6 +3068,7 @@ static void *treebasethread( void *arg )
 			if( specificityconsideration )
 				FreeDoubleMtx( dynamicmtx );
 			free( localmem );
+			free( lcblk );
 			return( NULL );
 		}
 		if( !targ->sched || targ->sched->inorder ) *jobpospt = l+1;
@@ -3034,12 +3079,22 @@ static void *treebasethread( void *arg )
 		if( dep[l].child0 != -1 )
 		{
 			while( dep[dep[l].child0].done == 0 )
+			{
+				if( dphelppool && dphelp_serve_locked() ) continue; // work/prog2: help while waiting
+				if( dphelppool ) dphelppool->nidle++;
 				pthread_cond_wait( targ->treecond, targ->mutex );
+				if( dphelppool ) dphelppool->nidle--;
+			}
 		}
 		if( dep[l].child1 != -1 ) 
 		{
 			while( dep[dep[l].child1].done == 0 )
+			{
+				if( dphelppool && dphelp_serve_locked() ) continue;
+				if( dphelppool ) dphelppool->nidle++;
 				pthread_cond_wait( targ->treecond, targ->mutex );
+				if( dphelppool ) dphelppool->nidle--;
+			}
 		}
 
 
@@ -3137,6 +3192,21 @@ static void *treebasethread( void *arg )
 		}
 		localcopylen = *alloclen; // work/prog: the member rows are copied after the mutex is released
 
+		/* work/prog2: with the ready queue, steps run out of index order, and the one-way switch
+		   below would then take effect at a different step than in the original in-order dispatch.
+		   So the first step that would flip it abandons the pass instead; disttbfast() then runs the
+		   pass again from the start with the original dispatch (bitwise the same as before as long
+		   as the switch never fires, since until then every step uses the same aligner). */
+		if( targ->sched && targ->sched->optimistic && !nevermemsave && ( alg != 'M' && ( len1 > 30000 || len2 > 30000  ) ) )
+		{
+			targ->sched->abort = 1;
+			(*nrunpt)--;
+			pthread_cond_broadcast( targ->treecond );
+			pthread_mutex_unlock( targ->mutex );
+			free( localmem[0] ); // the children's member lists, consumed as a finished step would
+			free( localmem[1] );
+			continue;
+		}
 		if( !nevermemsave && ( alg != 'M' && ( len1 > 30000 || len2 > 30000  ) ) )
 		{
 			reporterr(       "\nlen1=%d, len2=%d, Switching to the memsave mode\n", len1, len2 );
@@ -3158,11 +3228,31 @@ static void *treebasethread( void *arg )
 		   children, so nobody writes them now; the read lock only excludes a concurrent
 		   ReallocateCharMtx() by another thread.  Buffer size as in the original (alloclen at the
 		   time of the length check, > len1+len2). */
-		for( i=0; (j=localmem[0][i])!=-1; i++ ) localcopy[j] = calloc( localcopylen, sizeof( char ) );
-		for( i=0; (j=localmem[1][i])!=-1; i++ ) localcopy[j] = calloc( localcopylen, sizeof( char ) );
+		/* work/prog2: the copies live in one per-thread block (rows of localcopylen chars) that is
+		   reused across steps, instead of a calloc() per row per step. */
+		{
+			size_t need = (size_t)localcopylen * ( clus1 + clus2 ), k = 0;
+			if( need > lccap )
+			{
+				free( lcblk );
+				lccap = need + need / 2;
+				lcblk = malloc( lccap );
+				if( lcblk == NULL ) ErrorExit( "Cannot allocate the local copies in treebasethread.\n" );
+			}
+			for( i=0; (j=localmem[0][i])!=-1; i++ ) { localcopy[j] = lcblk + k; k += localcopylen; }
+			for( i=0; (j=localmem[1][i])!=-1; i++ ) { localcopy[j] = lcblk + k; k += localcopylen; }
+		}
 		pthread_rwlock_rdlock( targ->aseqlock );
+		if( clus1 + clus2 > 256 ) // work/prog2: large groups: row copies shared with idle helpers
+		{
+			rowcopy_all( localcopy, aseq, localmem[0], clus1, len1 );
+			rowcopy_all( localcopy, aseq, localmem[1], clus2, len2 );
+		}
+		else
+		{
 		for( i=0; (j=localmem[0][i])!=-1; i++ ) strcpy( localcopy[j], aseq[j] );
 		for( i=0; (j=localmem[1][i])!=-1; i++ ) strcpy( localcopy[j], aseq[j] );
+		}
 		pthread_rwlock_unlock( targ->aseqlock );
 
 #if 1 // CHUUI@@@@
@@ -3402,10 +3492,19 @@ static void *treebasethread( void *arg )
 		/* work/prog: write the aligned rows back before the step is marked done (the parent reads
 		   them only after that), under the aseq read lock instead of the global mutex. */
 		pthread_rwlock_rdlock( targ->aseqlock );
+		if( clus1 + clus2 > 256 ) // work/prog2: see the copy-in above
+		{
+			int newlen = strlen( localcopy[localmem[0][0]] );
+			rowcopy_all( aseq, localcopy, localmem[0], clus1, newlen );
+			rowcopy_all( aseq, localcopy, localmem[1], clus2, newlen );
+		}
+		else
+		{
 		for( i=0; (j=localmem[0][i])!=-1; i++ )
 			strcpy( aseq[j], localcopy[j] );
 		for( i=0; (j=localmem[1][i])!=-1; i++ )
 			strcpy( aseq[j], localcopy[j] );
+		}
 		pthread_rwlock_unlock( targ->aseqlock );
 
 		pthread_mutex_lock( targ->mutex );
@@ -3423,16 +3522,8 @@ static void *treebasethread( void *arg )
 
 
 
-		for( i=0; (j=localmem[0][i])!=-1; i++ )
-		{
-			if(localcopy[j] ) free( localcopy[j] );
-			localcopy[j] = NULL;
-		}
-		for( i=0; (j=localmem[1][i])!=-1; i++ )
-		{
-			if( localcopy[j] ) free( localcopy[j] );
-			localcopy[j] = NULL;
-		}
+		for( i=0; (j=localmem[0][i])!=-1; i++ ) localcopy[j] = NULL; // work/prog2: rows live in lcblk
+		for( i=0; (j=localmem[1][i])!=-1; i++ ) localcopy[j] = NULL;
 
 
 //		if( topol[l][0] ) free( topol[l][0] );
@@ -5799,6 +5890,7 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			int nthread_yoyu;
 			tbsched_t tbsched;
 			pthread_rwlock_t aseqlock;
+			dphelppool_t tbpool;
 	
 			nthread_yoyu = nthreadtb * 1;
 			nrun = 0;
@@ -5810,14 +5902,59 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			pthread_cond_init( &treecond, NULL );
 			pthread_rwlock_init( &aseqlock, NULL );
 	
+			/* The only order-dependent state in the progressive pass is the one-way switch to the
+			   memsave algorithm (alg = 'M') at the first step (in dispatch order) with a child longer
+			   than 30000 columns.  work/prog2:
+			   - one thread: always the original in-order dispatch (bitwise the order of the original;
+			     the ready queue gains nothing there);
+			   - more threads, switch still possible: the ready queue runs "optimistically"; the first
+			     step that would flip the switch abandons the pass, and the pass is run again from the
+			     start with the original in-order dispatch (tbsched_t.abort, the attempt loop below).
+			     Until the switch fires every step uses the same aligner whatever the order, so a
+			     pass that is not abandoned is exactly what the original computes; an abandoned one is
+			     redone with the original's own dispatch (and its own run-to-run behaviour);
+			   - switch impossible (--nomemsave, or already 'M' from pass 1): ready queue. */
+			static int tb_abandonedbefore = 0; // an earlier pass had to be redone: expect the same here
+			int tb_inorder = ( nthreadtb <= 1 || tb_abandonedbefore );
+#ifdef PROGTIMING
+			if( nthreadtb <= 1 && getenv( "MAFFT_READYQ1" ) && !tb_abandonedbefore ) tb_inorder = 0; // A/B: optimistic ready queue at one thread
+#endif
+			int tb_optimistic = ( !nevermemsave && alg != 'M' );
+			int tb_attempt;
+			char **tb_saveseq = NULL;
+			int *tb_savenlen = NULL;
+			if( !tb_inorder && tb_optimistic ) // what an abandoned attempt changes, to put it back
+			{
+				tb_saveseq = calloc( njob, sizeof( char * ) );
+				for( i=0; i<njob; i++ ) { tb_saveseq[i] = malloc( strlen( bseq[i] ) + 1 ); strcpy( tb_saveseq[i], bseq[i] ); }
+				tb_savenlen = calloc( njob, sizeof( int ) );
+				for( i=0; i<njob; i++ ) tb_savenlen[i] = nlen[i];
+			}
+			for( tb_attempt=0; ; tb_attempt++ )
+			{
+			nrun = 0;
+			jobpos = 0;
 			for( i=0; i<njob; i++ ) dep[i].done = 0; 
 			for( i=0; i<njob; i++ ) fftlog[i] = 1; 
-			/* The only order-dependent state in the progressive pass is the one-way switch to the
-			   memsave algorithm (alg = 'M') at the first step whose profile exceeds 30000 columns.
-			   When that can plausibly happen, keep the original in-order dispatch. */
-			tbsched_init( &tbsched, njob, dep, ( !nevermemsave && alg != 'M' && nlenmax > 3000 ) );
+			tbsched_init( &tbsched, njob, dep, tb_inorder, tb_optimistic );
+			/* work/prog2: idle threads help with large alignments (with the in-order dispatch, the
+			   threads that wait for the children of their step help as well) */
+#ifdef PROGTIMING
+			if( nthread_yoyu > 1 && !getenv( "MAFFT_NOHELP" ) ) // A/B switch in timing builds
+#else
+			if( nthread_yoyu > 1 )
+#endif
+			{
+				tbpool.mutex = &mutex;
+				tbpool.cond = &treecond;
+				tbpool.nidle = 0;
+				tbpool.jobs = NULL;
+				tbpool.pending = NULL;
+				dphelppool = &tbpool;
+			}
 #ifdef PROGTIMING
 			if( getenv( "MAFFT_PROGLOG" ) ) { ptlog = calloc( njob, sizeof( ptrec_t ) ); pt_base = pt_now(); }
+			struct rusage pt_ru0; double pt_w0 = pt_now(); getrusage( RUSAGE_SELF, &pt_ru0 );
 #endif
 	
 			for( i=0; i<nthread_yoyu; i++ )
@@ -5866,12 +6003,48 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 				pthread_join( handle[i], NULL );
 			}
 #ifdef PROGTIMING
+			{
+				struct rusage pt_ru1; double pt_w1 = pt_now(); getrusage( RUSAGE_SELF, &pt_ru1 );
+				reporterr( "\nPTRUSAGE pass=%d wall=%.3f user=%.3f sys=%.3f minflt=%ld majflt=%ld nivcsw=%ld nvcsw=%ld\n", iguidetree, pt_w1 - pt_w0,
+					( pt_ru1.ru_utime.tv_sec - pt_ru0.ru_utime.tv_sec ) + 1e-6 * ( pt_ru1.ru_utime.tv_usec - pt_ru0.ru_utime.tv_usec ),
+					( pt_ru1.ru_stime.tv_sec - pt_ru0.ru_stime.tv_sec ) + 1e-6 * ( pt_ru1.ru_stime.tv_usec - pt_ru0.ru_stime.tv_usec ),
+					pt_ru1.ru_minflt - pt_ru0.ru_minflt, pt_ru1.ru_majflt - pt_ru0.ru_majflt, pt_ru1.ru_nivcsw - pt_ru0.ru_nivcsw, pt_ru1.ru_nvcsw - pt_ru0.ru_nvcsw );
+			}
 			ptlog_write( njob, iguidetree );
 			free( ptlog ); ptlog = NULL;
 #endif
+			dphelppool = NULL;
+			if( !tbsched.abort )
+			{
+				tbsched_free( &tbsched );
+				break;
+			}
+			/* work/prog2: abandoned (see above): undo the attempt and run the pass again in order.
+			   The aligned rows and nlen go back to their saved values; profile caches and member
+			   lists are dropped (a member list is still owned by its step when that step was handed
+			   out but its parent was not); done flags and fftlog are reset at the top. */
+			reporterr( "\nAn alignment exceeds 30000 columns: redoing this pass with the original step order.\n" );
+			for( i=0; i<njob; i++ ) strcpy( bseq[i], tb_saveseq[i] );
+			for( i=0; i<njob; i++ ) nlen[i] = tb_savenlen[i];
+			for( i=0; i<njob-1; i++ )
+			{
+				if( cpmxhist[i] ) { FreeDoubleMtx( cpmxhist[i] ); cpmxhist[i] = NULL; }
+				if( memhist[i] && tbsched.started[i] && tbsched.parent[i] != -1 && !tbsched.started[tbsched.parent[i]] ) free( memhist[i] );
+				memhist[i] = NULL;
+			}
+			tbsched_free( &tbsched );
+			tb_inorder = 1;
+			tb_optimistic = 0;
+			tb_abandonedbefore = 1;
+			}
+			if( tb_saveseq )
+			{
+				for( i=0; i<njob; i++ ) free( tb_saveseq[i] );
+				free( tb_saveseq );
+				free( tb_savenlen );
+			}
 			pthread_mutex_destroy( &mutex );
 			pthread_cond_destroy( &treecond );
-			tbsched_free( &tbsched );
 			pthread_rwlock_destroy( &aseqlock );
 			free( handle );
 			free( targ );

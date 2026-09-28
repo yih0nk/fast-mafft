@@ -768,6 +768,48 @@ system( "/usr/bin/gnuplot list.plot" );
 
 
 
+/* work/prog2: per-thread arena for Falign's per-call row buffers (result1/2 and tmpres1/2, clus x
+   alloclen each, used to be calloc'ed row by row and freed on every call).  Every row is written
+   with a terminator before it is read (tmpres by strncpy + explicit 0, result by result[j][0] = 0
+   and terminated appends); the first byte of each row is still set to 0. */
+static TLS char *fa_blk = NULL;
+static TLS size_t fa_cap = 0;
+static TLS char **fa_rows = NULL;
+static TLS int fa_rowcap = 0;
+
+static void Falign_rows( int clus1, int clus2, int alloclen, char ***r1, char ***r2, char ***t1, char ***t2 )
+{
+	int n = 2 * ( clus1 + clus2 ), i;
+	size_t need = (size_t)n * alloclen;
+	char **p;
+	if( need > fa_cap )
+	{
+		free( fa_blk );
+		fa_cap = need + need / 2;
+		fa_blk = malloc( fa_cap );
+		if( fa_blk == NULL ) ErrorExit( "Cannot allocate the work area in Falign.\n" );
+	}
+	if( n + 4 > fa_rowcap )
+	{
+		free( fa_rows );
+		fa_rowcap = n + 4 + ( n + 4 ) / 2;
+		fa_rows = malloc( fa_rowcap * sizeof( char * ) );
+		if( fa_rows == NULL ) ErrorExit( "Cannot allocate the work area in Falign.\n" );
+	}
+	p = fa_rows;
+	*r1 = p; for( i=0; i<clus1; i++ ) *p++ = fa_blk + (size_t)( i ) * alloclen; *p++ = NULL;
+	*r2 = p; for( i=0; i<clus2; i++ ) *p++ = fa_blk + (size_t)( clus1 + i ) * alloclen; *p++ = NULL;
+	*t1 = p; for( i=0; i<clus1; i++ ) *p++ = fa_blk + (size_t)( clus1 + clus2 + i ) * alloclen; *p++ = NULL;
+	*t2 = p; for( i=0; i<clus2; i++ ) *p++ = fa_blk + (size_t)( 2*clus1 + clus2 + i ) * alloclen; *p++ = NULL;
+	for( i=0; i<n; i++ ) fa_blk[(size_t)i*alloclen] = 0;
+}
+
+static void Falign_rows_free( void )
+{
+	free( fa_blk ); fa_blk = NULL; fa_cap = 0;
+	free( fa_rows ); fa_rows = NULL; fa_rowcap = 0;
+}
+
 double Falign( int **whichmtx, double ***scoringmatrices, double **n_dynamicmtx,
 			  char  **seq1, char  **seq2, 
 			  double *eff1, double *eff2, 
@@ -832,6 +874,7 @@ double Falign( int **whichmtx, double ***scoringmatrices, double **n_dynamicmtx,
 			crossscoresize = 0;
 			mymergesort( 0, 0, NULL );
 			alignableReagion( 0, 0, NULL, NULL, NULL, NULL, NULL );
+			alignableReagion_prep_free();
 			fft( 0, NULL, 1 );
 			A__align( NULL, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, 0, 0, -1, -1, NULL, NULL, NULL, 0.0, 0.0 );
 			D__align( NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, 0, 0 );
@@ -854,6 +897,7 @@ double Falign( int **whichmtx, double ***scoringmatrices, double **n_dynamicmtx,
 			if( gstart ) free( gstart );
 			if( gend ) free( gend );
 			if( codonscoremtx ) FreeDoubleMtx( codonscoremtx );
+			Falign_rows_free();
 			if( !kobetsubunkatsu )
 			{
 				FreeFukusosuuMtx ( seqVector1 );
@@ -891,18 +935,17 @@ double Falign( int **whichmtx, double ***scoringmatrices, double **n_dynamicmtx,
 #endif
 
 
-	result1 = AllocateCharMtx( clus1, alloclen );
-	result2 = AllocateCharMtx( clus2, alloclen );
-	tmpres1 = AllocateCharMtx( clus1, alloclen );
-	tmpres2 = AllocateCharMtx( clus2, alloclen );
+	Falign_rows( clus1, clus2, alloclen, &result1, &result2, &tmpres1, &tmpres2 ); // work/prog2: per-thread arena
 	sgap1 = AllocateCharVec( clus1 );
 	egap1 = AllocateCharVec( clus1 );
 	sgap2 = AllocateCharVec( clus2 );
 	egap2 = AllocateCharVec( clus2 );
 	tmpptr1 = calloc( clus1, sizeof( char * ) );
 	tmpptr2 = calloc( clus2, sizeof( char * ) );
+#if RND
 	tmpseq1 = AllocateCharMtx( clus1, nlen );
 	tmpseq2 = AllocateCharMtx( clus2, nlen );
+#endif
 #if RND
 	rndseq1 = AllocateCharMtx( clus1, nlen );
 	rndseq2 = AllocateCharMtx( clus2, nlen );
@@ -1099,8 +1142,15 @@ double Falign( int **whichmtx, double ***scoringmatrices, double **n_dynamicmtx,
 		localalloclen = nlen;
 	}
 
+#if RND
 	for( j=0; j<clus1; j++ ) strcpy( tmpseq1[j], seq1[j] );
 	for( j=0; j<clus2; j++ ) strcpy( tmpseq2[j], seq2[j] );
+#else
+	/* work/prog2: the FFT input vectors are built from seq1/seq2 directly; tmpseq1/2 were
+	   byte-for-byte copies that seq_vec_3/seq_vec_5 only read up to the terminator. */
+	tmpseq1 = seq1;
+	tmpseq2 = seq2;
+#endif
 	PT_ADD(0);
 
 #if 0
@@ -1313,6 +1363,9 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 		maxk = NKOUHO;
 	}
 
+	/* work/prog2: the column profiles for alignableReagion are built once for all candidate lags
+	   (alignableReagion_prep / alignableReagion_lag in fftFunctions.c) */
+	alignableReagion_prep( clus1, clus2, seq1, seq2, eff1, eff2 );
 	for( k=0; k<maxk; k++ ) 
 	{
 		lag = kouho[k];
@@ -1329,7 +1382,25 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 #endif
 
 //		fprintf( stderr, "lag = %d\n", lag );
-		tmpint = alignableReagion( clus1, clus2, tmpptr1, tmpptr2, eff1, eff2, segment+count );
+		tmpint = alignableReagion_lag( lag > 0 ? 0 : -lag, lag > 0 ? lag : 0, segment+count ); // = alignableReagion( clus1, clus2, tmpptr1, tmpptr2, eff1, eff2, segment+count )
+#ifdef PROGTIMING
+		if( getenv( "MAFFT_ARCHECK" ) ) // work/prog2: compare with the original, segment by segment, bitwise
+		{
+			static TLS Segment *chkseg = NULL;
+			int t, ref;
+			if( chkseg == NULL ) chkseg = calloc( MAXSEG, sizeof( Segment ) );
+			for( t=0; t<tmpint+2 && count+t<MAXSEG; t++ ) chkseg[t] = segment[count+t];
+			ref = alignableReagion( clus1, clus2, tmpptr1, tmpptr2, eff1, eff2, segment+count );
+			if( ref != tmpint ) { reporterr( "\nARCHECK MISMATCH: %d vs %d segments\n", tmpint, ref ); exit( 1 ); }
+			for( t=0; t<tmpint+2 && count+t<MAXSEG; t++ )
+				if( chkseg[t].start != segment[count+t].start || chkseg[t].end != segment[count+t].end || chkseg[t].center != segment[count+t].center
+				 || memcmp( &chkseg[t].score, &segment[count+t].score, sizeof( double ) ) || chkseg[t].skipForeward != segment[count+t].skipForeward || chkseg[t].skipBackward != segment[count+t].skipBackward )
+				{
+					reporterr( "\nARCHECK MISMATCH in segment %d of %d\n", t, tmpint ); exit( 1 );
+				}
+			pt_acc[27] += 0.0;
+		}
+#endif
 #ifdef PROGTIMING
 		pt_acc[27] += 1.0;
 #endif
@@ -1733,12 +1804,11 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 		{
 //			fprintf( stderr, "\n\n## CHUUDAN!!! at Falign_localhom\n" );
 //			Added 2021/Jul/25.
-			FreeCharMtx( result1 );
-			FreeCharMtx( result2 );
-			FreeCharMtx( tmpres1 );
-			FreeCharMtx( tmpres2 );
+			// work/prog2: result1/2 and tmpres1/2 live in a per-thread arena; tmpseq1/2 alias seq1/2
+#if RND
 			FreeCharMtx( tmpseq1 );
 			FreeCharMtx( tmpseq2 );
+#endif
 			free( sgap1 );
 			free( egap1 );
 			free( sgap2 );
@@ -1808,12 +1878,11 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 	}
 #endif
 
-	FreeCharMtx( result1 );
-	FreeCharMtx( result2 );
-	FreeCharMtx( tmpres1 );
-	FreeCharMtx( tmpres2 );
+	// work/prog2: result1/2 and tmpres1/2 live in a per-thread arena; tmpseq1/2 alias seq1/2
+#if RND
 	FreeCharMtx( tmpseq1 );
 	FreeCharMtx( tmpseq2 );
+#endif
 	free( sgap1 );
 	free( egap1 );
 	free( sgap2 );

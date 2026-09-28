@@ -375,6 +375,191 @@ fprintf( stderr, "%d-%d length = %d\n", seg->start, seg->end, length );
 }
 
 
+/* work/prog2: alignableReagion() for the FFT candidate lags of one Falign call, with the per-column
+   profiles built once per call instead of once per lag.
+   alignableReagion( clus1, clus2, seq1 shifted by off1, seq2 shifted by off2, eff1, eff2, seg )
+   builds, for every column i, prf1[k] = sum over members j (ascending) of eff1[j] with
+   amino_n[seq1[j][i+off1]] == k, starting from 0.0 (and prf2 likewise), then
+   stra[i] = sum over k (descending, prf1[k] != 0) of sum over j (descending, prf2[j] != 0) of
+   n_disFFT[k][j] * prf1[k] * prf2[j], divided by totaleff.  The profile of column i+off1 does not
+   depend on the lag, so alignableReagion_prep() computes all of them once, member by member in
+   the same order (the same additions to each entry, from 0.0), for the letters that occur; the
+   per-lag function then forms every stra[i] with the same terms in the same order and runs the
+   window scan unchanged.  totaleff is the same double loop as before. */
+static TLS double *arp_p1 = NULL, *arp_p2 = NULL;   // [column * nl + slot]
+static TLS size_t arp_cap1 = 0, arp_cap2 = 0;
+static TLS int arp_nl1, arp_nl2, arp_len1, arp_len2;
+static TLS int arp_k1[26], arp_k2[26];              // letter of each slot, descending
+static TLS double arp_totaleff;
+static TLS double *arp_stra = NULL;
+static TLS int arp_stracap = 0;
+
+static void arp_build( int clus, char **seq, double *eff, int len, double **pp, size_t *cap, int *nlp, int *kl )
+{
+	int slot[0x100], seen[26], j, c, k, nl = 0;
+	double *p;
+	for( k=0; k<26; k++ ) seen[k] = 0;
+	for( j=0; j<clus; j++ )
+	{
+		const unsigned char *sp = (const unsigned char *)seq[j];
+		for( c=0; c<len; c++ ) { k = amino_n[sp[c]]; if( k >= 0 && k < 26 ) seen[k] = 1; }
+	}
+	for( k=0; k<0x100; k++ ) slot[k] = -1;
+	for( k=25; k>=0; k-- ) if( seen[k] ) { slot[k] = nl; kl[nl] = k; nl++; }
+	if( (size_t)len * ( nl ? nl : 1 ) > *cap )
+	{
+		free( *pp );
+		*cap = (size_t)len * ( nl ? nl : 1 );
+		*cap += *cap / 2;
+		*pp = malloc( *cap * sizeof( double ) );
+		if( *pp == NULL ) ErrorExit( "Cannot allocate profiles in alignableReagion_prep.\n" );
+	}
+	p = *pp;
+	for( c=0; c<len*nl; c++ ) p[c] = 0.0;
+	for( j=0; j<clus; j++ )
+	{
+		const unsigned char *sp = (const unsigned char *)seq[j];
+		const double e = eff[j];
+		for( c=0; c<len; c++ )
+		{
+			k = amino_n[sp[c]];
+			if( k >= 0 && k < 26 ) p[(size_t)c*nl+slot[k]] += e; // other letters never enter the hats
+		}
+	}
+	*nlp = nl;
+}
+
+void alignableReagion_prep( int clus1, int clus2, char **seq1, char **seq2, double *eff1, double *eff2 )
+{
+	int i, j;
+	double totaleff;
+	arp_len1 = strlen( seq1[0] );
+	arp_len2 = strlen( seq2[0] );
+	arp_build( clus1, seq1, eff1, arp_len1, &arp_p1, &arp_cap1, &arp_nl1, arp_k1 );
+	arp_build( clus2, seq2, eff2, arp_len2, &arp_p2, &arp_cap2, &arp_nl2, arp_k2 );
+	totaleff = 0.0;
+	for( i=0; i<clus1; i++ ) for( j=0; j<clus2; j++ ) totaleff += eff1[i] * eff2[j];
+	arp_totaleff = totaleff;
+}
+
+void alignableReagion_prep_free( void )
+{
+	free( arp_p1 ); arp_p1 = NULL; arp_cap1 = 0;
+	free( arp_p2 ); arp_p2 = NULL; arp_cap2 = 0;
+	free( arp_stra ); arp_stra = NULL; arp_stracap = 0;
+}
+
+int alignableReagion_lag( int off1, int off2, Segment *seg )
+{
+	int i, j;
+	int status, starttmp = 0;
+	double score;
+	int value = 0;
+	int len, maxlen;
+	int length = 0;
+	double *stra;
+	double cumscore;
+	double threshold;
+	const int nl1 = arp_nl1, nl2 = arp_nl2;
+	const double totaleff = arp_totaleff;
+
+	len = MIN( arp_len1 - off1, arp_len2 - off2 );
+	maxlen = MAX( arp_len1 - off1, arp_len2 - off2 ) + fftWinSize;
+	if( arp_stracap < maxlen )
+	{
+		free( arp_stra );
+		arp_stra = AllocateDoubleVec( maxlen );
+		arp_stracap = maxlen;
+	}
+	stra = arp_stra;
+	threshold = (int)fftThreshold / 100.0 * 600.0 * fftWinSize;
+
+	for( i=0; i<len; i++ )
+	{
+		const double *p1 = arp_p1 + (size_t)( i + off1 ) * nl1;
+		const double *p2 = arp_p2 + (size_t)( i + off2 ) * nl2;
+		int t1, t2;
+		stra[i] = 0.0;
+		for( t1=0; t1<nl1; t1++ )
+		{
+			int k = arp_k1[t1];
+			if( !p1[t1] ) continue;
+			for( t2=0; t2<nl2; t2++ )
+			{
+				j = arp_k2[t2];
+				if( !p2[t2] ) continue;
+				stra[i] += n_disFFT[k][j] * p1[t1] * p2[t2];
+			}
+		}
+		stra[i] /= totaleff;
+	}
+
+	/* the rest is alignableReagion() verbatim */
+	(seg+0)->skipForeward = 0;
+	(seg+1)->skipBackward = 0;
+	status = 0;
+	cumscore = 0.0;
+	score = 0.0;
+	for( j=0; j<fftWinSize; j++ ) score += stra[j];
+
+	for( i=1; i<len-fftWinSize; i++ )
+	{
+		score = score - stra[i-1] + stra[i+fftWinSize-1];
+		if( score > threshold )
+		{
+			if( !status )
+			{
+				status = 1;
+				starttmp = i;
+				length = 0;
+				cumscore = 0.0;
+			}
+			length++;
+			cumscore += score;
+		}
+		if( score <= threshold || length > SEGMENTSIZE )
+		{
+			if( status )
+			{
+				if( length > fftWinSize )
+				{
+					seg->start = starttmp;
+					seg->end = i;
+					seg->center = ( seg->start + seg->end + fftWinSize ) / 2 ;
+					seg->score = cumscore;
+					if( length > SEGMENTSIZE )
+					{
+						(seg+0)->skipForeward = 1;
+						(seg+1)->skipBackward = 1;
+					}
+					else
+					{
+						(seg+0)->skipForeward = 0;
+						(seg+1)->skipBackward = 0;
+					}
+					value++;
+					seg++;
+				}
+				length = 0;
+				cumscore = 0.0;
+				status = 0;
+				starttmp = i;
+				if( value > MAXSEG - 3 ) ErrorExit( "TOO MANY SEGMENTS!");
+			}
+		}
+	}
+	if( status && length > fftWinSize )
+	{
+		seg->end = i;
+		seg->start = starttmp;
+		seg->center = ( starttmp + i + fftWinSize ) / 2 ;
+		seg->score = cumscore;
+		value++;
+	}
+	return( value );
+}
+
+
 static int permit( Segment *seg1, Segment *seg2 )
 {
 	return( 0 );

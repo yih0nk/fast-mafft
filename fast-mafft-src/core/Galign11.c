@@ -1035,6 +1035,68 @@ static void Gdp_row_fast( int i, int lastj, int lgth2, double * restrict colw, i
 	*wmp = wmv;
 }
 
+/* work/prog2: one DP row of G__align11 in a single pass, with the match score of the cell
+   (match_calc_mtx) read inline instead of in a separate pass, for fpenalty_ex == 0.0.  Every cell
+   performs the operations of Gdp_row_fast's fast path (which are those of the original loop, see
+   there) in the same order; the column update, previously a separate loop, is independent across
+   columns, and the only other change is that currentw[j] = match + wm is formed from the match
+   value directly instead of from the value match_calc_mtx stored in currentw[j].  Column lgth2
+   has no match value (match_calc_mtx fills 0..lgth2-1) and keeps the buffer's old value, as
+   before. */
+#define GDP_CELL( FIRST, HASMATCH ) \
+	{ \
+		double mj = mloc[j], pw = prew[j-1], base, cw, mnew, gg; \
+		int mpj = mploc[j], cij, take, ijv; \
+		if( HASMATCH ) base = mrow[s2[j]]; else base = curw[j]; \
+		cw = mj + fpenalty; \
+		cij = i - mpj; \
+		take = ( pw >= mj ); \
+		mnew = take ? pw : mj; \
+		if( HASMATCH ) mnew += fpenalty_ex;  /* the original adds it for j < lgth2 only */ \
+		mloc[j] = mnew; \
+		mploc[j] = take ? i-1 : mpj; \
+		wmv = pw; \
+		ijv = 0; \
+		gg = mil + fpenalty; \
+		if( gg > wmv ) { wmv = gg; ijv = -( j - mpil ); } \
+		if( FIRST ) \
+		{ \
+			if( pw >= mil ) { mil = pw; mpil = j-1; } \
+			mil += fpenalty_ex_i; \
+		} \
+		else \
+		{ \
+			double pc = pw + fpenalty_ex_i; \
+			int take2 = ( pc >= mil ); \
+			mil = take2 ? pc : mil; \
+			mpil = take2 ? j-1 : mpil; \
+		} \
+		take = ( cw > wmv ); \
+		ijv = take ? cij : ijv; \
+		wmv = take ? cw : wmv; \
+		curw[j] = base + wmv; \
+		ijpi[j] = ijv; \
+	}
+
+static void Gdp_row_fused( int i, int lgth2, const double * restrict mrow, const unsigned char * restrict s2,
+	double * restrict mloc, int * restrict mploc, double * restrict curw, int * restrict ijpi,
+	const double * restrict prew, double fpenalty, double fpenalty_ex, double fpenalty_ex_i,
+	double *mip, int *mpip, double *wmp )
+{
+	// requires lgth2 >= 2 and fpenalty_ex_i == 0.0 (see Gdp_row_fast)
+	double mil = *mip, wmv = *wmp;
+	int mpil = *mpip, j;
+	j = 1;
+	GDP_CELL( 1, 1 )
+	for( j=2; j<lgth2; j++ )
+		GDP_CELL( 0, 1 )
+	j = lgth2;
+	GDP_CELL( 0, 0 )
+	*mip = mil;
+	*mpip = mpil;
+	*wmp = wmv;
+}
+
 #ifdef PROGTIMING
 static TLS double *g_chk_m = NULL, *g_chk_cur = NULL;
 static TLS int *g_chk_mp = NULL, *g_chk_ijp = NULL;
@@ -1058,6 +1120,7 @@ double G__align11( double **n_dynamicmtx, char **seq1, char **seq2, int alloclen
 	double *currentw, *previousw;
 	double fpenalty = (double)penalty;
 	double fpenalty_shift = (double)penalty_shift;
+	int gfused; // work/prog2
 	double fpenalty_tmp;
 #if USE_PENALTY_EX
 	double fpenalty_ex = (double)penalty_ex;
@@ -1404,6 +1467,7 @@ fprintf( stderr, "\n" );
 	}
 #endif
 
+	gfused = ( !trywarp && FASTDP_ON && fpenalty_ex == 0.0 && lgth2 >= 2 ); // work/prog2: Gdp_row_fused
 	for( i=1; i<lasti; i++ )
 	{
 		wtmp = previousw; 
@@ -1412,6 +1476,11 @@ fprintf( stderr, "\n" );
 
 		previousw[0] = initverticalw[i-1];
 
+#ifdef PROGTIMING
+		if( !gfused || g_dpcheck() ) // the check mode also runs the original loop, which needs the match row
+#else
+		if( !gfused ) // the fused row kernel reads the match scores itself
+#endif
 		match_calc_mtx( amino_dynamicmtx, currentw, seq1, seq2, i, lgth2 );
 #if XXXXXXX
 fprintf( stderr, "\n" );
@@ -1465,14 +1534,20 @@ fprintf( stderr, "\n" );
 				memcpy( g_chk_mp, mp, sizeof( int ) * lastj );
 				memcpy( g_chk_cur, currentw, sizeof( double ) * lastj );
 				t0 = pt_now();
-				Gdp_row_fast( i, lastj, lgth2, dpcolw, dpcolij, dpcolg2, g_chk_m, g_chk_mp, g_chk_cur, g_chk_ijp, previousw, fpenalty, fpenalty_ex, fpenalty_ex_i, &g_chk_mi, &g_chk_mpi, &g_chk_wm );
+				if( gfused )
+					Gdp_row_fused( i, lgth2, amino_dynamicmtx[(unsigned char)seq1[0][i]], (const unsigned char *)seq2[0], g_chk_m, g_chk_mp, g_chk_cur, g_chk_ijp, previousw, fpenalty, fpenalty_ex, fpenalty_ex_i, &g_chk_mi, &g_chk_mpi, &g_chk_wm );
+				else
+					Gdp_row_fast( i, lastj, lgth2, dpcolw, dpcolij, dpcolg2, g_chk_m, g_chk_mp, g_chk_cur, g_chk_ijp, previousw, fpenalty, fpenalty_ex, fpenalty_ex_i, &g_chk_mi, &g_chk_mpi, &g_chk_wm );
 				t1 = pt_now();
 				pt_acc[18] += t1 - t0;
 				g_chk_pending = 1; g_chk_t = t1;
 				goto originalloop;
 			}
 #endif
-			Gdp_row_fast( i, lastj, lgth2, dpcolw, dpcolij, dpcolg2, m, mp, currentw, ijp[i], previousw, fpenalty, fpenalty_ex, fpenalty_ex_i, &mi, &mpi, &wm );
+			if( gfused )
+				Gdp_row_fused( i, lgth2, amino_dynamicmtx[(unsigned char)seq1[0][i]], (const unsigned char *)seq2[0], m, mp, currentw, ijp[i], previousw, fpenalty, fpenalty_ex, fpenalty_ex_i, &mi, &mpi, &wm );
+			else
+				Gdp_row_fast( i, lastj, lgth2, dpcolw, dpcolij, dpcolg2, m, mp, currentw, ijp[i], previousw, fpenalty, fpenalty_ex, fpenalty_ex_i, &mi, &mpi, &wm );
 			lastverticalw[i] = currentw[lgth2-1]; // lgth2==0 no toki error
 			continue;
 		}

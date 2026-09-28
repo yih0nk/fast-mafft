@@ -1,5 +1,6 @@
 #include "mltaln.h"
 #include "progtiming.h"
+#include "dphelp.h"
 #ifdef PROGTIMING
 int pt_nofastdp = -1; /* A/B switch for timing builds: MAFFT_NOFASTDP=1 disables the fast DP path */
 static int pt_fastdp_enabled( void ) { if( pt_nofastdp < 0 ) pt_nofastdp = ( getenv( "MAFFT_NOFASTDP" ) != NULL ); return( !pt_nofastdp ); }
@@ -1105,7 +1106,9 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
 	if( strchr( gaptable1, '-' ) ) *ngap1 = 1; else *ngap1 = 0;
 	if( strchr( gaptable2, '-' ) ) *ngap2 = 1; else *ngap2 = 0;
 #if 1
-	if( *ngap1 == 0 && reuseprofiles )
+	if( mseq1 == NULL ) // work/prog2: the caller inserts the gaps in place (A__align, gapireru_inplace)
+		;
+	else if( *ngap1 == 0 && reuseprofiles )
 		;
 	else if( *ngap1 == 0 )
 	{
@@ -1121,7 +1124,9 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
 		for( i=0; i<icyc; i++ ) gapireru( mseq1[i], seq1[i], gaptable1 );
 	}
 
-	if( *ngap2 == 0 && reuseprofiles )
+	if( mseq2 == NULL ) // work/prog2: see above
+		;
+	else if( *ngap2 == 0 && reuseprofiles )
 		;
 	else if( *ngap2 == 0 )
 	{
@@ -1306,9 +1311,10 @@ static void Adp_row_fast( int i, int lastj, double * restrict colw, int * restri
    Column lgth2 has no match value in the original either (match_calc fills 0..lgth2-1 only), so
    its currentw entry keeps the value already in the buffer, exactly as before.  One scalar pass
    lets the out-of-order core overlap the independent per-column work with the serial mi chain. */
-#define ADP_CELL( FIRST, HASMATCH ) \
+#define ADP_CELL( FIRST, HASMATCH ) ADP_CELL_PW( FIRST, HASMATCH, prew[j-1] )
+#define ADP_CELL_PW( FIRST, HASMATCH, PWVAL ) \
 	{ \
-		double mj = mloc[j], pw = prew[j-1], base, g3, g4, gg, g2; \
+		double mj = mloc[j], pw = (PWVAL), base, g3, g4, gg, g2; \
 		int mpj = mploc[j], takec, take; \
 		if( HASMATCH ) \
 		{ \
@@ -1389,6 +1395,447 @@ static void dense_scores( double **n_dynamicmtx, double **cpmx1, int i1, double 
 	}
 }
 
+/* work/prog2: the same sums over only the letters k that have a nonzero weight in some row
+   1..lasti-1 of cpmx1 (dense1_k, ascending; dense1_prep).  Every skipped term is
+   n_dynamicmtx[k][l] * 0.0 added to the running sum, and fma( x, 0.0, sc ) == sc exactly because
+   sc starts at +0.0 and never becomes -0.0 (see match_calc_dense), so each sum is bit-identical
+   while the loop drops from nalphabets to a handful of letters. */
+static TLS int dense1_n = -1;
+static TLS int dense1_k[0x100];
+
+static void dense1_prep( double **cpmx1, int ncol ) // letters with a nonzero weight in columns 0..ncol-1
+{
+	int k, i;
+	dense1_n = 0;
+	for( k=0; k<nalphabets; k++ )
+	{
+		const double *c = cpmx1[k];
+		for( i=0; i<ncol; i++ ) if( c[i] != 0.0 ) break;
+		if( i < ncol ) dense1_k[dense1_n++] = k;
+	}
+}
+
+/* work/prog2: initverticalw without the sparse tables.  The original call
+     match_calc( n_dynamicmtx, initverticalw, cpmx2, cpmx1, 0, lgth1, doublework, intwork, 1 )
+   forms scarr[l] = sum over k < nalphabets of n_dynamicmtx[k][l] * cpmx2[k][0] and then, for each
+   column i of cpmx1, the chain 0.0 + scarr[l] * cpmx1[l][i] over the letters l with a nonzero
+   weight in that column, ascending.  Running the chain over every letter of dense1_k (a superset,
+   ascending) adds only exact zeros (see match_calc_dense). */
+static void dense_initvertical( double **n_dynamicmtx, double *match, double **cpmx2, double **cpmx1, int lgth1 )
+{
+	double sc[0x100];
+	int t, k, i;
+	for( t=0; t<dense1_n; t++ )
+	{
+		int l = dense1_k[t];
+		double a = 0.0;
+		for( k=0; k<nalphabets; k++ )
+			a += n_dynamicmtx[k][l] * cpmx2[k][0];
+		sc[t] = a;
+	}
+	for( i=0; i<lgth1; i++ )
+	{
+		double a = 0.0;
+		for( t=0; t<dense1_n; t++ )
+			a += sc[t] * cpmx1[dense1_k[t]][i];
+		match[i] = a;
+	}
+}
+
+/* the initialize part of match_calc(): sparse lists of the nonzero letters of every column */
+static void match_calc_sparse_init( double **cpmx2, int lgth2, double **doublework, int **intwork )
+{
+	int j, l, count;
+	for( j=0; j<lgth2; j++ )
+	{
+		count = 0;
+		for( l=0; l<nalphabets; l++ )
+		{
+			if( cpmx2[l][j] )
+			{
+				doublework[j][count] = cpmx2[l][j];
+				intwork[j][count] = l;
+				count++;
+			}
+		}
+		intwork[j][count] = -1;
+	}
+}
+
+static void dense_scores1( double **n_dynamicmtx, double **cpmx1, int i1, double *scu )
+{
+	int u, t;
+	for( u=0; u<dense_nu; u++ )
+	{
+		int l = dense_u[u];
+		double sc = 0.0;
+		for( t=0; t<dense1_n; t++ )
+		{
+			int k = dense1_k[t];
+			sc += n_dynamicmtx[k][l] * cpmx1[k][i1];
+		}
+		scu[u] = sc;
+	}
+}
+
+#ifdef enablemultithread
+/* ---------------------------------------------------------------------------------------------
+   work/prog2: helper pool (see dphelp.h) */
+dphelppool_t *dphelppool = NULL;
+
+int dphelp_idle( void )
+{
+	dphelppool_t *pool = dphelppool;
+	return( pool ? pool->nidle : 0 );
+}
+
+void dphelp_post( dphelpjob_t *job, int maxslots )
+{
+	dphelppool_t *pool = dphelppool;
+	job->slots = 0;
+	job->refs = 0;
+	job->next = NULL;
+	if( pool == NULL || maxslots <= 0 || pool->nidle <= 0 ) return;
+	pthread_mutex_lock( pool->mutex );
+	job->slots = MIN( maxslots, pool->nidle );
+	if( job->slots > 0 )
+	{
+		job->next = pool->jobs;
+		pool->jobs = job;
+		pthread_cond_broadcast( pool->cond );
+	}
+	pthread_mutex_unlock( pool->mutex );
+}
+
+void dphelp_finish( dphelpjob_t *job )
+{
+	dphelppool_t *pool = dphelppool;
+	int spins = 0;
+	if( pool == NULL ) return;
+	if( job->slots > 0 || __atomic_load_n( &job->refs, __ATOMIC_ACQUIRE ) > 0 )
+	{
+		dphelpjob_t **pp;
+		pthread_mutex_lock( pool->mutex );
+		for( pp=&pool->jobs; *pp; pp=&(*pp)->next ) if( *pp == job ) { *pp = job->next; break; }
+		job->slots = 0;
+		pthread_mutex_unlock( pool->mutex );
+	}
+	while( __atomic_load_n( &job->refs, __ATOMIC_ACQUIRE ) > 0 )
+		if( ++spins > 64 ) sched_yield();
+}
+
+int dphelp_serve_locked( void )
+{
+	dphelppool_t *pool = dphelppool;
+	dphelpjob_t *job;
+	if( pool == NULL || ( job = pool->jobs ) == NULL ) return( 0 );
+	if( --job->slots <= 0 ) pool->jobs = job->next;
+	__atomic_add_fetch( &job->refs, 1, __ATOMIC_ACQ_REL );
+	pthread_mutex_unlock( pool->mutex );
+	job->run( job->arg );
+	__atomic_sub_fetch( &job->refs, 1, __ATOMIC_RELEASE ); // the poster may free the job after this
+	pthread_mutex_lock( pool->mutex );
+	return( 1 );
+}
+
+typedef struct
+{
+	void (*body)( void *ctx, int lo, int hi );
+	void *ctx;
+	int n, chunk;
+	int next; // atomic
+} dphelpfor_t;
+
+static void dphelp_for_run( void *arg )
+{
+	dphelpfor_t *f = (dphelpfor_t *)arg;
+	int lo;
+	while( ( lo = __atomic_fetch_add( &f->next, f->chunk, __ATOMIC_RELAXED ) ) < f->n )
+		f->body( f->ctx, lo, MIN( lo + f->chunk, f->n ) );
+}
+
+static int dphelp_for_min = -1;
+void dphelp_for( int n, int chunk, double work, double minwork, void (*body)( void *ctx, int lo, int hi ), void *ctx )
+{
+	dphelpfor_t f;
+	dphelpjob_t job;
+	int nchunk;
+	if( dphelp_for_min < 0 )
+	{
+#ifdef PROGTIMING
+		dphelp_for_min = getenv( "MAFFT_NOHELPFOR" ) ? 1 : 0;
+#else
+		dphelp_for_min = 0;
+#endif
+	}
+	if( chunk < 1 ) chunk = 1;
+	nchunk = ( n + chunk - 1 ) / chunk;
+	if( dphelp_for_min || nchunk < 2 || work < minwork || dphelp_idle() <= 0 )
+	{
+		if( n > 0 ) body( ctx, 0, n );
+		return;
+	}
+	f.body = body; f.ctx = ctx; f.n = n; f.chunk = chunk; f.next = 0;
+	job.run = dphelp_for_run;
+	job.arg = &f;
+	dphelp_post( &job, nchunk - 1 );
+	dphelp_for_run( &f );
+	dphelp_finish( &job );
+}
+
+/* ---------------------------------------------------------------------------------------------
+   work/prog2: the fused DP of A__align, split into column bands and row blocks ("tiles") that
+   the calling thread and idle helper threads process in any order the dependencies allow.
+
+   Row i of band b (columns J[b] .. J[b+1]-1) needs
+     - row i-1 of the same band: m[], mp[], and the previous row's values prew[j-1] for
+       j > J[b] (all in the band's own columns of the shared arrays), and
+     - from band b-1 in row i: the row carry (mi, mpi) after column J[b]-1, and
+       prew[J[b]-1] = the value of row i-1 in column J[b]-1.
+   Band b-1 publishes those three values per row in bmi/bmpi/bw before it advances its row
+   counter (release); band b reads them after seeing the counter (acquire).  Columns never
+   cross bands, so each cell is computed by exactly the same ADP_CELL code, with the same
+   operands, as in Adp_row_fused4; only the thread and the moment differ.  Rows live in the
+   same two alternating buffers as in the serial loop (row i in buffer i&1), so even the unused
+   stale value in column lgth2 (which the kernels never give a match score) evolves exactly as
+   before.  A band is owned by at most one thread at a time (busy flag, taken with an acquiring
+   compare-and-swap and released with a release store), so its column state moves between
+   threads safely. */
+#define ADPB_MAXB 32
+typedef struct
+{
+	int done;   // rows 1..done of this band are finished (atomic)
+	int busy;   // a thread is working on this band (atomic)
+	char pad[56];
+} adpb_band_t;
+
+typedef struct
+{
+	int nrows, lgth2, nb, R;
+	int J[ADPB_MAXB+1];
+	double *wb[2];                  // row i lives in wb[i&1]
+	double *m; int *mp; int **ijp;
+	const double *gf1, *gf2, *fgcp1, *ogcp1, *fgcp2, *ogcp2;
+	const double *initverticalw; double *lastverticalw;
+	const double *rs;               // per row: the 4 row scores of the fused kernel
+	const double **rc;              // per row: the 4 profile columns of the fused kernel
+	double fpenalty_ex;
+	double *bw, *bmi; int *bmpi;    // [b*(nrows+1)+i]: values handed from band b-1 to band b
+	double wmlast;
+	adpb_band_t band[ADPB_MAXB];
+} adpb_t;
+
+static void adpb_row( adpb_t *p, int b, int i )
+{
+	const int lgth2 = p->lgth2, j0 = p->J[b], j1 = p->J[b+1], jm = MIN( j1, lgth2 );
+	double * restrict prew = p->wb[(i-1)&1];
+	double * restrict curw = p->wb[i&1];
+	double * restrict mloc = p->m;
+	int * restrict mploc = p->mp;
+	int * restrict ijpi = p->ijp[i];
+	const double * restrict gf2 = p->gf2;
+	const double * restrict fg2 = p->fgcp2;
+	const double * restrict og2 = p->ogcp2;
+	const double * restrict c0 = p->rc[4*i], * restrict c1 = p->rc[4*i+1], * restrict c2 = p->rc[4*i+2], * restrict c3 = p->rc[4*i+3];
+	const double s0 = p->rs[4*i], s1 = p->rs[4*i+1], s2 = p->rs[4*i+2], s3 = p->rs[4*i+3];
+	const double fgcp1va = p->fgcp1[i-1], ogcp1va = p->ogcp1[i], gf1va = p->gf1[i], gf1vapre = p->gf1[i-1];
+	const double fpenalty_ex = p->fpenalty_ex;
+	double mil, wmv = 0.0;
+	int mpil, ijv, j;
+
+	if( b == 0 )
+	{
+		prew[0] = p->initverticalw[i-1];                       // previousw[0] = initverticalw[i-1];
+		curw[0] = p->initverticalw[i];                         // currentw[0] = initverticalw[i];
+		mil = prew[0] + p->ogcp2[1] * p->gf1[i-1]; mpil = 0;   // mi = previousw[0] + ogcp2[1] * gapfreq1pt[i-1]; mpi=0;
+		j = 1;
+		if( 1 < lgth2 ) ADP_CELL( 1, 1 ) else ADP_CELL( 1, 0 )
+		j = 2;
+	}
+	else
+	{
+		const int nr1 = p->nrows + 1;
+		mil = p->bmi[b*nr1+i];
+		mpil = p->bmpi[b*nr1+i];
+		j = j0;
+		if( j < lgth2 ) ADP_CELL_PW( 0, 1, p->bw[b*nr1+i-1] ) else ADP_CELL_PW( 0, 0, p->bw[b*nr1+i-1] )
+		j = j0 + 1;
+	}
+	for( ; j<jm; j++ )
+		ADP_CELL( 0, 1 )
+	if( j == lgth2 && j < j1 )
+	{
+		ADP_CELL( 0, 0 )
+		j++;
+	}
+	if( b < p->nb - 1 )
+	{
+		const int nr1 = p->nrows + 1;
+		p->bw[(b+1)*nr1+i] = curw[j1-1];
+		p->bmi[(b+1)*nr1+i] = mil;
+		p->bmpi[(b+1)*nr1+i] = mpil;
+	}
+	else
+		p->wmlast = wmv;
+	if( j0 <= lgth2-1 && lgth2-1 < j1 ) p->lastverticalw[i] = curw[lgth2-1]; // lastverticalw[i] = currentw[lgth2-1];
+}
+
+static void adpb_run( void *arg )
+{
+	adpb_t *p = (adpb_t *)arg;
+	const int nb = p->nb, nrows = p->nrows, R = p->R;
+	int spins = 0;
+	while( 1 )
+	{
+		int b, best = -1, bestkey = 0, alldone = 1;
+		for( b=0; b<nb; b++ )
+		{
+			int d = __atomic_load_n( &p->band[b].done, __ATOMIC_ACQUIRE ), avail, key;
+			if( d >= nrows ) continue;
+			alldone = 0;
+			if( __atomic_load_n( &p->band[b].busy, __ATOMIC_RELAXED ) ) continue;
+			avail = b ? __atomic_load_n( &p->band[b-1].done, __ATOMIC_ACQUIRE ) : nrows;
+			if( avail <= d ) continue;
+			key = d / R + b; // wavefront order: earliest anti-diagonal first
+			if( best < 0 || key < bestkey ) { best = b; bestkey = key; }
+		}
+		if( alldone ) break;
+		if( best < 0 )
+		{
+			if( ++spins > 256 ) sched_yield();
+			continue;
+		}
+		{
+			int zero = 0, d, avail, end, i;
+			if( !__atomic_compare_exchange_n( &p->band[best].busy, &zero, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED ) ) continue;
+			spins = 0;
+			d = __atomic_load_n( &p->band[best].done, __ATOMIC_ACQUIRE );
+			avail = best ? __atomic_load_n( &p->band[best-1].done, __ATOMIC_ACQUIRE ) : nrows;
+			end = MIN( avail, d + R );
+			for( i=d+1; i<=end; i++ )
+			{
+				adpb_row( p, best, i );
+				__atomic_store_n( &p->band[best].done, i, __ATOMIC_RELEASE );
+			}
+			__atomic_store_n( &p->band[best].busy, 0, __ATOMIC_RELEASE );
+		}
+	}
+}
+
+/* Returns 1 if the DP of rows 1..lasti-1 was done here (tiled, possibly with helpers), 0 if the
+   caller must run its own loop (row not fusable, too small, or no helper idle).  On success the
+   final rows are in w0/w1 exactly as the serial loop leaves them and *wmp is its final wm. */
+static TLS double *adpb_rs = NULL;
+static TLS const double **adpb_rc = NULL;
+static TLS double *adpb_bw = NULL, *adpb_bmi = NULL;
+static TLS int *adpb_bmpi = NULL;
+static TLS int adpb_rowcap = 0, adpb_bcap = 0;
+static int adpb_minwidth = -1, adpb_mincells = -1, adpb_force = 0;
+
+static void adpb_free( void )
+{
+	free( adpb_rs ); adpb_rs = NULL;
+	free( adpb_rc ); adpb_rc = NULL;
+	free( adpb_bw ); adpb_bw = NULL;
+	free( adpb_bmi ); adpb_bmi = NULL;
+	free( adpb_bmpi ); adpb_bmpi = NULL;
+	adpb_rowcap = adpb_bcap = 0;
+}
+
+static int Adp_tiled( int lgth1, int lgth2, int lasti, double **n_dynamicmtx, double **cpmx1, double **cpmx2,
+	double *w0, double *w1, double *m, int *mp, int **ijp,
+	const double *gf1, const double *gf2, const double *fgcp1, const double *ogcp1, const double *fgcp2, const double *ogcp2,
+	const double *initverticalw, double *lastverticalw, double fpenalty_ex, double *wmp )
+{
+	adpb_t *p;
+	dphelpjob_t job;
+	int nrows = lasti - 1, nb, b, i, idle, maxb;
+	double cells = (double)nrows * lgth2;
+
+	if( adpb_minwidth < 0 )
+	{
+#ifdef PROGTIMING
+		char *e; // tuning and test switches of the timing builds
+		adpb_minwidth = ( e = getenv( "MAFFT_TILEWIDTH" ) ) ? atoi( e ) : 384;
+		adpb_mincells = ( e = getenv( "MAFFT_TILEMINCELLS" ) ) ? atoi( e ) : 2000000;
+		adpb_force = getenv( "MAFFT_TILEFORCE" ) != NULL; // testing: tile even without helpers
+		if( getenv( "MAFFT_NOTILE" ) ) adpb_minwidth = 1 << 30;
+#else
+		adpb_minwidth = 384;
+		adpb_mincells = 2000000;
+		adpb_force = 0;
+#endif
+	}
+	if( nrows < 2 || lgth2 < 2 * adpb_minwidth || cells < adpb_mincells || dense_nu < 0 ) return( 0 );
+	idle = dphelp_idle();
+	if( idle <= 0 && !adpb_force ) return( 0 );
+
+	maxb = MIN( ADPB_MAXB, lgth2 / adpb_minwidth );
+	nb = MIN( maxb, 3 * ( 1 + MAX( idle, 1 ) ) );
+	if( nb < 2 ) return( 0 );
+
+	if( nrows + 1 > adpb_rowcap )
+	{
+		free( adpb_rs ); free( adpb_rc );
+		adpb_rowcap = nrows + 1 + ( nrows + 1 ) / 2;
+		adpb_rs = malloc( sizeof( double ) * 4 * adpb_rowcap );
+		adpb_rc = malloc( sizeof( double * ) * 4 * adpb_rowcap );
+	}
+	/* the row scores and profile columns of each row, selected exactly as in the serial loop */
+	for( i=1; i<=nrows; i++ )
+	{
+		double scu[DENSE_MAXU];
+		int u, nsel = 0;
+		dense_scores1( n_dynamicmtx, cpmx1, i, scu );
+		for( u=0; u<dense_nu; u++ )
+		{
+			if( scu[u] == 0.0 ) continue;
+			if( nsel == 4 ) return( 0 ); // not fusable: the caller runs its own loop
+			adpb_rs[4*i+nsel] = scu[u];
+			adpb_rc[4*i+nsel] = cpmx2[dense_u[u]];
+			nsel++;
+		}
+		for( ; nsel<4; nsel++ )
+		{
+			adpb_rs[4*i+nsel] = 0.0;
+			adpb_rc[4*i+nsel] = cpmx2[0];
+		}
+	}
+	if( (size_t)nb * ( nrows + 1 ) > (size_t)adpb_bcap )
+	{
+		free( adpb_bw ); free( adpb_bmi ); free( adpb_bmpi );
+		adpb_bcap = nb * ( nrows + 1 ) + nb * ( nrows + 1 ) / 2;
+		adpb_bw = malloc( sizeof( double ) * adpb_bcap );
+		adpb_bmi = malloc( sizeof( double ) * adpb_bcap );
+		adpb_bmpi = malloc( sizeof( int ) * adpb_bcap );
+	}
+
+	if( posix_memalign( (void **)&p, 64, sizeof( adpb_t ) ) ) return( 0 );
+	memset( p, 0, sizeof( adpb_t ) );
+	p->nrows = nrows; p->lgth2 = lgth2; p->nb = nb;
+	for( b=0; b<=nb; b++ ) p->J[b] = 1 + (int)( (long long)lgth2 * b / nb );
+	p->R = MAX( 8, 24576 / ( lgth2 / nb ) );
+	p->wb[0] = w0; p->wb[1] = w1;
+	p->m = m; p->mp = mp; p->ijp = ijp;
+	p->gf1 = gf1; p->gf2 = gf2; p->fgcp1 = fgcp1; p->ogcp1 = ogcp1; p->fgcp2 = fgcp2; p->ogcp2 = ogcp2;
+	p->initverticalw = initverticalw; p->lastverticalw = lastverticalw;
+	p->rs = adpb_rs; p->rc = adpb_rc;
+	p->fpenalty_ex = fpenalty_ex;
+	p->bw = adpb_bw; p->bmi = adpb_bmi; p->bmpi = adpb_bmpi;
+	for( b=1; b<nb; b++ ) p->bw[b*(nrows+1)+0] = w0[p->J[b]-1]; // row 0, last column of band b-1
+	p->wmlast = *wmp;
+
+	job.run = adpb_run;
+	job.arg = p;
+	dphelp_post( &job, nb - 1 );
+	adpb_run( p );
+	dphelp_finish( &job );
+	*wmp = p->wmlast;
+	free( p );
+	return( 1 );
+}
+#endif
+
 #ifdef PROGTIMING
 static TLS double *chk_m = NULL, *chk_cur = NULL, *chk_match = NULL;
 static TLS int *chk_mp = NULL, *chk_ijp = NULL;
@@ -1398,6 +1845,362 @@ static TLS int pt_chk_mpi;
 static int pt_dpcheck_v = -1;
 static int pt_dpcheck( void ) { if( pt_dpcheck_v < 0 ) pt_dpcheck_v = ( getenv( "MAFFT_DPCHECK" ) != NULL ); return( pt_dpcheck_v ); }
 #endif
+
+#if defined( PROGTIMING ) && defined( enablemultithread )
+/* work/prog2: MAFFT_TILECHECK=1 -- for every tiled DP, save the initial state, keep the tiled
+   result, rerun the original row loop from the initial state and compare every value it
+   produces (both row buffers including the unused column lgth2, m, mp, the traceback cells,
+   lastverticalw, wm) bitwise.  Exits on the first difference. */
+static int pt_tilecheck_v = -1;
+static int pt_tilecheck( void ) { if( pt_tilecheck_v < 0 ) pt_tilecheck_v = ( getenv( "MAFFT_TILECHECK" ) != NULL ); return( pt_tilecheck_v ); }
+static TLS int tilechk_pending = 0;
+static TLS double *tilechk_cur0, *tilechk_prev0;          // the two physical row buffers
+static TLS double *tc_i0, *tc_i1, *tc_im, *tc_r0, *tc_r1, *tc_rm, *tc_rlv;
+static TLS int *tc_imp, *tc_rmp, *tc_rijp;
+static TLS double tc_iwm, tc_rwm;
+static void tilechk_save_init( int lgth2, double *cur, double *prev, double *m, int *mp, double wm )
+{
+	size_t n = lgth2 + 1;
+	tilechk_cur0 = cur; tilechk_prev0 = prev;
+	tc_i0 = realloc( tc_i0, n * sizeof( double ) ); memcpy( tc_i0, cur, n * sizeof( double ) );
+	tc_i1 = realloc( tc_i1, n * sizeof( double ) ); memcpy( tc_i1, prev, n * sizeof( double ) );
+	tc_im = realloc( tc_im, n * sizeof( double ) ); memcpy( tc_im, m, n * sizeof( double ) );
+	tc_imp = realloc( tc_imp, n * sizeof( int ) ); memcpy( tc_imp, mp, n * sizeof( int ) );
+	tc_iwm = wm;
+	tilechk_pending = 0;
+}
+static void tilechk_save_result( int lgth2, int lasti, double *m, int *mp, int **ijp, double *lastverticalw, double wm )
+{
+	size_t n = lgth2 + 1;
+	int i;
+	tc_r0 = realloc( tc_r0, n * sizeof( double ) ); memcpy( tc_r0, tilechk_cur0, n * sizeof( double ) );
+	tc_r1 = realloc( tc_r1, n * sizeof( double ) ); memcpy( tc_r1, tilechk_prev0, n * sizeof( double ) );
+	tc_rm = realloc( tc_rm, n * sizeof( double ) ); memcpy( tc_rm, m, n * sizeof( double ) );
+	tc_rmp = realloc( tc_rmp, n * sizeof( int ) ); memcpy( tc_rmp, mp, n * sizeof( int ) );
+	tc_rlv = realloc( tc_rlv, (size_t)lasti * sizeof( double ) ); memcpy( tc_rlv, lastverticalw, (size_t)lasti * sizeof( double ) );
+	tc_rijp = realloc( tc_rijp, (size_t)lasti * lgth2 * sizeof( int ) );
+	for( i=1; i<lasti; i++ ) memcpy( tc_rijp + (size_t)i * lgth2, ijp[i] + 1, lgth2 * sizeof( int ) );
+	tc_rwm = wm;
+	tilechk_pending = 1;
+}
+static void tilechk_restore_init( int lgth2, double *m, int *mp, double *wm )
+{
+	size_t n = lgth2 + 1;
+	memcpy( tilechk_cur0, tc_i0, n * sizeof( double ) );
+	memcpy( tilechk_prev0, tc_i1, n * sizeof( double ) );
+	memcpy( m, tc_im, n * sizeof( double ) );
+	memcpy( mp, tc_imp, n * sizeof( int ) );
+	*wm = tc_iwm;
+}
+static void tilechk_compare( int lgth1, int lgth2, int lasti, double *m, int *mp, int **ijp, double *lastverticalw, double wm )
+{
+	size_t n = lgth2 + 1;
+	int i, bad = 0;
+	if( memcmp( tc_r0, tilechk_cur0, n * sizeof( double ) ) ) bad |= 1;
+	if( memcmp( tc_r1, tilechk_prev0, n * sizeof( double ) ) ) bad |= 2;
+	if( memcmp( tc_rm, m, n * sizeof( double ) ) ) bad |= 4;
+	if( memcmp( tc_rmp, mp, n * sizeof( int ) ) ) bad |= 8;
+	if( memcmp( tc_rlv + 1, lastverticalw + 1, (size_t)( lasti - 1 ) * sizeof( double ) ) ) bad |= 16;
+	if( memcmp( &tc_rwm, &wm, sizeof( double ) ) ) bad |= 32;
+	for( i=1; i<lasti; i++ ) if( memcmp( tc_rijp + (size_t)i * lgth2, ijp[i] + 1, lgth2 * sizeof( int ) ) ) { bad |= 64; break; }
+	if( bad )
+	{
+		reporterr( "\nTILECHECK MISMATCH (code %d) in A__align, lgth1=%d lgth2=%d lasti=%d row %d\n", bad, lgth1, lgth2, lasti, i );
+		exit( 1 );
+	}
+	pt_acc[31] += 1.0;
+	tilechk_pending = 0;
+}
+#endif
+
+/* work/prog2: the profile of one group in a single pass over its rows.  Replaces
+     cpmx_calc_new( seq, cpmx, eff, len, clus )
+     st_OpeningGapCount( ogcp, ... ) or new_OpeningGapCount( ogcp, ..., sgappat )  (st: sgappat == NULL)
+     st_FinalGapCount( fgcp, ... ) or new_FinalGapCount( fgcp, ..., egappat )
+     gapcountf( gapfreq, seq, clus, eff, len )
+   Each of those zeroes its array and then adds eff[j] to entries member by member (j ascending);
+   here the four arrays receive exactly the same additions, member by member in the same order,
+   while each row is read once.  Opening gaps: column k gains eff[j] when it is a gap and the
+   previous column (or, for k = 0, sgappat[j], or no gap for the st_ version) is not.  Final
+   gaps: column k gains eff[j] when it is a gap and column k+1 is not; column len is the
+   terminator, never a gap, so the egappat argument of new_FinalGapCount never matters (its
+   last test compares against the terminator's state).  st_OpeningGapCount also sets
+   ogcp[len] = 0.0.  Rows must be terminated at len, as A__align ensures.  Large profiles are split
+   by columns among idle helper threads (dphelp_for). */
+typedef struct
+{
+	char **seq; int clus; double *eff; int len;
+	double **cpmx; double *ogcp, *fgcp, *gapfreq;
+	const char *sgappat;
+} profctx_t;
+
+/* columns lo..hi-1 of all four arrays (every addition to an entry comes from its own column range,
+   member by member in ascending order, so ranges can be done by different threads) */
+static void profile_fused_cols( void *vctx, int lo, int hi )
+{
+	profctx_t *c = (profctx_t *)vctx;
+	char **seq = c->seq; double *eff = c->eff; double **cpmx = c->cpmx;
+	double *ogcp = c->ogcp, *fgcp = c->fgcp, *gapfreq = c->gapfreq;
+	const char *sgappat = c->sgappat;
+	int j, k;
+	for( k=0; k<nalphabets; k++ ) { double *cp = cpmx[k]; int i; for( i=lo; i<hi; i++ ) cp[i] = 0.0; }
+	for( k=lo; k<hi; k++ ) { ogcp[k] = 0.0; fgcp[k] = 0.0; gapfreq[k] = 0.0; }
+	for( j=0; j<c->clus; j++ )
+	{
+		const unsigned char *sp = (const unsigned char *)seq[j];
+		const double e = eff[j];
+		int prev = lo ? ( sp[lo-1] == '-' ) : ( sgappat && sgappat[j] == '-' ); // opening: previous column, or the boundary pattern
+		int g = ( sp[lo] == '-' ), gn;
+		for( k=lo; k<hi; k++ )
+		{
+			gn = ( sp[k+1] == '-' ); // column len is the terminator: never a gap
+			cpmx[(unsigned char)amino_n[sp[k]]][k] += e;
+			if( g )
+			{
+				gapfreq[k] += e;
+				if( !prev ) ogcp[k] += e;
+				if( !gn ) fgcp[k] += e;
+			}
+			prev = g;
+			g = gn;
+		}
+	}
+}
+
+static void profile_fused( char **seq, int clus, double *eff, int len, double **cpmx, double *ogcp, double *fgcp, double *gapfreq, const char *sgappat )
+{
+	profctx_t c;
+	c.seq = seq; c.clus = clus; c.eff = eff; c.len = len; c.cpmx = cpmx; c.ogcp = ogcp; c.fgcp = fgcp; c.gapfreq = gapfreq; c.sgappat = sgappat;
+	if( sgappat == NULL ) ogcp[len] = 0.0; // st_OpeningGapCount
+	if( len <= 0 ) return;
+#ifdef enablemultithread
+	dphelp_for( len, MAX( 512, len / 16 ), (double)clus * len, 4.0e6, profile_fused_cols, &c );
+#else
+	profile_fused_cols( &c, 0, len );
+#endif
+}
+
+#ifdef PROGTIMING
+/* MAFFT_PROFCHECK=1: recompute with the original functions and compare bitwise */
+static void profile_check( char **seq, int clus, double *eff, int len, double **cpmx, double *ogcp, double *fgcp, double *gapfreq, char *sgappat, char *egappat )
+{
+	static TLS double **c2 = NULL, *o2 = NULL, *f2 = NULL, *g2 = NULL;
+	static TLS int cap = 0;
+	int k;
+	if( !getenv( "MAFFT_PROFCHECK" ) ) return;
+	if( len + 2 > cap )
+	{
+		if( c2 ) FreeDoubleMtx( c2 );
+		free( o2 ); free( f2 ); free( g2 );
+		cap = len + 2;
+		c2 = AllocateDoubleMtx( nalphabets, cap );
+		o2 = calloc( cap, sizeof( double ) ); f2 = calloc( cap, sizeof( double ) ); g2 = calloc( cap, sizeof( double ) );
+	}
+	cpmx_calc_new( seq, c2, eff, len, clus );
+	if( sgappat )
+	{
+		new_OpeningGapCount( o2, clus, seq, eff, len, sgappat );
+		new_FinalGapCount( f2, clus, seq, eff, len, egappat );
+	}
+	else
+	{
+		st_OpeningGapCount( o2, clus, seq, eff, len );
+		st_FinalGapCount( f2, clus, seq, eff, len );
+	}
+	gapcountf( g2, seq, clus, eff, len );
+	for( k=0; k<nalphabets; k++ ) if( memcmp( c2[k], cpmx[k], sizeof( double ) * len ) ) { reporterr( "\nPROFCHECK MISMATCH cpmx %d\n", k ); exit( 1 ); }
+	if( memcmp( o2, ogcp, sizeof( double ) * ( len + ( sgappat == NULL ) ) ) ) { reporterr( "\nPROFCHECK MISMATCH ogcp\n" ); exit( 1 ); }
+	if( memcmp( f2, fgcp, sizeof( double ) * len ) ) { reporterr( "\nPROFCHECK MISMATCH fgcp\n" ); exit( 1 ); }
+	if( memcmp( g2, gapfreq, sizeof( double ) * len ) ) { reporterr( "\nPROFCHECK MISMATCH gapfreq\n" ); exit( 1 ); }
+	pt_acc[28] += 0.0;
+}
+#else
+#define profile_check( a, b, c, d, e, f, g, h, i, j )
+#endif
+
+/* work/prog2: gapireru( res, ori, gt ) with res == ori.  gapireru writes, for p = 0.. , a gap where
+   gt[p] == '-' and otherwise the next character of ori.  Going backwards from the end, the
+   character that lands at p is ori[q] with q <= p (q counts the non-gap entries before p), and
+   every ori[q'] with q' > q has already been moved, so the row can be expanded in place.  The
+   result is the same string gapireru would have produced in a separate buffer. */
+static void gapireru_inplace( char *s, int lori, const char *gt, int lnew )
+{
+	const char gapchar = *newgapstr;
+	int p, q = lori - 1;
+	s[lnew] = 0;
+	for( p=lnew-1; p>=0; p-- )
+		s[p] = ( gt[p] == '-' ) ? gapchar : s[q--];
+}
+
+typedef struct { char **seq; const char *gt; int lori, lnew; } gapexpctx_t;
+
+static void gapexp_rows( void *vctx, int lo, int hi )
+{
+	gapexpctx_t *c = (gapexpctx_t *)vctx;
+	int i;
+	for( i=lo; i<hi; i++ ) gapireru_inplace( c->seq[i], c->lori, c->gt, c->lnew );
+}
+
+static void gapexp_all( char **seq, int n, const char *gt, int lori, int lnew )
+{
+	gapexpctx_t c;
+	c.seq = seq; c.gt = gt; c.lori = lori; c.lnew = lnew;
+#ifdef enablemultithread
+	dphelp_for( n, MAX( 16, n / 32 ), (double)n * lnew, 4.0e6, gapexp_rows, &c );
+#else
+	gapexp_rows( &c, 0, n );
+#endif
+}
+
+/* work/prog2: per-thread arenas for A__align's per-call buffers.
+   (1) The traceback matrix.  The original used the shared thread-local matrix commonIP, sized to
+       (1.3*lgth+110) x (1.3*lgth+110) ints with every row calloc'ed separately, and freed and
+       reallocated it (and zero-filled every row again) whenever a larger alignment came along.
+       Here the rows are packed with a stride of lgth2+2 ints into one block that is only replaced
+       when a call needs more than it holds; the block is sized for the largest alignment that fits
+       in alloclen (lgth1+lgth2 < alloclen), so that happens only when alloclen itself grows.
+       A__align writes every cell that it or Atracking reads (the DP fills rows 1..lasti-1,
+       columns 1..lastj-1; Atracking sets row 0, column 0 and [lgth1][lgth2]), and the original
+       reused commonIP across calls without clearing it, so stale contents never matter.
+   (2) mseq, the rows that receive the gapped result before it is copied back: rows of
+       lgth1+lgth2+100 chars in one block.  Every row that is read was written with a terminator
+       first, except in the reuseprofiles case, where mseq1[0] may be read by strlen() unwritten;
+       the first byte of every row is set to 0 so such a read still sees "" as with calloc(). */
+static TLS int *aijp_blk = NULL;
+static TLS size_t aijp_cap = 0;
+static TLS int **aijp_rows = NULL;
+static TLS int aijp_rowcap = 0;
+static TLS char *amseq_blk = NULL;
+static TLS size_t amseq_cap = 0;
+static TLS char **amseq_rows = NULL;
+static TLS int amseq_rowcap = 0;
+
+/* Large traceback blocks are shared between threads through a small pool: a thread returns its
+   block after a large alignment (A_ijp_release), and the next large alignment, on whichever
+   thread, takes a pooled block that is big enough instead of allocating (and page-faulting in)
+   a fresh one.  The contents of a block never matter (see above). */
+#define AIJP_POOLMAX 16
+#define AIJP_POOLMIN ( (size_t)16 << 20 ) // ints; smaller blocks stay with their thread
+#ifdef enablemultithread
+static pthread_mutex_t aijp_poolmutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
+static int *aijp_poolblk[AIJP_POOLMAX];
+static size_t aijp_poolcap[AIJP_POOLMAX];
+static int aijp_pooln = 0;
+
+static void A_ijp_release( void ) // give a large block back to the pool
+{
+#ifdef enablemultithread
+	if( aijp_cap < AIJP_POOLMIN ) return;
+	pthread_mutex_lock( &aijp_poolmutex );
+	if( aijp_pooln < AIJP_POOLMAX )
+	{
+		aijp_poolblk[aijp_pooln] = aijp_blk;
+		aijp_poolcap[aijp_pooln] = aijp_cap;
+		aijp_pooln++;
+		aijp_blk = NULL;
+		aijp_cap = 0;
+	}
+	pthread_mutex_unlock( &aijp_poolmutex );
+#endif
+}
+
+static void A_ijp_poolfree( void )
+{
+#ifdef enablemultithread
+	int k;
+	pthread_mutex_lock( &aijp_poolmutex );
+	for( k=0; k<aijp_pooln; k++ ) free( aijp_poolblk[k] );
+	aijp_pooln = 0;
+	pthread_mutex_unlock( &aijp_poolmutex );
+#endif
+}
+
+static int **A_ijp_get( int lgth1, int lgth2, int alloclen )
+{
+	size_t stride = (size_t)lgth2 + 2, need = ( (size_t)lgth1 + 2 ) * stride;
+	int i;
+#ifdef enablemultithread
+	if( need > aijp_cap && need >= AIJP_POOLMIN / 4 && aijp_pooln > 0 )
+	{
+		int k, best = -1;
+		pthread_mutex_lock( &aijp_poolmutex );
+		for( k=0; k<aijp_pooln; k++ ) // the smallest pooled block that is big enough
+			if( aijp_poolcap[k] >= need && ( best < 0 || aijp_poolcap[k] < aijp_poolcap[best] ) ) best = k;
+		if( best >= 0 )
+		{
+			int *b = aijp_poolblk[best];
+			size_t c = aijp_poolcap[best];
+			if( aijp_blk && aijp_cap >= AIJP_POOLMIN ) { aijp_poolblk[best] = aijp_blk; aijp_poolcap[best] = aijp_cap; }
+			else
+			{
+				free( aijp_blk );
+				aijp_poolblk[best] = aijp_poolblk[aijp_pooln-1];
+				aijp_poolcap[best] = aijp_poolcap[aijp_pooln-1];
+				aijp_pooln--;
+			}
+			aijp_blk = b;
+			aijp_cap = c;
+		}
+		pthread_mutex_unlock( &aijp_poolmutex );
+	}
+#endif
+	if( need > aijp_cap )
+	{
+		size_t half = (size_t)( alloclen > 0 ? alloclen : 0 ) / 2 + 4;
+		size_t cap = half * half;
+		if( cap < need + need / 4 ) cap = need + need / 4;
+		free( aijp_blk );
+		aijp_blk = malloc( cap * sizeof( int ) );
+		if( aijp_blk == NULL ) ErrorExit( "Cannot allocate the traceback matrix in A__align.\n" );
+		aijp_cap = cap;
+	}
+	if( lgth1 + 2 > aijp_rowcap )
+	{
+		free( aijp_rows );
+		aijp_rowcap = lgth1 + 2 + ( lgth1 + 2 ) / 2;
+		aijp_rows = malloc( aijp_rowcap * sizeof( int * ) );
+		if( aijp_rows == NULL ) ErrorExit( "Cannot allocate the traceback matrix in A__align.\n" );
+	}
+	for( i=0; i<lgth1+2; i++ ) aijp_rows[i] = aijp_blk + (size_t)i * stride;
+	return( aijp_rows );
+}
+
+static char **A_mseq_get( int nrow, int rowlen )
+{
+	size_t need = (size_t)nrow * rowlen;
+	int i;
+	if( need > amseq_cap )
+	{
+		free( amseq_blk );
+		amseq_cap = need + need / 2;
+		amseq_blk = malloc( amseq_cap );
+		if( amseq_blk == NULL ) ErrorExit( "Cannot allocate mseq in A__align.\n" );
+	}
+	if( nrow + 1 > amseq_rowcap )
+	{
+		free( amseq_rows );
+		amseq_rowcap = nrow + 1 + ( nrow + 1 ) / 2;
+		amseq_rows = malloc( amseq_rowcap * sizeof( char * ) );
+		if( amseq_rows == NULL ) ErrorExit( "Cannot allocate mseq in A__align.\n" );
+	}
+	for( i=0; i<nrow; i++ )
+	{
+		amseq_rows[i] = amseq_blk + (size_t)i * rowlen;
+		amseq_rows[i][0] = 0;
+	}
+	amseq_rows[nrow] = NULL;
+	return( amseq_rows );
+}
+
+static void A_arenas_free( void )
+{
+	A_ijp_poolfree();
+	free( aijp_blk ); aijp_blk = NULL; aijp_cap = 0;
+	free( aijp_rows ); aijp_rows = NULL; aijp_rowcap = 0;
+	free( amseq_blk ); amseq_blk = NULL; amseq_cap = 0;
+	free( amseq_rows ); amseq_rows = NULL; amseq_rowcap = 0;
+}
 
 double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **seq1, char **seq2, double *eff1, double *eff2, int icyc, int jcyc, int alloclen, int constraint, double *impmatch, char *sgap1, char *sgap2, char *egap1, char *egap2, int *chudanpt, int chudanref, int *chudanres, int headgp, int tailgp, int firstmem, int calledbyfulltreebase, double ***cpmxchild0, double ***cpmxchild1, double ***cpmxresult, double orieff1, double orieff2 )
 /* score no keisan no sai motokaraaru gap no atukai ni mondai ga aru */
@@ -1486,6 +2289,8 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 	int *warpipt, *warpjpt;
 	char *gt1, *gt2, *gt1bk, *gt2bk;
 	int usefused, rowfused;
+	int sparse2_ready = 1; // work/prog2: match_calc's sparse tables of cpmx2 are built
+	int inplace = 0;       // work/prog2: the result rows were written in place (no mseq)
 	double fsel_s[4];
 	double *fsel_c[4];
 	PT_DECL;
@@ -1544,6 +2349,7 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 			free( dpcolg2 ); dpcolg2 = NULL;
 			dpcolalloc = 0;
 		}
+		A_arenas_free();
 		return( 0.0 );
 	}
 
@@ -1624,9 +2430,14 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 	for( i=0; i<jcyc; i++ ) fprintf( stderr, "eff2[%d] = %f\n", i, eff2[i] );
 #endif
 
-	mseq1 = AllocateCharMtx( icyc, 0 );
-	mseq2 = AllocateCharMtx( jcyc, 0 );
-	mseq = AllocateCharMtx( icyc+jcyc, lgth1+lgth2+100 );
+	if( constraint ) // work/prog2: per-thread arena (was AllocateCharMtx per call); without a constraint the gaps are inserted in place
+	{
+		mseq = A_mseq_get( icyc+jcyc, lgth1+lgth2+100 );
+		mseq1 = mseq;
+		mseq2 = mseq + icyc;
+	}
+	else
+		mseq = mseq1 = mseq2 = NULL;
 #ifdef PROGTIMING
 	{ double _n = pt_now(); pt_acc[24] += _n - _pt_t; }
 #endif
@@ -1722,42 +2533,17 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 
 	for( i=0; i<icyc; i++ )
 	{
-		mseq1[i] = mseq[i];
+		if( mseq ) mseq1[i] = mseq[i];
 		seq1[i][lgth1] = 0;
 	}
 	for( j=0; j<jcyc; j++ )
 	{
-		mseq2[j] = mseq[icyc+j];
+		if( mseq ) mseq2[j] = mseq[icyc+j];
 		seq2[j][lgth2] = 0;
 	}
 
 
-	if( orlgth1 > commonAlloc1 || orlgth2 > commonAlloc2 )
-	{
-		int ll1, ll2;
-
-		if( commonAlloc1 && commonAlloc2 )
-		{
-			FreeIntMtx( commonIP );
-		}
-
-		ll1 = MAX( orlgth1, commonAlloc1 );
-		ll2 = MAX( orlgth2, commonAlloc2 );
-
-#if DEBUG
-		fprintf( stderr, "\n\ntrying to allocate %dx%d matrices ... ", ll1+1, ll2+1 );
-#endif
-
-		commonIP = AllocateIntMtx( ll1+10, ll2+10 );
-
-#if DEBUG
-		fprintf( stderr, "succeeded\n\n" );
-#endif
-
-		commonAlloc1 = ll1;
-		commonAlloc2 = ll2;
-	}
-	ijp = commonIP;
+	ijp = A_ijp_get( lgth1, lgth2, alloclen ); // work/prog2: per-thread arena (was the shared commonIP matrix)
 #ifdef PROGTIMING
 	double _pt_s1 = pt_now();
 #endif
@@ -1826,16 +2612,13 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 		{
 //			reporterr( "\nDo not use cpmxhist for child 0!\n" );
 			cpmx1pt = &cpmx1;
-			cpmx_calc_new( seq1, *cpmx1pt, eff1, lgth1, icyc );
-
 			gapfreq1pt = gapfreq1;
-			gapcountf( gapfreq1pt, seq1, icyc, eff1, lgth1 );
-			for( i=0; i<lgth1; i++ ) gapfreq1pt[i] = 1.0 - gapfreq1pt[i];
-
 			ogcp1opt = ogcp1o;
 			fgcp1opt = fgcp1o;
-			st_OpeningGapCount( ogcp1opt, icyc, seq1, eff1, lgth1 );
-			st_FinalGapCount( fgcp1opt, icyc, seq1, eff1, lgth1 );
+			/* work/prog2: cpmx_calc_new + gapcountf + st_OpeningGapCount + st_FinalGapCount in one pass */
+			profile_fused( seq1, icyc, eff1, lgth1, *cpmx1pt, ogcp1opt, fgcp1opt, gapfreq1pt, NULL );
+			profile_check( seq1, icyc, eff1, lgth1, *cpmx1pt, ogcp1opt, fgcp1opt, gapfreq1pt, NULL, NULL );
+			for( i=0; i<lgth1; i++ ) gapfreq1pt[i] = 1.0 - gapfreq1pt[i];
 		}
 	
 		if( cpmxchild1 && *cpmxchild1 )
@@ -1850,16 +2633,12 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 		{
 //			reporterr( "\nDo not use cpmxhist for child 1!\n" );
 			cpmx2pt = &cpmx2;
-			cpmx_calc_new( seq2, *cpmx2pt, eff2, lgth2, jcyc );
-
 			gapfreq2pt = gapfreq2;
-			gapcountf( gapfreq2pt, seq2, jcyc, eff2, lgth2 );
-			for( i=0; i<lgth2; i++ ) gapfreq2pt[i] = 1.0 - gapfreq2pt[i];
-
 			ogcp2opt = ogcp2o;
 			fgcp2opt = fgcp2o;
-			st_OpeningGapCount( ogcp2opt, jcyc, seq2, eff2, lgth2 );
-			st_FinalGapCount( fgcp2opt, jcyc, seq2, eff2, lgth2 );
+			profile_fused( seq2, jcyc, eff2, lgth2, *cpmx2pt, ogcp2opt, fgcp2opt, gapfreq2pt, NULL ); // work/prog2
+			profile_check( seq2, jcyc, eff2, lgth2, *cpmx2pt, ogcp2opt, fgcp2opt, gapfreq2pt, NULL, NULL );
+			for( i=0; i<lgth2; i++ ) gapfreq2pt[i] = 1.0 - gapfreq2pt[i];
 		}
 
 		//sgap1 == 1 ni taiou shite iani node, legacygap niyorazu, headgap to tailgap ha nai to minasu.
@@ -1880,6 +2659,35 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 		fgcp1opt = fgcp1o;
 		fgcp2opt = fgcp2o;
 
+		if( !reuseprofiles && legacygapcost == 0 )
+		{
+			/* work/prog2: cpmx_calc_new, the opening/final gap counts and gapcountf of each group in
+			   one pass (profile_fused); the remaining steps exactly as below */
+			profile_fused( seq1, icyc, eff1, lgth1, *cpmx1pt, ogcp1opt, fgcp1opt, gapfreq1pt, sgap1 ? sgap1 : NULL );
+			profile_check( seq1, icyc, eff1, lgth1, *cpmx1pt, ogcp1opt, fgcp1opt, gapfreq1pt, sgap1, egap1 );
+			profile_fused( seq2, jcyc, eff2, lgth2, *cpmx2pt, ogcp2opt, fgcp2opt, gapfreq2pt, sgap1 ? sgap2 : NULL );
+			profile_check( seq2, jcyc, eff2, lgth2, *cpmx2pt, ogcp2opt, fgcp2opt, gapfreq2pt, sgap1 ? sgap2 : NULL, egap2 );
+			if( sgap1 )
+			{
+				outgapcount( &headgapfreq1, icyc, sgap1, eff1 );
+				outgapcount( &headgapfreq2, jcyc, sgap2, eff2 );
+				outgapcount( gapfreq1pt+lgth1, icyc, egap1, eff1 );
+				outgapcount( gapfreq2pt+lgth2, jcyc, egap2, eff2 );
+			}
+			else
+			{
+				headgapfreq1 = 0.0;
+				headgapfreq2 = 0.0;
+				gapfreq1pt[lgth1] = 0.0;
+				gapfreq2pt[lgth2] = 0.0;
+			}
+			for( i=0; i<lgth1+1; i++ ) gapfreq1pt[i] = 1.0 - gapfreq1pt[i];
+			for( i=0; i<lgth2+1; i++ ) gapfreq2pt[i] = 1.0 - gapfreq2pt[i];
+			headgapfreq1 = 1.0 - headgapfreq1;
+			headgapfreq2 = 1.0 - headgapfreq2;
+		}
+		else
+		{
 		if( reuseprofiles )
 		{
 //			reporterr( "reuse" );
@@ -1945,6 +2753,7 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 			for( i=0; i<lgth2+1; i++ ) gapfreq2pt[i] = 1.0;
 			headgapfreq1 = 1.0;
 			headgapfreq2 = 1.0;
+		}
 		}
 	}
 
@@ -2037,6 +2846,36 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 	currentw = w1;
 	previousw = w2;
 
+	/* work/prog2: with the dense letter lists (at most 8 letters on either side), the first column
+	   and the first row are formed densely (bit-identical, see dense_initvertical and
+	   match_calc_dense), and the sparse tables of match_calc are built only if a row later needs
+	   them (sparse2_ready). */
+	if( FASTDP_ON && !constraint ) match_calc_dense_prep( *cpmx2pt, lgth2 );
+	else dense_nu = -1;
+	if( dense_nu >= 0 ) dense1_prep( *cpmx1pt, lgth1+1 ); // columns 0..lgth1: the first column and every DP row
+	if( dense_nu >= 0 && dense1_n <= DENSE_MAXU )
+	{
+		dense_initvertical( n_dynamicmtx, initverticalw, *cpmx2pt, *cpmx1pt, lgth1 );
+		match_calc_dense( n_dynamicmtx, currentw, *cpmx1pt, *cpmx2pt, 0, lgth2 );
+		sparse2_ready = 0;
+#ifdef PROGTIMING
+		if( getenv( "MAFFT_PROFCHECK" ) ) // compare with the original sparse computation, bitwise
+		{
+			double *a1 = malloc( sizeof( double ) * ( lgth1 + 1 ) ), *a2 = malloc( sizeof( double ) * ( lgth2 + 1 ) );
+			match_calc( n_dynamicmtx, a1, *cpmx2pt, *cpmx1pt, 0, lgth1, doublework, intwork, 1 );
+			match_calc( n_dynamicmtx, a2, *cpmx1pt, *cpmx2pt, 0, lgth2, doublework, intwork, 1 );
+			sparse2_ready = 1;
+			if( memcmp( a1, initverticalw, sizeof( double ) * lgth1 ) || memcmp( a2, currentw, sizeof( double ) * lgth2 ) )
+			{
+				reporterr( "\nPROFCHECK MISMATCH in the first column/row (lgth1=%d lgth2=%d)\n", lgth1, lgth2 );
+				exit( 1 );
+			}
+			free( a1 ); free( a2 );
+		}
+#endif
+	}
+	else
+	{
 	match_calc( n_dynamicmtx, initverticalw, *cpmx2pt, *cpmx1pt, 0, lgth1, doublework, intwork, 1 );
 	if( constraint )
 		imp_match_out_vead_tate( initverticalw, 0, lgth1 ); // 060306
@@ -2044,8 +2883,9 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 	match_calc( n_dynamicmtx, currentw, *cpmx1pt, *cpmx2pt, 0, lgth2, doublework, intwork, 1 );
 	if( constraint )
 		imp_match_out_vead( currentw, 0, lgth2 ); // 060306
-	if( FASTDP_ON && !constraint ) match_calc_dense_prep( *cpmx2pt, lgth2 );
-	else dense_nu = -1;
+	sparse2_ready = 1;
+	if( dense_nu >= 0 ) dense1_prep( *cpmx1pt, lgth1+1 );
+	}
 #if 0 // -> tbfast.c // impossible
 	if( localhom )
 		imp_match_calc( n_dynamicmtx, currentw, icyc, jcyc, lgth1, lgth2, seq1, seq2, eff1, eff2, localhom, 1, 0 );
@@ -2172,6 +3012,37 @@ for( i=0; i<lgth2; i++ )
 	usefused = ( FASTDP_ON && !trywarp && !constraint && dense_nu >= 0 && fpenalty_ex == 0.0 && lgth2 >= 1 );
 
 	PT_ADD(7);
+#ifdef enablemultithread
+	/* work/prog2: large fused DPs are split into tiles that idle helper threads share (Adp_tiled);
+	   the loop below is skipped when that path ran.  MAFFT_TILECHECK=1 (timing builds) reruns the
+	   serial loop afterwards on the saved initial state and compares everything bitwise. */
+	if( usefused && chudanpt == NULL && lasti > 2 )
+	{
+#ifdef PROGTIMING
+		if( pt_tilecheck() ) tilechk_save_init( lgth2, currentw, previousw, m, mp, wm );
+		else tilechk_pending = 0;
+#endif
+		if( Adp_tiled( lgth1, lgth2, lasti, n_dynamicmtx, *cpmx1pt, *cpmx2pt, currentw, previousw, m, mp, ijp,
+			gapfreq1pt, gapfreq2pt, fgcp1, ogcp1, fgcp2, ogcp2, initverticalw, lastverticalw, fpenalty_ex, &wm ) )
+		{
+			if( ( lasti - 1 ) & 1 ) { wtmp = currentw; currentw = previousw; previousw = wtmp; }
+#ifdef PROGTIMING
+			pt_acc[29] += 1.0; pt_acc[30] += (double)( lasti - 1 ) * lgth2;
+			if( pt_tilecheck() )
+			{
+				tilechk_save_result( lgth2, lasti, m, mp, ijp, lastverticalw, wm );
+				tilechk_restore_init( lgth2, m, mp, &wm ); // the initial state again, then the original loop
+				currentw = tilechk_cur0; previousw = tilechk_prev0;
+				goto adp_rowloop;
+			}
+#endif
+			goto adp_rowsdone;
+		}
+	}
+#endif
+#if defined( PROGTIMING ) && defined( enablemultithread )
+	adp_rowloop:
+#endif
 	for( i=1; i<lasti; i++ )
 	{
 
@@ -2181,9 +3052,7 @@ for( i=0; i<lgth2; i++ )
 		{
 //			fprintf( stderr, "\n\n## CHUUDAN!!! S\n" );
 			*chudanres = 1;
-			free( mseq1 ); // 2021/Sep
-			free( mseq2 ); // 2021/Sep
-			FreeCharMtx( mseq ); // 2021/Sep
+			// work/prog2: mseq lives in a per-thread arena
 			return( -1.0 );
 		}
 #endif
@@ -2202,7 +3071,7 @@ for( i=0; i<lgth2; i++ )
 			   which are exact no-ops as well (see match_calc_dense). */
 			double scu[DENSE_MAXU];
 			int u, nsel = 0;
-			dense_scores( n_dynamicmtx, *cpmx1pt, i, scu );
+			dense_scores1( n_dynamicmtx, *cpmx1pt, i, scu );
 			for( u=0; u<dense_nu; u++ )
 			{
 				if( scu[u] == 0.0 ) continue;
@@ -2233,6 +3102,7 @@ for( i=0; i<lgth2; i++ )
 			double t0 = pt_now(), t1, t2;
 			match_calc_dense( n_dynamicmtx, chk_match, *cpmx1pt, *cpmx2pt, i, lgth2 );
 			t1 = pt_now();
+			if( !sparse2_ready ) { match_calc_sparse_init( *cpmx2pt, lgth2, doublework, intwork ); sparse2_ready = 1; }
 			match_calc( n_dynamicmtx, currentw, *cpmx1pt, *cpmx2pt, i, lgth2, doublework, intwork, 0 );
 			t2 = pt_now();
 			pt_acc[16] += t1 - t0; pt_acc[17] += t2 - t1;
@@ -2247,7 +3117,10 @@ for( i=0; i<lgth2; i++ )
 		if( dense_nu >= 0 )
 			match_calc_dense( n_dynamicmtx, currentw, *cpmx1pt, *cpmx2pt, i, lgth2 );
 		else
+		{
+			if( !sparse2_ready ) { match_calc_sparse_init( *cpmx2pt, lgth2, doublework, intwork ); sparse2_ready = 1; }
 			match_calc( n_dynamicmtx, currentw, *cpmx1pt, *cpmx2pt, i, lgth2, doublework, intwork, 0 );
+		}
 #ifdef PROGTIMING
 		pt_acc[11] += pt_now() - _mc0;
 #endif
@@ -2388,9 +3261,7 @@ fprintf( stderr, "\n" );
 			if( chudanpt && *chudanpt != chudanref ) 
 			{
 //				fprintf( stderr, "\n\n## CHUUDAN!!! S\n" );
-				free( mseq1 ); // 2021/Sep
-				free( mseq2 ); // 2021/Sep
-				FreeCharMtx( mseq ); // 2021/Sep
+				// work/prog2: mseq lives in a per-thread arena
 				*chudanres = 1;
 				return( -1.0 );
 			}
@@ -2521,6 +3392,10 @@ fprintf( stderr, "\n" );
 			intncpy( prevwarpj, warpj, lastj );
 		}
 	}
+	adp_rowsdone:
+#if defined( PROGTIMING ) && defined( enablemultithread )
+	if( tilechk_pending ) tilechk_compare( lgth1, lgth2, lasti, m, mp, ijp, lastverticalw, wm );
+#endif
 
 	if( trywarp )
 	{
@@ -2565,8 +3440,24 @@ fprintf( stderr, "\n" );
 	else
 	{
 //		wmo = Atracking( currentw, lastverticalw, seq1, seq2, mseq1, mseq2, ijp, icyc, jcyc, tailgp, warpis, warpjs, warpbase, &ngap1, &ngap2, reuseprofiles, eff1, eff2, cpmxresult, cpmx1pt, cpmx2pt, gapfreq1pt, gapfreq2pt, ogcp1opt, ogcp2opt, fgcp1opt, fgcp2opt, orieff1, orieff2, (cpmx1pt!=cpmx1), (cpmx2pt!=cpmx2) );
-		wmo = Atracking( currentw, lastverticalw, fpenalty, fpenalty_ex, seq1, seq2, mseq1, mseq2, ijp, icyc, jcyc, tailgp, warpis, warpjs, warpbase, &ngap1, &ngap2, reuseprofiles, &gt1, &gt2 );
+		/* work/prog2: Atracking only builds the gap tables here; the gaps are inserted into seq1/seq2
+		   in place below (gapireru_inplace), instead of into mseq1/mseq2 followed by a strcpy back.
+		   Rows without inserted gaps (ngap == 0) are left as they are: the original copied them to
+		   mseq and back unchanged. */
+		wmo = Atracking( currentw, lastverticalw, fpenalty, fpenalty_ex, seq1, seq2, NULL, NULL, ijp, icyc, jcyc, tailgp, warpis, warpjs, warpbase, &ngap1, &ngap2, reuseprofiles, &gt1, &gt2 );
 		if( !tailgp ) wm = wmo;
+		inplace = 1;
+		{
+			int lnew1 = gt1bk + lgth1+lgth2 - gt1, lnew2 = gt2bk + lgth1+lgth2 - gt2;
+			resultlen = ( ngap1 == 0 && reuseprofiles ) ? 0 : lnew1; // = strlen( mseq1[0] ) in the original
+			if( alloclen < resultlen || resultlen > N )
+			{
+				fprintf( stderr, "alloclen=%d, resultlen=%d, N=%d\n", alloclen, resultlen, N );
+				ErrorExit( "LENGTH OVER!\n" );
+			}
+			if( ngap1 ) gapexp_all( seq1, icyc, gt1, lgth1, lnew1 );
+			if( ngap2 ) gapexp_all( seq2, jcyc, gt2, lgth2, lnew2 );
+		}
 	}
 
 	PT_ADD(9);
@@ -2675,6 +3566,8 @@ fprintf( stderr, "\n" );
 
 //	fprintf( stderr, "### impmatch = %f\n", *impmatch );
 
+	if( !inplace ) // work/prog2: otherwise done in place after Atracking
+	{
 	resultlen = strlen( mseq1[0] );
 	if( alloclen < resultlen || resultlen > N )
 	{
@@ -2687,6 +3580,7 @@ fprintf( stderr, "\n" );
 		for( i=0; i<icyc; i++ ) strcpy( seq1[i], mseq1[i] );
 	if( ngap2 || !reuseprofiles )
 		for( j=0; j<jcyc; j++ ) strcpy( seq2[j], mseq2[j] );
+	}
 
 
 
@@ -2708,9 +3602,8 @@ fprintf( stderr, "\n" );
 	previouscall = calledbyfulltreebase;
 
 	PT_ADD(10);
-	free( mseq1 );
-	free( mseq2 );
-	FreeCharMtx( mseq );
+	// work/prog2: mseq lives in a per-thread arena
+	A_ijp_release(); // work/prog2: large traceback blocks go back to the shared pool
 
 	return( wm );
 }

@@ -136,6 +136,9 @@ extern int getKouho( int *kouho, int nkouho, double *soukan, int nlen2 );
 extern void zurasu2( int lag, int    clus1, int    clus2, char  **seq1, char  **seq2, char **aseq1, char **aseq2 );
 extern void zurasu( int lag, int    clus1, int    clus2, char  **seq1, char  **seq2, char **aseq1, char **aseq2 );
 extern int alignableReagion( int    clus1, int    clus2, char  **seq1, char  **seq2, double *eff1, double *eff2, Segment *seg );
+extern void alignableReagion_prep( int clus1, int clus2, char **seq1, char **seq2, double *eff1, double *eff2 ); // work/prog2
+extern void alignableReagion_prep_free( void ); // work/prog2
+extern int alignableReagion_lag( int off1, int off2, Segment *seg ); // work/prog2
 extern void blockAlign( int *cut1, int *cut2, double **ocrossscore, int *ncut );
 extern void blockAlign2( int *cut1, int *cut2, Segment **seg1, Segment **seg2, double **ocrossscore, int *ncut );
 extern void blockAlign3( int *cut1, int *cut2, Segment **seg1, Segment **seg2, double **ocrossscore, int *ncut );
