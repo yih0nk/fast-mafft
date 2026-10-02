@@ -1,3 +1,6 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE // fast-mafft: glibc hides pthread_rwlock_t under -std=c99 without a feature macro
+#endif
 #include "mltaln.h"
 #include "progtiming.h"
 #include "dphelp.h"
