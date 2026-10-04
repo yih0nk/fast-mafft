@@ -59,6 +59,10 @@ static int mapout;
 static int smoothing;
 static double maxdistmtxsize;
 static int nthreadtb;
+static int nthreadtbq = -1;       // work/v7: threads for the progressive passes when the step order cannot change the result (-C a-b-c: c); -1 = nthreadtb
+static int tb_origserial = 0;     // work/largen: the original would run the progressive passes in the serial treebase() (njob > 20000)
+static size_t tb_keepbytes = 0;   // work/largen: > 0: after each step a thread frees its row and traceback arenas larger than this
+static double tb_heavymin = 64.0 * 1048576.0; // work/largen: a step whose full DP traceback needs this many bytes is heavy (see treebasethread)
 static int useexternalanchors;
 static int oneiteration;
 
@@ -174,6 +178,7 @@ typedef struct _treebasethread_arg
 	int *rowcap;
 	int nocopy;
 	struct _lzstate *lz; // work/prog3: deferred gap insertion (lazygap.h), NULL = off
+	int nrunmax; // work/v7: threads of this attempt (the limit on steps in flight; was nthreadtb)
 } treebasethread_arg_t;
 
 typedef struct _distancematrixthread_arg
@@ -334,7 +339,15 @@ void arguments( int argc, char *argv[] )
 					reporterr(       "nthread = %d\n", nthread );
 					reporterr(       "nthreadpair = %d\n", nthread );
 					if( strchr( *argv, '-' ) )
+					{
 						nthreadtb = myatoi( strchr( *argv, '-' )+1 );
+						/* work/v7: -C a-b-c.  c = threads for the progressive passes whenever their result
+						   cannot depend on the step order (see nthreadtbq in disttbfast()); b stays what the
+						   original uses, and the order-dependent (in-order) dispatch keeps it.  mafft.tmpl
+						   passes c = --thread when it caps b at 16. */
+						if( strchr( strchr( *argv, '-' )+1, '-' ) )
+							nthreadtbq = myatoi( strchr( strchr( *argv, '-' )+1, '-' )+1 );
+					}
 					else
 						nthreadtb = nthread;
 					reporterr(       "nthreadtb = %d\n", nthreadtb );
@@ -3892,6 +3905,14 @@ typedef struct _tbsched
 	int optimistic; // work/prog2: ready queue while the memsave switch has not fired; abort on it (see below)
 	int abort;     // work/prog2: set when a step finds a child longer than 30000 columns
 	char *started; // work/prog2: step handed out (for the clean-up after an abort)
+	int limit;     // work/largen: only steps with a smaller index run in this attempt
+	int detect;    // work/largen: a step that finds a child longer than 30000 columns lowers limit to
+	               // its own index and is put back, instead of abandoning the pass (see disttbfast())
+	double heavyfactor;   // work/largen: > 0: heavy steps (below) may hold at most heavyfactor * njob * alloclen
+	double heavyinflight; // bytes of traceback in heavy steps now running
+	int *deferred;        // heavy steps put back for lack of budget, pushed again when a heavy step ends
+	int ndeferred;
+	int ndeferrals;       // (count, for the test builds' report)
 } tbsched_t;
 
 static int tbsched_before( tbsched_t *sc, int a, int b )
@@ -3932,7 +3953,7 @@ static int tbsched_isready( Treedep *dep, int l )
 	return( ( dep[l].child0 == -1 || dep[dep[l].child0].done ) && ( dep[l].child1 == -1 || dep[dep[l].child1].done ) );
 }
 
-static void tbsched_init( tbsched_t *sc, int njob, Treedep *dep, int inorder, int optimistic )
+static void tbsched_init( tbsched_t *sc, int njob, Treedep *dep, int inorder, int optimistic, int limit )
 {
 	int l, nstep = njob - 1;
 	double *size = calloc( nstep, sizeof( double ) );
@@ -3940,12 +3961,19 @@ static void tbsched_init( tbsched_t *sc, int njob, Treedep *dep, int inorder, in
 	sc->parent = calloc( nstep, sizeof( int ) );
 	sc->prio = calloc( nstep, sizeof( double ) );
 	sc->started = calloc( nstep, sizeof( char ) );
+	sc->deferred = calloc( nstep, sizeof( int ) );
+	sc->ndeferred = 0;
+	sc->ndeferrals = 0;
+	sc->heavyfactor = 0.0;
+	sc->heavyinflight = 0.0;
 	sc->nheap = 0;
 	sc->ntaken = 0;
 	sc->ndone = 0;
 	sc->inorder = inorder;
 	sc->optimistic = optimistic && !inorder;
 	sc->abort = 0;
+	sc->limit = limit;  // work/largen: njob-1 = every step
+	sc->detect = 0;
 #ifdef PROGTIMING
 	if( getenv( "MAFFT_INORDER" ) ) sc->inorder = 1;
 #endif
@@ -3958,14 +3986,18 @@ static void tbsched_init( tbsched_t *sc, int njob, Treedep *dep, int inorder, in
 	}
 	for( l=nstep-1; l>=0; l-- ) // parents always have larger indices
 		sc->prio[l] = pow( size[l], 0.75 ) + ( sc->parent[l] == -1 ? 0.0 : sc->prio[sc->parent[l]] );
-	for( l=0; l<nstep; l++ )
-		if( tbsched_isready( dep, l ) ) tbsched_push( sc, l );
+	for( l=0; l<nstep; l++ ) // work/largen: steps done in an earlier phase of the pass are skipped
+	{
+		if( dep[l].done ) sc->ndone++;
+		else if( l < sc->limit && tbsched_isready( dep, l ) ) tbsched_push( sc, l );
+	}
 	free( size );
 }
 
 static void tbsched_free( tbsched_t *sc )
 {
 	free( sc->started );
+	free( sc->deferred );
 	free( sc->heap );
 	free( sc->parent );
 	free( sc->prio );
@@ -3975,7 +4007,7 @@ static void tbsched_done( tbsched_t *sc, Treedep *dep, int l ) // call with the 
 {
 	int p = sc->parent[l];
 	sc->ndone++;
-	if( p != -1 && tbsched_isready( dep, p ) ) tbsched_push( sc, p );
+	if( p != -1 && p < sc->limit && tbsched_isready( dep, p ) ) tbsched_push( sc, p );
 }
 
 /* work/prog3: deferred gap insertion (see lazygap.h).
@@ -4196,6 +4228,9 @@ static void lz_report( void ) { if( getenv( "MAFFT_LAZYCHECK" ) ) reporterr( "\n
 
 /* work/prog2: copying the member rows in and out of the local copies, split among idle helpers
    for large groups (each row is copied by exactly one thread; strcpy as before). */
+/* work/v7: with prog3's / largen's in-place rows (targ->nocopy, always on in normal builds) none of
+   the copy code below, aseqlock or the ReallocateCharMtx of all rows runs; they remain for the
+   MAFFT_COPYROWS=1 A/B switch of the timing builds (-DPROGTIMING) only, with gccpar's deadlock fix. */
 typedef struct { char **dst, **src; int *mem; } rowcopy_t;
 static void rowcopy_body( void *vctx, int lo, int hi )
 {
@@ -4270,6 +4305,7 @@ static void *treebasethread( void *arg )
 	double orieff1, orieff2;
 	ExtAnch *pairanch = NULL;
 	int localcopylen = 0;
+	double heavybytes = 0.0; // work/largen: traceback bytes this step counts against the heavy-step budget
 	int lz_on = 0, lz_stale0 = 0, lz_stale1 = 0, lz_defer0 = 0, lz_defer1 = 0; // work/prog3
 	char *lcblk = NULL; // work/prog2: per-thread block holding the local copies of the member rows
 	size_t lccap = 0;
@@ -4324,9 +4360,11 @@ static void *treebasethread( void *arg )
 			while( 1 )
 			{
 				if( sc->abort ) break; // work/prog2: the pass is being restarted in order (see below)
+				while( sc->nheap > 0 && sc->heap[0] >= sc->limit ) tbsched_pop( sc ); // work/largen: left for a later phase
 				if( sc->nheap > 0 ) break;
 				if( dphelppool && dphelp_serve_locked() ) continue;
 				if( dphelppool ? ( sc->ndone == njob-1 ) : ( sc->ntaken == njob-1 ) ) break;
+				if( *nrunpt == 0 ) break; // work/largen: nothing ready, nothing running: the rest belongs to a later phase
 				if( dphelppool ) dphelppool->nidle++;
 				pthread_cond_wait( targ->treecond, targ->mutex );
 				if( dphelppool ) dphelppool->nidle--;
@@ -4399,7 +4437,7 @@ static void *treebasethread( void *arg )
 
 
 //		while( *nrunpt >= nthread ) // bug
-		while( *nrunpt >= nthreadtb ) // tabun iranai
+		while( *nrunpt >= targ->nrunmax ) // tabun iranai  (work/v7: the threads of this attempt, nthreadtb in the original)
 			pthread_cond_wait( targ->treecond, targ->mutex ); // tabun iranai
 		(*nrunpt)++;
 		PTT(1);
@@ -4498,6 +4536,26 @@ static void *treebasethread( void *arg )
 		   So the first step that would flip it abandons the pass instead; disttbfast() then runs the
 		   pass again from the start with the original dispatch (bitwise the same as before as long
 		   as the switch never fires, since until then every step uses the same aligner). */
+		if( targ->sched && targ->sched->optimistic && targ->sched->detect && !nevermemsave && ( alg != 'M' && ( len1 > 30000 || len2 > 30000  ) ) )
+		{
+			/* work/largen (more than 20000 sequences, see disttbfast()): the original, serial,
+			   switches to the memsave algorithm at the first step in index order that finds a
+			   child longer than 30000 columns.  Put this step back as if it had never been taken
+			   and run no step with an index >= l in this attempt; the pass is finished in later
+			   phases once the smallest such index is known.  (work/v7: nothing of the step has
+			   been touched yet: no row grown, no lazy-gap table materialized or requested.) */
+			tbsched_t *sc = targ->sched;
+			if( l < sc->limit ) sc->limit = l;
+			sc->started[l] = 0;
+			sc->ntaken--;
+			if( l != njob-2 ) { free( memhist[l] ); memhist[l] = NULL; }
+			if( dep[l].child0 == -1 ) free( localmem[0] ); // the children's member lists stay in memhist
+			if( dep[l].child1 == -1 ) free( localmem[1] );
+			(*nrunpt)--;
+			pthread_cond_broadcast( targ->treecond );
+			pthread_mutex_unlock( targ->mutex );
+			continue;
+		}
 		if( targ->sched && targ->sched->optimistic && !nevermemsave && ( alg != 'M' && ( len1 > 30000 || len2 > 30000  ) ) )
 		{
 			targ->sched->abort = 1;
@@ -4512,6 +4570,42 @@ static void *treebasethread( void *arg )
 		{
 			reporterr(       "\nlen1=%d, len2=%d, Switching to the memsave mode\n", len1, len2 );
 			alg = 'M';
+		}
+
+		/* work/largen: memory (above 20000 sequences, see disttbfast()).  A step that will run the
+		   full A__align DP (no FFT, not 1-vs-1) with a traceback of at least tb_heavymin bytes is
+		   heavy.  Heavy steps run together only while their tracebacks fit in heavyfactor * njob *
+		   alloclen bytes (the original's A__align allocates a whole njob x alloclen copy of the
+		   alignment, mseq, at the root step) and no heavy step is waiting; otherwise the step is put
+		   back, as if never taken, until a heavy step ends.  A heavy step always runs when no other
+		   one does.  Idle threads meanwhile help the running steps.  (work/v7: len1/len2 are the
+		   logical lengths with deferred gaps; the put-back happens before anything of the step is
+		   touched.) */
+		heavybytes = 0.0;
+		if( targ->sched && targ->sched->heavyfactor > 0.0 && !targ->sched->inorder && alg != 'M' && !useexternalanchors
+			&& !( clus1 == 1 && clus2 == 1 ) && !( force_fft || ( use_fft && nlen[m1] > clus1 && nlen[m2] > clus2 ) ) )
+		{
+			tbsched_t *sc = targ->sched;
+			double hb = (double)( len1 + 2 ) * (double)( len2 + 2 ) * sizeof( int );
+			if( hb >= tb_heavymin )
+			{
+				if( sc->heavyinflight > 0.0 && ( sc->ndeferred > 0 || sc->heavyinflight + hb > sc->heavyfactor * (double)njob * (double)*alloclen ) ) // (no overtaking a deferred step)
+				{
+					sc->deferred[sc->ndeferred++] = l;
+					sc->ndeferrals++;
+					sc->started[l] = 0;
+					sc->ntaken--;
+					if( l != njob-2 ) { free( memhist[l] ); memhist[l] = NULL; }
+					if( dep[l].child0 == -1 ) free( localmem[0] );
+					if( dep[l].child1 == -1 ) free( localmem[1] );
+					(*nrunpt)--;
+					pthread_cond_broadcast( targ->treecond );
+					pthread_mutex_unlock( targ->mutex );
+					continue;
+				}
+				sc->heavyinflight += hb;
+				heavybytes = hb;
+			}
 		}
 
 		if( alg == 'M' ) // hoka no thread ga M ni shitakamo shirenainode
@@ -4932,6 +5026,11 @@ static void *treebasethread( void *arg )
 		pthread_mutex_lock( targ->mutex );
 		dep[l].done = 1;
 		if( targ->sched ) tbsched_done( targ->sched, dep, l );
+		if( heavybytes > 0.0 ) // work/largen: budget back, deferred heavy steps are ready again
+		{
+			targ->sched->heavyinflight -= heavybytes;
+			while( targ->sched->ndeferred > 0 ) tbsched_push( targ->sched, targ->sched->deferred[--targ->sched->ndeferred] );
+		}
 		PTT(5);
 		(*nrunpt)--;
 		pthread_cond_broadcast( targ->treecond );
@@ -4941,6 +5040,11 @@ static void *treebasethread( void *arg )
 
 		pthread_mutex_unlock( targ->mutex );
 		PTT(6);
+		if( tb_keepbytes ) // work/largen: memory as with one step at a time (see disttbfast())
+		{
+			A__align_trim( tb_keepbytes );
+			Falign_trim( tb_keepbytes );
+		}
 
 
 
@@ -6365,8 +6469,44 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 		nthreadtb = 0;
 	}
 #endif
-//	if( njob > 10000 ) nthreadtb = 0; 
-	if( njob > 20000 ) nthreadtb = 0; 
+//	if( njob > 10000 ) nthreadtb = 0;
+//	if( njob > 20000 ) nthreadtb = 0;
+	/* work/largen: the original runs both progressive passes in the serial treebase() above 20000
+	   sequences, whatever --thread says, for the two reasons given below (2018/Jan).  Neither holds
+	   in this version:
+	   1. treebasethread() builds the member lists from memhist (2018/Mar) and never calls
+	      topolorderz()/topolorder_lessargs(), the recursion over the tree whose depth can reach
+	      njob; the worker threads also get a stack of max( 8 MB, 200 * njob ) like the main thread
+	      (pthread_create below).
+	   2. there are no local copies any more: each step aligns its member rows in place (see the
+	      note above treebasethread()).
+	   With --thread N, nthread stays N on both paths, so A__align never reuses profiles (that needs
+	   nthread == 0), and each step computes the same function of its two children in treebase()
+	   and in treebasethread().  The one order-dependent piece of state is the memsave switch
+	   (alg = 'M' once a child exceeds 30000 columns): above 20000 sequences the threads reproduce
+	   where the serial pass switches, exactly (the phases in the driver below; at or below 20000
+	   the original's threaded, in-order behaviour is kept, as in work/prog2).  With one thread,
+	   treebase() as before. */
+	tb_origserial = ( njob > 20000 );
+#ifdef GCCPAR_TBTEST
+	if( getenv( "MAFFT_LARGEN_ORIGSERIAL" ) ) tb_origserial = 1; // test builds only: behave as above 20000 sequences at any size
+#endif
+#ifdef PROGTIMING
+	if( tb_origserial && nthreadtb <= 1 && !getenv( "MAFFT_LARGEN_TB1" ) ) nthreadtb = 0; // timing builds: MAFFT_LARGEN_TB1 keeps treebasethread() at one thread (per-step logs)
+#else
+	if( tb_origserial && nthreadtb <= 1 ) nthreadtb = 0;
+#endif
+#ifdef LARGEN_CUTOFF
+	if( njob > LARGEN_CUTOFF ) nthreadtb = 0; // build option: restore a size cutoff
+#endif
+	/* work/v7: nthreadtbq, the threads for an attempt of a progressive pass whose result cannot
+	   depend on the step order: the optimistic ready queue (it gives the original's serial result
+	   or abandons the attempt), the phases above 20000 sequences, and a pass that runs in 'M' from
+	   its start.  mafft.tmpl caps nthreadtb at 16 for --thread >= 16 (the original's
+	   "multithread: 16 made"); it passes the uncapped count as c in -C a-b-c.  The in-order
+	   dispatch, whose result with a memsave switch depends on the dispatch (the original's own
+	   racy behaviour), keeps nthreadtb threads, i.e. what the original uses. */
+	if( nthreadtbq < nthreadtb || nthreadtb <= 1 ) nthreadtbq = nthreadtb;
 #ifdef GCCPAR_TBTEST
 	if( getenv( "MAFFT_SERIALTB" ) ) nthreadtb = 0; // test builds only: force the serial treebase() path
 #endif
@@ -7302,10 +7442,11 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 		startclock = clock();
 #endif
 	
+		int tb_runserial = 1; // work/largen: 0 once the threaded pass below has completed
 #ifdef enablemultithread
 		if( nthreadtb > 0 && nadd == 0 ) // nthreadpair ha minai
 		{
-			treebasethread_arg_t *targ; 
+			treebasethread_arg_t *targ;
 			int jobpos;
 			pthread_t *handle;
 			pthread_mutex_t mutex;
@@ -7313,20 +7454,48 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			int *fftlog;
 			int nrun;
 			int nthread_yoyu;
+			int nthread_max, nthread_q; // work/v7: threads of the order-independent attempts (nthreadtbq), allocated for the larger count
 			tbsched_t tbsched;
 			pthread_rwlock_t aseqlock;
 			dphelppool_t tbpool;
-	
+			pthread_attr_t tbattr;
+
+			tb_runserial = 0;
+			nthread_q = ( nthreadtbq > nthreadtb ) ? nthreadtbq : nthreadtb;
+			nthread_max = nthread_q;
 			nthread_yoyu = nthreadtb * 1;
+			/* work/largen: give the worker threads a stack as large as the one the main thread gets
+			   for the tree recursions (setstacksize( 200 * njob ) above), at least 8 MB, instead of the
+			   platform default (512 KB on macOS, RLIMIT_STACK or 2 MB with glibc).  The step code does
+			   not recurse over the tree (see the note at tb_origserial); a margin, and only address space. */
+			pthread_attr_init( &tbattr );
+			{
+				size_t ss = 0, want = (size_t)200 * njob;
+				if( want < ( (size_t)8 << 20 ) ) want = (size_t)8 << 20;
+				pthread_attr_getstacksize( &tbattr, &ss );
+				if( ss < want ) pthread_attr_setstacksize( &tbattr, want );
+			}
+			/* work/largen: memory.  Above 20000 sequences the original holds the buffers of one step
+			   at a time (plus the distance matrix, during pass 1).  Here every thread keeps its row
+			   and traceback arenas between steps, and big traceback blocks go to a shared pool, so
+			   several threads' large buffers would stay allocated together.  For these passes the
+			   pool is off and a thread frees any arena larger than tb_keepbytes when its step ends:
+			   what stays allocated is then only what the running steps use, which are disjoint
+			   groups of rows. */
+			tb_keepbytes = tb_origserial ? ( (size_t)16 << 20 ) : 0;
+#ifdef GCCPAR_TBTEST
+			if( getenv( "MAFFT_LARGEN_KEEP" ) ) tb_keepbytes = (size_t)atof( getenv( "MAFFT_LARGEN_KEEP" ) ); // test builds: 0 = keep everything (and pool)
+#endif
+			A__align_nopool = ( tb_keepbytes > 0 );
 			nrun = 0;
-			jobpos = 0; 
-			targ = calloc( nthread_yoyu, sizeof( treebasethread_arg_t ) ); 
+			jobpos = 0;
+			targ = calloc( nthread_max, sizeof( treebasethread_arg_t ) );
 			fftlog = AllocateIntVec( njob );
-			handle = calloc( nthread_yoyu, sizeof( pthread_t ) ); 
+			handle = calloc( nthread_max, sizeof( pthread_t ) );
 			pthread_mutex_init( &mutex, NULL );
 			pthread_cond_init( &treecond, NULL );
 			pthread_rwlock_init( &aseqlock, NULL );
-	
+
 			/* The only order-dependent state in the progressive pass is the one-way switch to the
 			   memsave algorithm (alg = 'M') at the first step (in dispatch order) with a child longer
 			   than 30000 columns.  work/prog2:
@@ -7370,16 +7539,50 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 				tb_savenlen = calloc( njob, sizeof( int ) );
 				for( i=0; i<njob; i++ ) tb_savenlen[i] = nlen[i];
 			}
+			/* work/largen: above 20000 sequences the original runs the pass serially, so the memsave
+			   switch takes effect exactly at s*, the first step in index order with a child longer
+			   than 30000 columns: steps < s* use alg, steps >= s* use 'M'.  Here that result is
+			   reproduced with the threads, in phases:
+			   0  every step with alg, from the ready queue; a step that finds a child longer than
+			      30000 columns is put back and stops every step with a larger or equal index from
+			      starting (tbsched_t.limit).  The set of such steps is closed under taking parents
+			      (alignments only grow towards the root) and parents have larger indices, so every
+			      step < s* still runs (with alg, as in the original) and the smallest step put back
+			      is s* itself: at the end, limit = s*.
+			   1  only if some step >= s* had already run with alg before limit came down to s*: those
+			      results are wrong.  Each topmost such step's subtree is reset (rows and nlen of its
+			      members from the start of the pass, done flags, profile caches, work/v7: and its
+			      deferred gap tables) and its steps < s* are run again (limit = s*), which gives the
+			      same results as in phase 0.
+			   2  alg = 'M', then every remaining step (all >= s*), in any order.
+			   No switch: phase 0 is the whole pass, as before. */
+			int tb_phase = 0, tb_limit = njob-1, tb_sstar = -1;
 			for( tb_attempt=0; ; tb_attempt++ )
 			{
 			nrun = 0;
 			jobpos = 0;
-			for( i=0; i<njob; i++ ) dep[i].done = 0; 
-			for( i=0; i<njob; i++ ) fftlog[i] = 1; 
-			tbsched_init( &tbsched, njob, dep, tb_inorder, tb_optimistic );
+			if( tb_phase == 0 )
+			{
+				for( i=0; i<njob; i++ ) dep[i].done = 0;
+				for( i=0; i<njob; i++ ) fftlog[i] = 1;
+			}
+			tbsched_init( &tbsched, njob, dep, tb_inorder, tb_optimistic, tb_limit );
+			tbsched.detect = ( tb_origserial && tbsched.optimistic );
+			tbsched.heavyfactor = ( tb_keepbytes > 0 ) ? 1.0 : 0.0; // work/largen: see treebasethread()
+#ifdef GCCPAR_TBTEST
+			if( getenv( "MAFFT_LARGEN_HEAVY" ) ) tbsched.heavyfactor = atof( getenv( "MAFFT_LARGEN_HEAVY" ) ); // test builds: 0 = no budget
+			if( getenv( "MAFFT_LARGEN_HEAVYMIN" ) ) tb_heavymin = atof( getenv( "MAFFT_LARGEN_HEAVYMIN" ) ); // test builds: bytes
+#endif
+			/* work/v7: the order-independent attempts (ready queue) run nthread_q threads, the in-order
+			   dispatch nthreadtb, as the original (see nthreadtbq) */
+			nthread_yoyu = tbsched.inorder ? nthreadtb : nthread_q;
 			/* work/prog3: deferred gap insertion needs the rows in place, and a fixed aligner per step:
 			   either the optimistic ready queue (a memsave switch abandons the attempt) or one thread
 			   (the switch happens in the same thread, before the step looks at alg) */
+			/* work/v7: and in the phases above 20000 sequences: phase 0 and 1 are the optimistic ready
+			   queue (a step that would switch is put back before it touches anything), phase 2 runs
+			   every remaining step with 'M' (nothing is deferred; pending tables are materialized
+			   before a step reads its rows); a phase-1 reset drops the tables of the reset subtrees */
 			if( tb_nocopy && ( !tbsched.inorder || nthread_yoyu == 1 ) && tb_lazyok )
 			{
 				if( tb_lz == NULL ) tb_lz = lz_new( njob, bseq, tb_lazycheck );
@@ -7445,8 +7648,9 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 				targ[i].rowcap = tb_rowcap;
 				targ[i].nocopy = tb_nocopy;
 				targ[i].lz = tb_lz;
-	
-				pthread_create( handle+i, NULL, treebasethread, (void *)(targ+i) );
+				targ[i].nrunmax = nthread_yoyu;
+
+				if( pthread_create( handle+i, &tbattr, treebasethread, (void *)(targ+i) ) ) ErrorExit( "Cannot create a thread for the progressive alignment.\n" ); // work/largen: stack size
 			}
 
 			for( i=0; i<nthread_yoyu; i++ )
@@ -7465,16 +7669,90 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			free( ptlog ); ptlog = NULL;
 #endif
 			dphelppool = NULL;
+#ifdef GCCPAR_TBTEST
+			if( getenv( "MAFFT_LARGEN_HEAVY" ) ) reporterr( "\nheavy steps put back in this attempt: %d\n", tbsched.ndeferrals );
+#endif
 			if( !tbsched.abort )
 			{
-				if( tb_lz && tb_lz->stale[njob-2] ) ErrorExit( "lazy gaps: the root was not materialized.\n" );
+				int goswitch = 0;
+				if( tbsched.detect && tbsched.limit < tb_limit ) // work/largen: phase 0 found the switch (see above)
+				{
+					int nbad = 0, p, l, m;
+					char *insub;
+					if( tb_phase != 0 ) ErrorExit( "A step below the memsave switch found a child longer than 30000 columns.\n" ); // cannot happen
+					tb_sstar = tbsched.limit;
+					insub = calloc( njob, sizeof( char ) );
+					for( l=njob-2; l>=0; l-- ) // parents have larger indices than their children
+					{
+						p = tbsched.parent[l];
+						if( dep[l].done && l >= tb_sstar && ( p == -1 || ( !insub[p] && !dep[p].done ) ) ) // a topmost step that ran with the wrong algorithm
+						{
+							if( memhist[l] == NULL ) ErrorExit( "No member list for a step to redo.\n" ); // only the root has none, and it cannot be done here
+							for( i=0; (m=memhist[l][i])!=-1; i++ )
+							{
+								strcpy( bseq[m], tb_saveseq[m] ); nlen[m] = tb_savenlen[m];
 #ifdef PROGTIMING
-				if( tb_lz && tb_lz->shadow ) // every row against its shadow
-					for( i=0; i<njob; i++ )
-						if( strcmp( tb_lz->shadow[i], bseq[i] ) ) { reporterr( "\nLAZYCHECK MISMATCH at the end of the pass, row %d\n", i ); exit( 1 ); }
+								if( tb_lz && tb_lz->shadow ) // work/v7: the shadow row starts over too
+								{
+									int n = strlen( bseq[m] ) + 1;
+									if( n > tb_lz->shadowcap[m] ) { tb_lz->shadow[m] = realloc( tb_lz->shadow[m], n ); tb_lz->shadowcap[m] = n; }
+									strcpy( tb_lz->shadow[m], bseq[m] );
+								}
 #endif
-				tbsched_free( &tbsched );
-				break;
+							}
+							free( memhist[l] ); memhist[l] = NULL;
+							insub[l] = 1;
+							nbad++;
+						}
+						else if( p != -1 && insub[p] ) insub[l] = 1;
+						if( insub[l] )
+						{
+							dep[l].done = 0; // (the member lists of the steps below it were freed by their parents)
+							if( cpmxhist[l] ) { FreeDoubleMtx( cpmxhist[l] ); cpmxhist[l] = NULL; }
+							if( tb_lz ) // work/v7: deferred gap tables made inside the subtree are void (its rows start over);
+							{           // the topmost step's own table would come from its parent, which has not run
+								if( tb_lz->op[l] ) { free( tb_lz->op[l]->gt ); free( tb_lz->op[l] ); tb_lz->op[l] = NULL; }
+								tb_lz->stale[l] = 0; tb_lz->len[l] = 0;
+							}
+						}
+					}
+					free( insub );
+					tbsched_free( &tbsched );
+					reporterr( "\nAn alignment exceeds 30000 columns: the memsave mode starts at step %d of %d, as in the original's serial pass", tb_sstar+1, njob-1 );
+					if( nbad ) reporterr( "; %d subtree(s) that ran past it are redone", nbad );
+					reporterr( ".\n" );
+					if( nbad ) // phase 1
+					{
+						tb_phase = 1;
+						tb_limit = tb_sstar;
+						continue;
+					}
+					goswitch = 1;
+				}
+				else
+				{
+					tbsched_free( &tbsched );
+					if( tb_phase != 1 ) // the pass is complete
+					{
+						if( tb_lz && tb_lz->stale[njob-2] ) ErrorExit( "lazy gaps: the root was not materialized.\n" );
+#ifdef PROGTIMING
+						if( tb_lz && tb_lz->shadow ) // every row against its shadow
+							for( i=0; i<njob; i++ )
+								if( strcmp( tb_lz->shadow[i], bseq[i] ) ) { reporterr( "\nLAZYCHECK MISMATCH at the end of the pass, row %d\n", i ); exit( 1 ); }
+#endif
+						break;
+					}
+					goswitch = 1; // phase 1 done: every step < s* is done
+				}
+				if( goswitch ) // phase 2
+				{
+					reporterr( "\nSwitching to the memsave mode\n" );
+					alg = 'M';
+					tb_phase = 2;
+					tb_limit = njob-1;
+					tb_optimistic = 0;
+					continue;
+				}
 			}
 			/* work/prog2: abandoned (see above): undo the attempt and run the pass again in order.
 			   The aligned rows and nlen go back to their saved values; profile caches and member
@@ -7506,13 +7784,16 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			pthread_mutex_destroy( &mutex );
 			pthread_cond_destroy( &treecond );
 			pthread_rwlock_destroy( &aseqlock );
+			pthread_attr_destroy( &tbattr );
+			tb_keepbytes = 0;
+			A__align_nopool = 0;
 			free( handle );
 			free( targ );
 			free( fftlog );
 
 		}
-		else
 #endif
+		if( tb_runserial )
 		{
 #if 0
 			if( calcpairdists ) // except for last

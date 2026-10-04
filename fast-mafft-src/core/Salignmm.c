@@ -2509,9 +2509,20 @@ static int *aijp_poolblk[AIJP_POOLMAX];
 static size_t aijp_poolcap[AIJP_POOLMAX];
 static int aijp_pooln = 0;
 
+/* work/largen: with more than 20000 sequences the original aligns one step at a time.  To keep the
+   threaded pass's memory close to that, disttbfast() turns the pool off for those passes
+   (A__align_nopool) and each thread gives its large blocks back when a step ends (A__align_trim). */
+int A__align_nopool = 0;
+void A__align_trim( size_t keep )
+{
+	if( aijp_cap * sizeof( int ) > keep ) { free( aijp_blk ); aijp_blk = NULL; aijp_cap = 0; }
+	if( amseq_cap > keep ) { free( amseq_blk ); amseq_blk = NULL; amseq_cap = 0; }
+}
+
 static void A_ijp_release( void ) // give a large block back to the pool
 {
 #ifdef enablemultithread
+	if( A__align_nopool ) return; // work/largen
 	if( aijp_cap < AIJP_POOLMIN ) return;
 	pthread_mutex_lock( &aijp_poolmutex );
 	if( aijp_pooln < AIJP_POOLMAX )

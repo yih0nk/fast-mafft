@@ -811,6 +811,11 @@ static void Falign_rows_free( void )
 	free( fa_rows ); fa_rows = NULL; fa_rowcap = 0;
 }
 
+void Falign_trim( size_t keep ) // work/largen: give a large row arena back (see A__align_trim)
+{
+	if( fa_cap > keep ) { free( fa_blk ); fa_blk = NULL; fa_cap = 0; }
+}
+
 /* work/prog3: the segments of a Falign call in parallel.  After the anchors are fixed, every
    segment between two cut points is aligned on its own: its inputs are the original columns
    cut1[i]..cut1[i+1]-1 (and cut2[...]) of seq1/seq2 plus the gap states at the cut points
@@ -1086,7 +1091,16 @@ double Falign( int **whichmtx, double ***scoringmatrices, double **n_dynamicmtx,
 #endif
 
 
-	Falign_rows( clus1, clus2, alloclen, &result1, &result2, &tmpres1, &tmpres2 ); // work/prog2: per-thread arena
+	/* work/largen: rows of len1 + len2 + 100 bytes (at most alloclen) instead of alloclen.  Each row
+	   here holds a merged row of this step or an aligned pair of segments of it, at most len1 + len2
+	   characters plus the terminator; alloclen is the longest alignment so far in the whole pass, so
+	   below the root the rows were mostly unused (and, with threads, several steps' arenas exist at
+	   once). */
+	{
+		int rowlen = len1 + len2 + 100;
+		if( rowlen > alloclen ) rowlen = alloclen;
+		Falign_rows( clus1, clus2, rowlen, &result1, &result2, &tmpres1, &tmpres2 ); // work/prog2: per-thread arena
+	}
 	sgap1 = AllocateCharVec( clus1 );
 	egap1 = AllocateCharVec( clus1 );
 	sgap2 = AllocateCharVec( clus2 );

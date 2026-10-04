@@ -155,6 +155,9 @@ extern double A__align_variousdist( int **which, double ***scoringmatrices, doub
 extern double A__align_gapmap( char **seq1, char **seq2, double *eff1, double *eff2, int icyc, int jcyc, int alloclen, int constraint, double *impmatch, int *gapmap1, int *gapmap2 );
 extern double translate_and_Calign( char **mseq1, char **mseq2, double *effarr1, double *effarr2, int clus1, int clus2, int alloclen );
 extern double Fgetlag( double **scoringmtx, char  **seq1, char  **seq2, double *eff1, double *eff2, int    clus1, int    clus2, int alloclen );
+extern void Falign_trim( size_t keep ); // work/largen
+extern void A__align_trim( size_t keep ); // work/largen
+extern int A__align_nopool; // work/largen
 extern double Falign( int **whichmtx, double ***scoringmatrices, double **scoreingmtx, char  **seq1, char  **seq2, double *eff1, double *eff2, double **eff1s, double **eff2s, int    clus1, int    clus2, int alloclen, int *fftlog, int *, int, int * );
 extern double Falign_udpari_long( int **whichmtx, double ***scoringmatrices, double **scoringmtx, char  **seq1, char  **seq2, double *eff1, double *eff2, double **eff1s, double **eff2s, int    clus1, int    clus2, int alloclen, int *fftlog );
 extern double Falign_givenanchors( ExtAnch *extanch, int **whichmtx, double ***scoringmatrices, double **scoringmtx, char  **seq1, char  **seq2, double *eff1, double *eff2, double **eff1s, double **eff2s, int    clus1, int    clus2, int alloclen, int *fftlog );

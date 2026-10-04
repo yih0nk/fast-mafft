@@ -1080,29 +1080,34 @@ static void Gdp_row_fast( int i, int lastj, int lgth2, double * restrict colw, i
 	}
 
 /* work/prog3: GDP_CELL( 0, 1 ) with the match score given (prow[j] == mrow[s2[j]]) */
+/* work/v7: with gccpar's branch-free selects (ISEL/DSEL_GE, the integer mask for the horizontal-gap
+   candidate), i.e. exactly GDP_CELL( 0, 1 ) above with base = PEXPR.  Same operations on the same
+   operands in the same order as prog3's version (cw, gg, pc, mnew + fpenalty_ex, base + wmv; the
+   same >= / > comparisons and tie rules; -( j - mpil ) taken before mpil is updated), so gcc no
+   longer has data-dependent branches in it (the tails of the vector rows, and the scalar reference
+   of MAFFT_VECCHECK). */
 #define GDP_CELL_P( PEXPR ) \
 	{ \
-		double mj = mloc[j], pw = prew[j-1], base, cw, mnew, gg, pc; \
-		int mpj = mploc[j], cij, take, ijv, take2; \
+		double mj = mloc[j], pw = prew[j-1], base, cw, mnew, gg, wh, pc; \
+		int mpj = mploc[j], take, th, ijv, take2; \
 		base = (PEXPR); \
 		cw = mj + fpenalty; \
-		cij = i - mpj; \
 		take = ( pw >= mj ); \
-		mnew = take ? pw : mj; \
+		mnew = DSEL_GE( pw, mj ); \
 		mnew += fpenalty_ex; \
 		mloc[j] = mnew; \
-		mploc[j] = take ? i-1 : mpj; \
-		wmv = pw; \
-		ijv = 0; \
+		mploc[j] = ISEL( take, i-1, mpj ); \
 		gg = mil + fpenalty; \
-		if( gg > wmv ) { wmv = gg; ijv = -( j - mpil ); } \
+		th = ( gg > pw ); \
+		wh = th ? gg : pw; \
+		ijv = -( j - mpil ) & -th; \
 		pc = pw + fpenalty_ex_i; \
 		take2 = ( pc >= mil ); \
-		mil = take2 ? pc : mil; \
-		mpil = take2 ? j-1 : mpil; \
-		take = ( cw > wmv ); \
-		ijv = take ? cij : ijv; \
-		wmv = take ? cw : wmv; \
+		mil = DSEL_GE( pc, mil ); \
+		mpil = ISEL( take2, j-1, mpil ); \
+		take = ( cw > wh ); \
+		ijv = ISEL( take, i - mpj, ijv ); \
+		wmv = take ? cw : wh; \
 		curw[j] = base + wmv; \
 		ijpi[j] = ijv; \
 	}

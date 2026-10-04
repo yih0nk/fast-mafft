@@ -1271,6 +1271,14 @@ $ownlist"
 		else
 			numthreadstb=16
 		fi
+# fast-mafft (v7): disttbfast gets -C a-b-c.  b (capped at 16 as above) is what the original's
+# progressive passes use, and disttbfast keeps it wherever the result depends on the step order
+# (the in-order dispatch after a memsave switch).  c = all --thread threads for the passes whose
+# result does not depend on the order or the thread count (the ready queue, and the phases above
+# 20000 sequences).  An explicit --threadtb sets both.
+		numthreadstbq=$numthreads
+	else
+		numthreadstbq=$numthreadstb
 	fi
 
 	if [ $numthreadsit -lt 0 ]; then
@@ -2660,7 +2668,7 @@ $ownlist"
 			"$prefix/pairlocalalign" $addarg   -C $numthreads $seqtype $model  -g $lexp -f $lgop -Q $spfactor -h $laof -Y < infile > /dev/null  2>>"$progressfile"      || exit 1
 			cat hat3.seed hat3 > hatx
 			mv hatx hat3
-			"$prefix/disttbfast" -E 1 -s $unalignlevel $legacygapopt -W $tuplesize $termgapopt $outnum $addarg $add2ndhalfarg -C $numthreads-$numthreadstb $memopt $weightopt $treeinopt $treeoutopt -T -y $seqtype $model -f "-"$gop -Q $spfactor -h $aof  $param_fft $algopt $treealg $scoreoutarg < infile   > /dev/null 2>>"$progressfile" || exit 1
+			"$prefix/disttbfast" -E 1 -s $unalignlevel $legacygapopt -W $tuplesize $termgapopt $outnum $addarg $add2ndhalfarg -C $numthreads-$numthreadstb-$numthreadstbq $memopt $weightopt $treeinopt $treeoutopt -T -y $seqtype $model -f "-"$gop -Q $spfactor -h $aof  $param_fft $algopt $treealg $scoreoutarg < infile   > /dev/null 2>>"$progressfile" || exit 1
 			if [ $fragment -ne 0 ]; then 
 				"$prefix/addsingle" $codonposopt $codonscoreopt -Q 100 $legacygapopt -O $outnum $addsinglearg $addarg $add2ndhalfarg -C $numthreads $memopt $weightopt $treeinopt $treeoutopt $distoutopt $seqtype $model -f "-"$gop  -h $aof  $param_fft $localparam   $algopt $treealg < infile   > /dev/null 2>>"$progressfile" || exit 1
 			else
@@ -2688,7 +2696,7 @@ $ownlist"
 			if [ $fragment -ne 0 ]; then 
 				"$prefix/addsingle" $codonposopt $codonscoreopt -Q 100 $legacygapopt -W $tuplesize -O $outnum $addsinglearg $addarg $add2ndhalfarg -C $numthreads $memopt $weightopt $treeinopt $treeoutopt $distoutopt $seqtype $model -f "-"$gop  -h $aof  $param_fft $localparam   $algopt $treealg < infile   > /dev/null 2>>"$progressfile" || exit 1
 			else
-				"$prefix/disttbfast" -q $npickup -E $cycledisttbfast -V "-"$gopdist  -s $unalignlevel $legacygapopt $mergearg -W $tuplesize $termgapopt $outnum $addarg $add2ndhalfarg -C $numthreads-$numthreadstb $memopt $weightopt $treeinopt $treeoutopt $distoutopt $seqtype $model -g $gexp -f "-"$gop -Q $spfactor -h $aof  $param_fft $algopt $treealg $scoreoutarg $anchoropt -x $terminalmargin $oneiterationopt < infile   > pre 2>>"$progressfile" || exit 1
+				"$prefix/disttbfast" -q $npickup -E $cycledisttbfast -V "-"$gopdist  -s $unalignlevel $legacygapopt $mergearg -W $tuplesize $termgapopt $outnum $addarg $add2ndhalfarg -C $numthreads-$numthreadstb-$numthreadstbq $memopt $weightopt $treeinopt $treeoutopt $distoutopt $seqtype $model -g $gexp -f "-"$gop -Q $spfactor -h $aof  $param_fft $algopt $treealg $scoreoutarg $anchoropt -x $terminalmargin $oneiterationopt < infile   > pre 2>>"$progressfile" || exit 1
 				mv hat3.seed hat3
 			fi
 		fi
