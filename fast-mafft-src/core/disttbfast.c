@@ -1226,6 +1226,109 @@ static void *ylmsacompactdisthalfmtxthread( void *arg ) // enablemultithread == 
 }
 
 /*
+ * fast-mafft (work/x86simd): instruction-set level of the two distance kernels
+ * below (msadistfast, sextetfast).
+ *   level 0  portable C
+ *   level 1  128-bit SIMD: NEON on arm64; on x86-64 SSE2 (sextet, always
+ *            available) and POPCNT (msadist; portable C if the CPU lacks it)
+ *   level 2  x86-64 AVX2 (msadist also needs POPCNT and BMI1)
+ * On x86-64 (gcc or clang) the SSE2/POPCNT/AVX2 kernels are compiled with
+ * __attribute__((target(...))), so a default build (no -m flags) has them, and
+ * the level is chosen at run time with __builtin_cpu_supports().  Only integer
+ * kernels carry a target attribute; every double operation stays in default
+ * code, so no FMA contraction or other rounding change can occur.  The level is
+ * fixed before any worker thread starts.
+ *   MAFFT_SIMD=scalar|sse2|neon|popcnt|avx2   lower the level (debug / A-B);
+ *   a level the CPU lacks is not used (warning)
+ */
+/* BEGIN fmsimd dispatch */
+#include <stdint.h>
+#if defined(__x86_64__) && ( defined(__GNUC__) || defined(__clang__) )
+// mltaln.h defines one-letter macros (M N B C D G ...) that some compilers'
+// intrinsics headers use as parameter names (Apple clang 15: B)
+#pragma push_macro( "M" )
+#pragma push_macro( "N" )
+#pragma push_macro( "B" )
+#pragma push_macro( "C" )
+#pragma push_macro( "D" )
+#pragma push_macro( "G" )
+#pragma push_macro( "TM" )
+#pragma push_macro( "WIN" )
+#pragma push_macro( "MAX" )
+#pragma push_macro( "MIN" )
+#undef M
+#undef N
+#undef B
+#undef C
+#undef D
+#undef G
+#undef TM
+#undef WIN
+#undef MAX
+#undef MIN
+#include <immintrin.h>
+#pragma pop_macro( "MIN" )
+#pragma pop_macro( "MAX" )
+#pragma pop_macro( "WIN" )
+#pragma pop_macro( "TM" )
+#pragma pop_macro( "G" )
+#pragma pop_macro( "D" )
+#pragma pop_macro( "C" )
+#pragma pop_macro( "B" )
+#pragma pop_macro( "N" )
+#pragma pop_macro( "M" )
+#define FMSIMD_X86 1
+#else
+#define FMSIMD_X86 0
+#endif
+#define FMSIMD_SCALAR 0
+#define FMSIMD_BASE 1
+#define FMSIMD_AVX2 2
+
+// the highest level this CPU runs; *popcnt = x86 POPCNT present, *avx2ok = the
+// msadist AVX2 kernel can run (AVX2, POPCNT, BMI1); either pointer may be NULL
+static int fmsimd_cpu( int *popcnt, int *avx2ok )
+{
+	int pc = 0, lv = FMSIMD_SCALAR, a2 = 0;
+#if FMSIMD_X86
+	__builtin_cpu_init();
+	pc = __builtin_cpu_supports( "popcnt" ) ? 1 : 0;
+	a2 = __builtin_cpu_supports( "avx2" ) ? 1 : 0;
+	lv = a2 ? FMSIMD_AVX2 : FMSIMD_BASE; // SSE2 is part of x86-64
+	if( avx2ok ) *avx2ok = a2 && pc && __builtin_cpu_supports( "bmi" ); // msadist AVX2 kernel: avx2,popcnt,bmi
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+	lv = FMSIMD_BASE;
+	if( avx2ok ) *avx2ok = 0;
+#else
+	if( avx2ok ) *avx2ok = 0;
+#endif
+	if( popcnt ) *popcnt = pc;
+	(void)a2;
+	return( lv );
+}
+
+// level to use: the CPU's, lowered by MAFFT_SIMD
+static int fmsimd_level( void )
+{
+	int cpu = fmsimd_cpu( NULL, NULL ), want = cpu;
+	const char *e = getenv( "MAFFT_SIMD" );
+	if( e && *e )
+	{
+		if( !strcmp( e, "scalar" ) ) want = FMSIMD_SCALAR;
+		else if( !strcmp( e, "sse2" ) || !strcmp( e, "neon" ) || !strcmp( e, "popcnt" ) ) want = FMSIMD_BASE;
+		else if( !strcmp( e, "avx2" ) ) want = FMSIMD_AVX2;
+		else reporterr( "MAFFT_SIMD=%s not recognised (scalar|sse2|neon|popcnt|avx2)\n", e );
+		if( want > cpu )
+		{
+			reporterr( "MAFFT_SIMD=%s: not available on this CPU, using level %d\n", e, cpu );
+			want = cpu;
+		}
+	}
+	return( want );
+}
+/* END fmsimd dispatch */
+
+/*
  * fast-mafft: exact fast replacement for naivepairscorefast() in the
  * "Making a distance matrix from msa" stage.
  *
@@ -1252,17 +1355,36 @@ static void *ylmsacompactdisthalfmtxthread( void *arg ) // enablemultithread == 
  * transversion), each row is stored as gap mask + 2 code-bit planes and
  *     sum = Td[3]*n_rr + (Td[0]-Td[3])*n_0 + (Td[1]-Td[3])*n_1 + (Td[2]-Td[3])*n_2
  * where n_rr counts both-residue columns and n_d those with code xor d;
- * all counts are popcounts (NEON when available).
- * Generic path (any other residue bytes < 0x80): the same gap masks plus a
- * residue mask; the both-residue columns are visited bit by bit and scored
- * from a flat copy of amino_dis.
+ * all counts are popcounts (NEON on arm64; POPCNT or AVX2 on x86-64, see
+ * fmsimd above).  With AVX2 the gap runs of row i are counted for 4 rows j at
+ * a time in 64-bit lanes (msadist_gaprow_avx2) and the pair loop only adds the
+ * residue popcounts.
+ * Bit-plane path with exceptions (fast-mafft work/x86simd): with more than 4
+ * residue kinds, the 4 most frequent go in the planes if an xor code exists
+ * for them and the rest are rare (IUPAC codes in DNA: N, R, Y, ...).  An
+ * exception is stored as code 0 and, for every column where one row holds an
+ * exception and the other a residue, amino_dis[a][b] - Td[code(a)^code(b)]
+ * is added from per-row exception lists.
+ * Column path (any other residue bytes < 0x80, e.g. protein): for row i the
+ * residue sums with all later rows are accumulated at once by walking, for
+ * each residue column of i, the list of later rows with a residue in that
+ * column (msadist_colrow); the gap runs come from gap masks as above.  With
+ * AVX2, a column where >= 1/8 of the rows have a residue is instead added for
+ * 32 later rows at a time from column-major residue codes (vpshufb lookups of
+ * amino_dis as int16; msadist_densecol_avx2).  The older generic path
+ * (both-residue columns visited bit by bit) remains as a fallback.
  * Rows of unequal length or bytes >= 0x80 fall back to the original code.
  *
  * Debug (environment):
  *   MAFFT_MSADIST=ref      original function for every pair
  *   MAFFT_MSADIST=check    fast and original for every pair; exit(1) on any
  *                          bitwise difference ("generic,check" also works)
+ *   MAFFT_MSADIST=stat     print the path chosen (check does too)
  *   MAFFT_MSADIST=generic  skip the bit-plane path
+ *   MAFFT_MSADIST=noexc    no exceptions (bit-plane path only for <= 4 kinds)
+ *   MAFFT_MSADIST=ctz      generic path instead of the column path
+ *   MAFFT_MSADIST=nolane   AVX2 without the 4-lane gap runs
+ *   MAFFT_MSADIST=nodense  AVX2 column path without dense columns
  *   MAFFT_MSADIST_DUMP=f   write the finished matrix (row i, j>i, doubles)
  *   MAFFT_MSADIST_SAVEMSA=f  write the aligned rows + amino_dis (bench input)
  */
@@ -1276,6 +1398,7 @@ static void *ylmsacompactdisthalfmtxthread( void *arg ) // enablemultithread == 
 #endif
 
 #define MSADIST_CHUNK 4000 // 128-column blocks per u16 accumulation chunk (16*4000 < 65536)
+#define MSADIST_EXC 8      // lut flag: a residue outside the 4 plane kinds (bit-plane path with exceptions)
 
 typedef struct _msadistfast
 {
@@ -1285,35 +1408,83 @@ typedef struct _msadistfast
 	int penal;
 	int check;    // 1: also run naivepairscorefast() and compare bitwise
 	int xorpath;  // 1: bit-plane path, 0: generic path
-	char **seq;   // the aligned rows (generic path reads residues from them)
-	/* bit-plane path: <= 4 residue kinds and amino_dis[x][y] depends only on code(x)^code(y) */
+	int kern;     // kernel: 0 portable C, 1 NEON (arm64) or POPCNT (x86-64), 2 AVX2 (x86-64)
+	char **seq;   // the aligned rows (generic path and exceptions read residues from them)
+	/* bit-plane path: <= 4 plane kinds and amino_dis[x][y] depends only on code(x)^code(y) */
 	uint64_t *planes; // per row, per 128 columns: G[2] b0[2] b1[2] (gap mask, code bit 0, code bit 1)
 	long long Td[4];  // amino_dis value for code xor d
+	/* exceptions: residues outside the plane kinds (IUPAC codes in DNA); they are
+	   stored in the planes as code 0 and the difference is added per column */
+	int nexckinds;    // residue kinds outside the plane kinds (0: none)
+	int *exn;         // per row: number of exception columns
+	uint32_t **excol; // per row: ( column << 8 ) | byte for each exception column, ascending (NULL if none)
+	int *CXa, *CXb;   // ( exception byte e << 3 ) | k, p = the plane kind of code k: amino_dis[e][p] - Td[k] (CXa),
+	                  // amino_dis[p][e] - Td[k] (CXb); k = 4 (a gap): 0
+	int *CB;          // ( a << 7 ) | b, both exceptions: amino_dis[a][b] - Td[0]
+	long long nexc;   // total exception columns
+	int nexcrows;     // rows with at least one
 	/* generic path: any residue bytes < 0x80 */
-	uint64_t *masks;  // per row, per 64 columns: G, R (gap mask, residue mask)
+	uint64_t *masks;  // per row: W words of gap mask G, then W words of residue mask R
 	int *T;           // 0x80*0x80 copy of amino_dis (the gap row and column are never used)
+	/* column path (generic alphabets): the residue sum of row i with every later
+	   row is accumulated at once from per-column lists (msadist_colrow); the gap
+	   runs come from the gap masks */
+	int colpath;
+	uint32_t *centry; // per column, ascending rows: ( row << 8 ) | residue byte
+	size_t *coff;     // L+1 offsets into centry
+	uint32_t *rpos;   // per row, per residue (ascending column): index of its own entry in centry
+	size_t *roff;     // nseq+1 offsets into rpos
+	size_t *tcnt;     // preparation: per thread, per column: count, then fill cursor
+	/* dense columns (column path, AVX2): a column where >= nseq/8 rows have a residue is
+	   added for 32 later rows at a time from column-major residue codes instead of
+	   walking its list (msadist_densecol_avx2) */
+	int ndense;       // number of dense columns (0: none)
+	int *dcol;        // per column: its dense index, or -1
+	int np32;         // rows rounded up to a multiple of 32
+	uint8_t *dcode;   // ( dense index ) * np32 + row: residue code 0..30, 31 for a gap (and padding rows)
+	uint8_t *dtab;    // per residue byte a, 64 bytes: amino_dis[a][kind of code k] as int16 split into
+	                  // low bytes (codes 0-15, 16-31) and high bytes (codes 0-15, 16-31); code 31 -> 0
+	unsigned char kcode[0x80]; // residue byte -> code
+	/* AVX2 (kern 2): the gap runs of row i with 4 rows at a time, in 64-bit lanes
+	   (msadist_gaprow_avx2); the gap masks are stored transposed in groups of 4 rows */
+	int ne4;          // 1: g4 is built and the gap runs come from msadist_rowprep()
+	uint64_t *g4;     // ( ( row >> 2 ) * W + w ) * 4 + ( row & 3 ): gap word w of row
+	int skip1;        // bit-plane path: Td[1] == Td[3] (DNA), so n1 is not needed
 	/* preparation */
 	int nthreads;
-	int phase;
+	int phase;        // 0: lengths and bytes seen, 1: masks, 2: byte counts, 3: exception lists,
+	                  // 4: residues per column, 5: column lists, 6: transposed gap masks, 7: dense codes
 	unsigned char lut[0x80];
 } msadistfast_t;
 
 typedef struct _msadistprep
 {
 	msadistfast_t *f;
+	int t;                 // thread number
 	int r0, r1;
 	int bad;               // phase 0: a row of another length, or a byte >= 0x80
 	unsigned char seen[0x80];
 	int nknown;            // phase 0: bytes seen so far, in known[] (NEON fast scan)
 	unsigned char known[0x80];
+	long long cnt[0x80];   // phase 2: byte counts
 } msadistprep_t;
 
 static void msadistfast_free( msadistfast_t *f )
 {
+	int i;
 	if( f == NULL ) return;
+	if( f->excol ) for( i=0; i<f->nseq; i++ ) free( f->excol[i] );
+	free( f->excol );
+	free( f->exn );
+	free( f->CXa );
+	free( f->CXb );
+	free( f->CB );
 	free( f->planes );
 	free( f->masks );
 	free( f->T );
+	free( f->centry ); free( f->coff ); free( f->rpos ); free( f->roff ); free( f->tcnt );
+	free( f->g4 );
+	free( f->dcol ); free( f->dcode ); free( f->dtab );
 	free( f );
 }
 
@@ -1343,12 +1514,28 @@ static inline void msadist_lut64( const msadistfast_t *f, const unsigned char *s
 }
 #endif
 
-// phase 0: check lengths and collect the residue bytes; phase 1: build the row bit masks
+#if FMSIMD_X86
+// bit k = ( s[k] == c ) for 64 bytes (SSE2, part of x86-64)
+static inline uint64_t msadist_eqmask64( const unsigned char *s, unsigned char c )
+{
+	const __m128i v = _mm_set1_epi8( (char)c );
+	uint64_t m0 = (uint32_t)_mm_movemask_epi8( _mm_cmpeq_epi8( _mm_loadu_si128( (const __m128i *)s ), v ) );
+	uint64_t m1 = (uint32_t)_mm_movemask_epi8( _mm_cmpeq_epi8( _mm_loadu_si128( (const __m128i *)( s + 16 ) ), v ) );
+	uint64_t m2 = (uint32_t)_mm_movemask_epi8( _mm_cmpeq_epi8( _mm_loadu_si128( (const __m128i *)( s + 32 ) ), v ) );
+	uint64_t m3 = (uint32_t)_mm_movemask_epi8( _mm_cmpeq_epi8( _mm_loadu_si128( (const __m128i *)( s + 48 ) ), v ) );
+	return( m0 | ( m1 << 16 ) | ( m2 << 32 ) | ( m3 << 48 ) );
+}
+#endif
+
+// phase 0: check lengths and collect the residue bytes; phase 1: build the row bit masks;
+// phase 2: count the bytes; phase 3: list the exception columns of each row
 static void *msadist_prepthread( void *arg )
 {
 	msadistprep_t *p = (msadistprep_t *)arg;
 	msadistfast_t *f = p->f;
 	int i, c, k, w, cmax, L = f->L, W = f->W;
+	uint32_t *buf = NULL;
+	if( f->phase == 3 ) buf = malloc( ( L + 1 ) * sizeof( uint32_t ) );
 	for( i=p->r0; i<p->r1; i++ )
 	{
 		const unsigned char *s = (const unsigned char *)f->seq[i];
@@ -1373,9 +1560,76 @@ static void *msadist_prepthread( void *arg )
 				}
 				c += 16;
 			}
+#elif FMSIMD_X86
+			// the same with SSE2
+			while( p->nknown <= 8 && c + 16 <= L )
+			{
+				__m128i v = _mm_loadu_si128( (const __m128i *)( s+c ) ), m = _mm_setzero_si128();
+				for( k=0; k<p->nknown; k++ ) m = _mm_or_si128( m, _mm_cmpeq_epi8( v, _mm_set1_epi8( (char)p->known[k] ) ) );
+				if( _mm_movemask_epi8( m ) != 0xffff )
+				{
+					for( k=c; k<c+16; k++ )
+					{
+						hi |= s[k];
+						if( !p->seen[s[k]&0x7f] ) { p->seen[s[k]&0x7f] = 1; p->known[p->nknown++] = s[k]&0x7f; }
+					}
+				}
+				c += 16;
+			}
 #endif
 			for( ; c<L; c++ ) { hi |= s[c]; p->seen[s[c]&0x7f] = 1; }
 			if( hi & 0x80 ) p->bad = 1;
+		}
+		else if( f->phase == 2 )
+		{
+			for( c=0; c<L; c++ ) p->cnt[s[c]]++;
+		}
+		else if( f->phase == 7 )
+		{
+			for( c=0; c<L; c++ ) if( f->dcol[c] >= 0 ) f->dcode[(size_t)f->dcol[c] * f->np32 + i] = f->kcode[s[c]];
+		}
+		else if( f->phase == 6 )
+		{
+			uint64_t *g4 = f->g4 + (size_t)( i >> 2 ) * W * 4 + ( i & 3 );
+			if( f->xorpath ) for( w=0; w<W; w++ ) g4[4*w] = f->planes[(size_t)i * 3 * W + ( w >> 1 ) * 6 + ( w & 1 )];
+			else for( w=0; w<W; w++ ) g4[4*w] = f->masks[(size_t)i * 2 * W + w];
+		}
+		else if( f->phase == 4 || f->phase == 5 )
+		{
+			// residues of row i in column order, from its residue mask
+			const uint64_t *mk = f->masks + (size_t)i * 2 * W;
+			size_t *tc = f->tcnt + (size_t)p->t * L;
+			uint32_t *rp = f->rpos ? f->rpos + f->roff[i] : NULL;
+			int m = 0;
+			for( w=0; w<W; w++ )
+			{
+				uint64_t r = mk[W+w];
+				while( r )
+				{
+					c = w*64 + __builtin_ctzll( r );
+					if( f->phase == 4 ) tc[c]++;
+					else
+					{
+						size_t q = tc[c]++;
+						f->centry[q] = ( (uint32_t)i << 8 ) | s[c];
+						rp[m] = (uint32_t)q;
+					}
+					m++;
+					r &= r - 1;
+				}
+			}
+			if( f->phase == 4 ) f->roff[i+1] = m;
+		}
+		else if( f->phase == 3 )
+		{
+			int m = 0;
+			for( c=0; c<L; c++ ) if( f->lut[s[c]] & MSADIST_EXC ) buf[m++] = ( (uint32_t)c << 8 ) | s[c];
+			f->exn[i] = m;
+			if( m )
+			{
+				f->excol[i] = malloc( m * sizeof( uint32_t ) );
+				memcpy( f->excol[i], buf, m * sizeof( uint32_t ) );
+			}
 		}
 		else if( f->xorpath )
 		{
@@ -1418,7 +1672,14 @@ static void *msadist_prepthread( void *arg )
 				{
 					const uint8x16_t gap = vdupq_n_u8( '-' );
 					g = msadist_movemask64( vceqq_u8( vld1q_u8( s+w*64 ), gap ), vceqq_u8( vld1q_u8( s+w*64+16 ), gap ), vceqq_u8( vld1q_u8( s+w*64+32 ), gap ), vceqq_u8( vld1q_u8( s+w*64+48 ), gap ) );
-					mk[2*w] = g; mk[2*w+1] = ~g;
+					mk[w] = g; mk[W+w] = ~g;
+					continue;
+				}
+#elif FMSIMD_X86
+				if( cmax == 64 )
+				{
+					g = msadist_eqmask64( s+w*64, '-' );
+					mk[w] = g; mk[W+w] = ~g;
 					continue;
 				}
 #endif
@@ -1428,10 +1689,11 @@ static void *msadist_prepthread( void *arg )
 					g |= v << k;
 					r |= ( v ^ 1 ) << k;
 				}
-				mk[2*w] = g; mk[2*w+1] = r;
+				mk[w] = g; mk[W+w] = r;
 			}
 		}
 	}
+	free( buf );
 	return( NULL );
 }
 
@@ -1442,6 +1704,7 @@ static void msadist_prepphase( msadistfast_t *f, msadistprep_t *p, int phase )
 	for( t=0; t<nth; t++ )
 	{
 		p[t].f = f;
+		p[t].t = t;
 		p[t].r0 = (int)( (long long)f->nseq * t / nth );
 		p[t].r1 = (int)( (long long)f->nseq * ( t + 1 ) / nth );
 	}
@@ -1486,24 +1749,37 @@ static int msadist_findxorcode( int K, const unsigned char *chr, int *code, long
 	return( 0 );
 }
 
+static const char *msadist_kname( const msadistfast_t *f )
+{
+	if( f->kern == 2 ) return( "avx2" );
+#if MSADIST_NEON
+	if( f->kern == 1 ) return( "neon" );
+#endif
+	if( f->kern == 1 ) return( "popcnt" );
+	return( "portable" );
+}
+
 // Returns NULL when the original function must be used.
 // MAFFT_MSADIST may contain "ref" (use the original), "check" (compare every pair
-// with the original) and "generic" (skip the bit-plane path).
+// with the original), "generic" (skip the bit-plane path), "noexc" (bit-plane
+// path only for <= 4 residue kinds) and "stat" (print the path chosen).
 static msadistfast_t *msadistfast_prepare( int nseq, char **seq, int penal, int nthreads )
 {
 	msadistfast_t *f;
 	msadistprep_t *p;
 	int code[4];
-	unsigned char chr[4];
-	int t, a, b, c, K, bad;
-	long long Td[4];
+	unsigned char chr[4], all[0x80];
+	int t, a, b, c, K, Kp, bad, lv, pc, a2;
+	long long Td[4], cnt[0x80], nres;
 	unsigned char seen[0x80];
 	const char *mode = getenv( "MAFFT_MSADIST" );
+	int stat;
 
 	if( mode && strstr( mode, "ref" ) ) return( NULL );
 	if( nseq < 2 ) return( NULL );
 	if( nthreads < 1 ) nthreads = 1;
 	if( nthreads > nseq ) nthreads = nseq;
+	stat = ( mode && ( strstr( mode, "stat" ) || strstr( mode, "check" ) ) );
 
 	f = calloc( 1, sizeof( msadistfast_t ) );
 	p = calloc( nthreads, sizeof( msadistprep_t ) );
@@ -1515,6 +1791,17 @@ static msadistfast_t *msadistfast_prepare( int nseq, char **seq, int penal, int 
 	f->check = ( mode && strstr( mode, "check" ) );
 	f->nthreads = nthreads;
 
+	lv = fmsimd_level();
+	fmsimd_cpu( &pc, &a2 );
+	f->kern = 0;
+#if MSADIST_NEON
+	if( lv >= FMSIMD_BASE ) f->kern = 1;
+#elif FMSIMD_X86
+	if( lv >= FMSIMD_AVX2 && a2 ) f->kern = 2;
+	else if( lv >= FMSIMD_BASE && pc ) f->kern = 1;
+#endif
+	(void)pc; (void)a2;
+
 	msadist_prepphase( f, p, 0 );
 	bad = 0;
 	memset( seen, 0, sizeof( seen ) );
@@ -1525,6 +1812,7 @@ static msadistfast_t *msadistfast_prepare( int nseq, char **seq, int penal, int 
 	}
 	if( bad || seen[0] )
 	{
+		if( stat ) reporterr( "msadist fast: not used (rows of unequal length or bytes >= 0x80): original code for every pair\n" );
 		free( p );
 		msadistfast_free( f );
 		return( NULL );
@@ -1534,26 +1822,180 @@ static msadistfast_t *msadistfast_prepare( int nseq, char **seq, int penal, int 
 	for( c=1; c<0x80; c++ ) if( seen[c] && c != '-' )
 	{
 		if( K < 4 ) chr[K] = c;
+		all[K] = c;
 		K++;
 	}
-	f->xorpath = ( K <= 4 && !( mode && strstr( mode, "generic" ) ) && msadist_findxorcode( K, chr, code, Td ) );
+	Kp = K; // kinds in the planes
+	f->xorpath = 0;
+	if( !( mode && strstr( mode, "generic" ) ) )
+	{
+		if( K <= 4 ) f->xorpath = msadist_findxorcode( K, chr, code, Td );
+		else if( !( mode && strstr( mode, "noexc" ) ) )
+		{
+			// more than 4 kinds: the 4 most frequent go in the planes if an xor code
+			// exists for them and the others are rare (<= L/32 per row on average)
+			msadist_prepphase( f, p, 2 );
+			memset( cnt, 0, sizeof( cnt ) );
+			for( t=0; t<nthreads; t++ ) for( c=0; c<0x80; c++ ) cnt[c] += p[t].cnt[c];
+			for( a=0; a<4; a++ ) // selection of the top 4 (ties: smaller byte first)
+			{
+				int best = -1;
+				for( b=0; b<K; b++ )
+				{
+					int used = 0;
+					for( c=0; c<a; c++ ) if( chr[c] == all[b] ) used = 1;
+					if( !used && ( best < 0 || cnt[all[b]] > cnt[all[best]] ) ) best = b;
+				}
+				chr[a] = all[best];
+			}
+			nres = 0;
+			for( b=0; b<K; b++ ) nres += cnt[all[b]];
+			f->nexc = nres - cnt[chr[0]] - cnt[chr[1]] - cnt[chr[2]] - cnt[chr[3]];
+			Kp = 4;
+			if( f->nexc * 32 <= (long long)nseq * f->L && msadist_findxorcode( 4, chr, code, Td ) )
+			{
+				f->xorpath = 1;
+				f->nexckinds = K - 4;
+			}
+			else if( stat ) reporterr( "msadist fast: %d residue kinds, %lld of %lld residues outside the top 4; generic path\n", K, f->nexc, nres );
+		}
+	}
 	if( f->xorpath )
 	{
 		for( a=0; a<4; a++ ) f->Td[a] = Td[a];
 		memset( f->lut, 0, sizeof( f->lut ) );
 		f->lut['-'] = 4;
-		for( a=0; a<K; a++ ) f->lut[chr[a]] = code[a];
+		if( f->nexckinds ) for( b=0; b<K; b++ ) f->lut[all[b]] = MSADIST_EXC; // code 0 in the planes
+		for( a=0; a<Kp; a++ ) f->lut[chr[a]] = code[a];
 		f->planes = calloc( (size_t)nseq * 3 * f->W, sizeof( uint64_t ) );
-		if( f->check ) reporterr( "msadist fast (bit-plane path): L=%d K=%d Td=%lld,%lld,%lld,%lld penal=%d\n", f->L, K, Td[0], Td[1], Td[2], Td[3], penal );
+		if( f->nexckinds )
+		{
+			f->exn = calloc( nseq, sizeof( int ) );
+			f->excol = calloc( nseq, sizeof( uint32_t * ) );
+			f->CXa = calloc( 0x80 * 8, sizeof( int ) );
+			f->CXb = calloc( 0x80 * 8, sizeof( int ) );
+			f->CB = calloc( 0x80 * 0x80, sizeof( int ) );
+			// an exception is code 0 in the planes, so the plane sum counted Td[0^k] = Td[k]
+			// against the plane kind chr[b] of code k = code[b], and Td[0] against another exception
+			for( a=1; a<0x80; a++ ) if( f->lut[a] & MSADIST_EXC )
+			{
+				for( b=0; b<4; b++ )
+				{
+					f->CXa[(a<<3)|code[b]] = amino_dis[a][chr[b]] - (int)Td[code[b]];
+					f->CXb[(a<<3)|code[b]] = amino_dis[chr[b]][a] - (int)Td[code[b]];
+				}
+				for( b=1; b<0x80; b++ ) if( f->lut[b] & MSADIST_EXC ) f->CB[(a<<7)|b] = amino_dis[a][b] - (int)Td[0];
+			}
+			msadist_prepphase( f, p, 3 );
+			f->nexc = 0;
+			for( a=0; a<nseq; a++ )
+			{
+				f->nexc += f->exn[a];
+				if( f->exn[a] ) f->nexcrows++;
+			}
+		}
+		if( stat ) reporterr( "msadist fast (bit-plane path, %s%s): L=%d K=%d Td=%lld,%lld,%lld,%lld penal=%d; exceptions: %d kinds, %lld columns in %d of %d rows\n", msadist_kname( f ), ( f->kern == 2 && !( mode && strstr( mode, "nolane" ) ) ) ? ", 4-lane gap runs" : "", f->L, K, Td[0], Td[1], Td[2], Td[3], penal, f->nexckinds, f->nexc, f->nexcrows, nseq );
 	}
 	else
 	{
 		f->T = calloc( 0x80 * 0x80, sizeof( int ) );
 		for( a=0; a<0x80; a++ ) for( b=0; b<0x80; b++ ) f->T[(a<<7)|b] = ( a == '-' || b == '-' ) ? 0 : amino_dis[a][b];
 		f->masks = calloc( (size_t)nseq * 2 * f->W, sizeof( uint64_t ) );
-		if( f->check ) reporterr( "msadist fast (generic path): L=%d K=%d penal=%d\n", f->L, K, penal );
+		// column path unless switched off or an int sum could overflow
+		{
+			long long tmax = 0;
+			for( a=0; a<0x80*0x80; a++ ) if( llabs( (long long)f->T[a] ) > tmax ) tmax = llabs( (long long)f->T[a] );
+			f->colpath = !( mode && strstr( mode, "ctz" ) ) && nseq < ( 1 << 24 ) && tmax * f->L < 0x7fffffffLL;
+		}
 	}
 	msadist_prepphase( f, p, 1 );
+	if( f->colpath )
+	{
+		size_t tot, q;
+		int L = f->L;
+		f->tcnt = calloc( (size_t)nthreads * L, sizeof( size_t ) );
+		f->roff = calloc( nseq + 1, sizeof( size_t ) );
+		f->coff = calloc( L + 1, sizeof( size_t ) );
+		msadist_prepphase( f, p, 4 );
+		for( a=0; a<nseq; a++ ) f->roff[a+1] += f->roff[a];
+		for( c=0; c<L; c++ ) for( t=0; t<nthreads; t++ ) f->coff[c+1] += f->tcnt[(size_t)t*L+c];
+		for( c=0; c<L; c++ ) f->coff[c+1] += f->coff[c];
+		tot = f->coff[L];
+		if( tot < 0xffffffffUL ) // entry indices are 32-bit
+		{
+			for( c=0; c<L; c++ ) // fill cursors: thread t's rows follow those of threads < t
+			{
+				q = f->coff[c];
+				for( t=0; t<nthreads; t++ ) { size_t m = f->tcnt[(size_t)t*L+c]; f->tcnt[(size_t)t*L+c] = q; q += m; }
+			}
+			f->centry = malloc( ( tot + 1 ) * sizeof( uint32_t ) );
+			f->rpos = malloc( ( tot + 1 ) * sizeof( uint32_t ) );
+		}
+		if( f->centry && f->rpos ) msadist_prepphase( f, p, 5 );
+		else // too many residues or no memory: the generic path
+		{
+			free( f->centry ); free( f->rpos ); free( f->coff ); free( f->roff );
+			f->centry = f->rpos = NULL; f->coff = f->roff = NULL;
+			f->colpath = 0;
+		}
+		free( f->tcnt ); f->tcnt = NULL;
+	}
+	f->skip1 = f->xorpath && f->Td[1] == f->Td[3];
+#if FMSIMD_X86
+	if( f->colpath && f->kern == 2 && !( mode && strstr( mode, "nodense" ) ) )
+	{
+		int K2 = 0, nd = 0, ok = 1, kb[31];
+		memset( f->kcode, 31, sizeof( f->kcode ) );
+		for( c=1; c<0x80; c++ ) if( seen[c] && c != '-' )
+		{
+			if( K2 == 31 ) { ok = 0; break; }
+			kb[K2] = c;
+			f->kcode[c] = K2++;
+		}
+		for( a=0; a<K2 && ok; a++ ) for( b=0; b<K2; b++ ) if( amino_dis[kb[a]][kb[b]] < -32768 || amino_dis[kb[a]][kb[b]] > 32767 ) ok = 0;
+		if( ok )
+		{
+			f->dcol = malloc( f->L * sizeof( int ) );
+			for( c=0; c<f->L; c++ )
+			{
+				f->dcol[c] = -1;
+				if( (long long)( f->coff[c+1] - f->coff[c] ) * 8 >= nseq && nseq >= 64 ) f->dcol[c] = nd++;
+			}
+			f->np32 = ( nseq + 31 ) & ~31;
+			if( nd && !posix_memalign( (void **)&f->dcode, 32, (size_t)nd * f->np32 ) && ( f->dtab = calloc( 0x80, 64 ) ) )
+			{
+				memset( f->dcode, 31, (size_t)nd * f->np32 );
+				for( a=0; a<K2; a++ ) for( b=0; b<K2; b++ )
+				{
+					int v = amino_dis[kb[a]][kb[b]];
+					uint8_t *tb = f->dtab + kb[a] * 64;
+					tb[( b >> 4 ) * 16 + ( b & 15 )] = (uint8_t)( v & 0xff );
+					tb[32 + ( b >> 4 ) * 16 + ( b & 15 )] = (uint8_t)( ( v >> 8 ) & 0xff );
+				}
+				msadist_prepphase( f, p, 7 );
+				f->ndense = nd;
+			}
+			else
+			{
+				free( f->dcol ); free( f->dcode ); free( f->dtab );
+				f->dcol = NULL; f->dcode = NULL; f->dtab = NULL;
+			}
+		}
+	}
+
+	if( f->kern == 2 && ( f->xorpath || f->colpath ) && !( mode && strstr( mode, "nolane" ) ) )
+	{
+		size_t ng = ( (size_t)nseq + 3 ) / 4;
+		if( !posix_memalign( (void **)&f->g4, 32, ng * f->W * 4 * sizeof( uint64_t ) ) )
+		{
+			memset( f->g4, 0, ng * f->W * 4 * sizeof( uint64_t ) );
+			msadist_prepphase( f, p, 6 );
+			f->ne4 = 1;
+		}
+		else f->g4 = NULL;
+	}
+#endif
+	if( !f->xorpath && stat ) reporterr( "msadist fast (%s path, %s%s): L=%d K=%d penal=%d; %d dense columns\n", f->colpath ? "column" : "generic", msadist_kname( f ), f->ne4 ? ", 4-lane gap runs" : "", f->L, K, penal, f->ndense );
 	free( p );
 	return( f );
 }
@@ -1570,12 +2012,48 @@ static msadistfast_t *msadistfast_prepare( int nseq, char **seq, int penal, int 
 		(e) = ( sa_ & ~a_ ) | ( sb_ & ~b_ ); \
 	} while( 0 )
 
-static inline long long msadist_xorscore( const msadistfast_t *f, const uint64_t *pi, const uint64_t *pj )
+// nA counts columns with a gap in either row, nB those that are not identical
+// residue pairs, n1/n2 the both-residue columns with code xor 1/2, nE the gap
+// runs.  Padding columns (>= len) have no gap bit and code 0 in both rows, so
+// they add to neither nA nor nB.  Both-residue columns: len - nA; with code
+// xor 0: len - nB; xor 1: n1; xor 2: n2; xor 3: the rest.
+static inline long long msadist_xorsum( const msadistfast_t *f, long long nA, long long nB, long long n1, long long n2, long long nE )
 {
-	long long len = f->L, nA = 0, nB = 0, n1 = 0, n2 = 0, nE = 0;
+	long long len = f->L;
+	return( f->Td[3] * ( len - nA ) + ( f->Td[0] - f->Td[3] ) * ( len - nB ) + ( f->Td[1] - f->Td[3] ) * n1 + ( f->Td[2] - f->Td[3] ) * n2
+	      + (long long)f->penal * nE );
+}
+
+// portable C
+static long long msadist_xorscore_c( const msadistfast_t *f, const uint64_t *pi, const uint64_t *pj )
+{
+	long long nA = 0, nB = 0, n1 = 0, n2 = 0, nE = 0;
+	int nblk = f->W / 2, k, h;
+	uint64_t ci = 0, cj = 0, e0, e1;
+	for( k=0; k<nblk; k++ )
+	{
+		const uint64_t *qi = pi + 6*k, *qj = pj + 6*k;
+		for( h=0; h<2; h++ )
+		{
+			uint64_t gor = qi[h] | qj[h], x0 = qi[2+h] ^ qj[2+h], x1 = qi[4+h] ^ qj[4+h];
+			nA += __builtin_popcountll( gor );
+			nB += __builtin_popcountll( gor | x0 | x1 );
+			n1 += __builtin_popcountll( x0 & ~( gor | x1 ) );
+			n2 += __builtin_popcountll( x1 & ~( gor | x0 ) );
+		}
+		MSADIST_RUNWORD( qi[0], qj[0], ci, cj, e0 );
+		MSADIST_RUNWORD( qi[1], qj[1], ci, cj, e1 );
+		nE += __builtin_popcountll( e0 ) + __builtin_popcountll( e1 );
+	}
+	return( msadist_xorsum( f, nA, nB, n1, n2, nE ) );
+}
+
+#if MSADIST_NEON
+static long long msadist_xorscore_neon( const msadistfast_t *f, const uint64_t *pi, const uint64_t *pj )
+{
+	long long nA = 0, nB = 0, n1 = 0, n2 = 0, nE = 0;
 	int nblk = f->W / 2, k0, k1, k;
 	uint64_t ci = 0, cj = 0, e0, e1;
-#if MSADIST_NEON
 	for( k0=0; k0<nblk; k0=k1 )
 	{
 		uint16x8_t aA = vdupq_n_u16( 0 ), aB = vdupq_n_u16( 0 ), a1 = vdupq_n_u16( 0 ), a2 = vdupq_n_u16( 0 ), aE = vdupq_n_u16( 0 );
@@ -1598,34 +2076,237 @@ static inline long long msadist_xorscore( const msadistfast_t *f, const uint64_t
 		}
 		nA += vaddlvq_u16( aA ); nB += vaddlvq_u16( aB ); n1 += vaddlvq_u16( a1 ); n2 += vaddlvq_u16( a2 ); nE += vaddlvq_u16( aE );
 	}
-#else
-	(void)k0; (void)k1;
-	for( k=0; k<nblk; k++ )
-	{
-		const uint64_t *qi = pi + 6*k, *qj = pj + 6*k;
-		int h;
-		for( h=0; h<2; h++ )
-		{
-			uint64_t gor = qi[h] | qj[h], x0 = qi[2+h] ^ qj[2+h], x1 = qi[4+h] ^ qj[4+h];
-			nA += __builtin_popcountll( gor );
-			nB += __builtin_popcountll( gor | x0 | x1 );
-			n1 += __builtin_popcountll( x0 & ~( gor | x1 ) );
-			n2 += __builtin_popcountll( x1 & ~( gor | x0 ) );
-		}
-		MSADIST_RUNWORD( qi[0], qj[0], ci, cj, e0 );
-		MSADIST_RUNWORD( qi[1], qj[1], ci, cj, e1 );
-		nE += __builtin_popcountll( e0 ) + __builtin_popcountll( e1 );
-	}
+	return( msadist_xorsum( f, nA, nB, n1, n2, nE ) );
+}
 #endif
-	// nA counts columns with a gap in either row, nB those that are not identical
-	// residue pairs.  Padding columns (>= len) have no gap bit and code 0 in both
-	// rows, so they add to neither.  Both-residue columns: len - nA; with code
-	// xor 0: len - nB; xor 1: n1; xor 2: n2; xor 3: the rest.
-	return( f->Td[3] * ( len - nA ) + ( f->Td[0] - f->Td[3] ) * ( len - nB ) + ( f->Td[1] - f->Td[3] ) * n1 + ( f->Td[2] - f->Td[3] ) * n2
-	      + (long long)f->penal * nE );
+
+#if FMSIMD_X86
+// The gap-run words of one 128-column block with x86 add-with-carry (adc):
+// a0,a1 the gap words of row i, b0,b1 of row j; ca, cb the carries of the
+// two chains (unsigned char).  Same result as two MSADIST_RUNWORDs.
+#define MSADIST_ADC2( a0, a1, b0, b1, ca, cb, e0, e1 ) \
+	do { \
+		unsigned long long ga0_ = (a0), ga1_ = (a1), gb0_ = (b0), gb1_ = (b1), sa0_, sa1_, sb0_, sb1_; \
+		unsigned long long xa0_ = ga0_ & ~gb0_, xa1_ = ga1_ & ~gb1_, xb0_ = gb0_ & ~ga0_, xb1_ = gb1_ & ~ga1_; \
+		(ca) = _addcarry_u64( (ca), ga0_, xa0_, &sa0_ ); \
+		(ca) = _addcarry_u64( (ca), ga1_, xa1_, &sa1_ ); \
+		(cb) = _addcarry_u64( (cb), gb0_, xb0_, &sb0_ ); \
+		(cb) = _addcarry_u64( (cb), gb1_, xb1_, &sb1_ ); \
+		(e0) = ( sa0_ & ~ga0_ ) | ( sb0_ & ~gb0_ ); \
+		(e1) = ( sa1_ & ~ga1_ ) | ( sb1_ & ~gb1_ ); \
+	} while( 0 )
+
+// one 128-column block with scalar popcounts (inside a target("popcnt") function)
+#define MSADIST_POPBLOCK( qi, qj ) \
+	do { \
+		int h_; \
+		uint64_t e0_, e1_; \
+		for( h_=0; h_<2; h_++ ) \
+		{ \
+			uint64_t gor_ = (qi)[h_] | (qj)[h_], x0_ = (qi)[2+h_] ^ (qj)[2+h_], x1_ = (qi)[4+h_] ^ (qj)[4+h_]; \
+			uint64_t t0_ = gor_ | x0_, t1_ = gor_ | x1_; \
+			nA += __builtin_popcountll( gor_ ); \
+			nB += __builtin_popcountll( t0_ | x1_ ); \
+			n1 += __builtin_popcountll( x0_ & ~t1_ ); \
+			n2 += __builtin_popcountll( x1_ & ~t0_ ); \
+		} \
+		MSADIST_ADC2( (qi)[0], (qi)[1], (qj)[0], (qj)[1], ci, cj, e0_, e1_ ); \
+		nE += __builtin_popcountll( e0_ ) + __builtin_popcountll( e1_ ); \
+	} while( 0 )
+
+__attribute__((target("popcnt")))
+static long long msadist_xorscore_popcnt( const msadistfast_t *f, const uint64_t *pi, const uint64_t *pj )
+{
+	long long nA = 0, nB = 0, n1 = 0, n2 = 0, nE = 0;
+	int nblk = f->W / 2, k;
+	unsigned char ci = 0, cj = 0;
+	for( k=0; k<nblk; k++ ) MSADIST_POPBLOCK( pi + 6*k, pj + 6*k );
+	return( msadist_xorsum( f, nA, nB, n1, n2, nE ) );
 }
 
-static inline long long msadist_genericscore( const msadistfast_t *f, int i, int j )
+// byte-wise popcount of a 256-bit vector (nibble table, pshufb)
+#define MSADIST_POPB( v ) _mm256_add_epi8( _mm256_shuffle_epi8( lut4, _mm256_and_si256( (v), m4 ) ), _mm256_shuffle_epi8( lut4, _mm256_and_si256( _mm256_srli_epi16( (v), 4 ), m4 ) ) )
+#define MSADIST_HSUM( v, out ) do { __m128i h_ = _mm_add_epi64( _mm256_castsi256_si128( v ), _mm256_extracti128_si256( v, 1 ) ); (out) = (long long)_mm_cvtsi128_si64( h_ ) + (long long)_mm_cvtsi128_si64( _mm_unpackhi_epi64( h_, h_ ) ); } while( 0 )
+
+// AVX2: two 128-column blocks per step.  The four residue popcounts run in
+// 256-bit vectors (byte counts, widened with vpsadbw every 31 steps); the gap-run
+// chain runs in scalar registers with adc and popcnt alongside.
+__attribute__((target("avx2,popcnt,bmi")))
+static long long msadist_xorscore_avx2( const msadistfast_t *f, const uint64_t *pi, const uint64_t *pj )
+{
+	const __m256i lut4 = _mm256_setr_epi8( 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4 );
+	const __m256i m4 = _mm256_set1_epi8( 0x0f ), z = _mm256_setzero_si256();
+	__m256i sA = z, sB = z, s1 = z, s2 = z;
+	long long nA = 0, nB = 0, n1 = 0, n2 = 0, nE = 0;
+	int nblk = f->W / 2, npr = nblk / 2, k, k0, k1;
+	unsigned char ci = 0, cj = 0;
+	for( k0=0; k0<npr; k0=k1 )
+	{
+		__m256i bA = z, bB = z, b1 = z, b2 = z; // byte counts, at most 8 per step
+		k1 = k0 + 31 < npr ? k0 + 31 : npr;
+		for( k=k0; k<k1; k++ )
+		{
+			const uint64_t *qi = pi + 12*k, *qj = pj + 12*k;
+			uint64_t e0, e1, e2, e3;
+			// two blocks = 12 words, as 3 vectors: [G b0] [b1 G'] [b0' b1'] (128 bits each)
+			__m256i ai = _mm256_loadu_si256( (const __m256i *)qi ), bi = _mm256_loadu_si256( (const __m256i *)( qi + 4 ) ), di = _mm256_loadu_si256( (const __m256i *)( qi + 8 ) );
+			__m256i aj = _mm256_loadu_si256( (const __m256i *)qj ), bj = _mm256_loadu_si256( (const __m256i *)( qj + 4 ) ), dj = _mm256_loadu_si256( (const __m256i *)( qj + 8 ) );
+			__m256i xd = _mm256_xor_si256( di, dj );
+			__m256i gor = _mm256_blend_epi32( _mm256_or_si256( ai, aj ), _mm256_or_si256( bi, bj ), 0xF0 ); // [G|G, G'|G']
+			__m256i x0 = _mm256_permute2x128_si256( _mm256_xor_si256( ai, aj ), xd, 0x21 );          // [b0^b0, b0'^b0']
+			__m256i x1 = _mm256_blend_epi32( _mm256_xor_si256( bi, bj ), xd, 0xF0 );                 // [b1^b1, b1'^b1']
+			__m256i t0 = _mm256_or_si256( gor, x0 ), t1 = _mm256_or_si256( gor, x1 );
+			bA = _mm256_add_epi8( bA, MSADIST_POPB( gor ) );
+			bB = _mm256_add_epi8( bB, MSADIST_POPB( _mm256_or_si256( t0, x1 ) ) );
+			b1 = _mm256_add_epi8( b1, MSADIST_POPB( _mm256_andnot_si256( t1, x0 ) ) );
+			b2 = _mm256_add_epi8( b2, MSADIST_POPB( _mm256_andnot_si256( t0, x1 ) ) );
+			MSADIST_ADC2( qi[0], qi[1], qj[0], qj[1], ci, cj, e0, e1 );
+			MSADIST_ADC2( qi[6], qi[7], qj[6], qj[7], ci, cj, e2, e3 );
+			nE += __builtin_popcountll( e0 ) + __builtin_popcountll( e1 ) + __builtin_popcountll( e2 ) + __builtin_popcountll( e3 );
+		}
+		sA = _mm256_add_epi64( sA, _mm256_sad_epu8( bA, z ) );
+		sB = _mm256_add_epi64( sB, _mm256_sad_epu8( bB, z ) );
+		s1 = _mm256_add_epi64( s1, _mm256_sad_epu8( b1, z ) );
+		s2 = _mm256_add_epi64( s2, _mm256_sad_epu8( b2, z ) );
+	}
+	MSADIST_HSUM( sA, nA ); MSADIST_HSUM( sB, nB ); MSADIST_HSUM( s1, n1 ); MSADIST_HSUM( s2, n2 );
+	if( nblk & 1 ) MSADIST_POPBLOCK( pi + 6*(nblk-1), pj + 6*(nblk-1) );
+	return( msadist_xorsum( f, nA, nB, n1, n2, nE ) );
+}
+
+// AVX2 with the gap runs nE already known (msadist_gaprow_avx2): the residue
+// popcounts only, without n1 when skip1 (its coefficient Td[1]-Td[3] is 0)
+static inline __attribute__((always_inline,target("avx2,popcnt"))) long long msadist_xorresbody( const msadistfast_t *f, const uint64_t *pi, const uint64_t *pj, long long nE, const int skip1 )
+{
+	const __m256i lut4 = _mm256_setr_epi8( 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4 );
+	const __m256i m4 = _mm256_set1_epi8( 0x0f ), z = _mm256_setzero_si256();
+	__m256i sA = z, sB = z, s1 = z, s2 = z;
+	long long nA = 0, nB = 0, n1 = 0, n2 = 0;
+	int nblk = f->W / 2, npr = nblk / 2, h;
+	const uint64_t *qe = pi + 12 * npr, *qe1;
+	while( pi < qe )
+	{
+		__m256i bA = z, bB = z, b1 = z, b2 = z; // byte counts, at most 8 per step
+		qe1 = qe - pi > 12*31 ? pi + 12*31 : qe;
+		for( ; pi<qe1; pi+=12, pj+=12 )
+		{
+			// two blocks = 12 words, as 3 vectors: [G b0] [b1 G'] [b0' b1'] (128 bits each)
+			__m256i ai = _mm256_loadu_si256( (const __m256i *)pi ), bi = _mm256_loadu_si256( (const __m256i *)( pi + 4 ) ), di = _mm256_loadu_si256( (const __m256i *)( pi + 8 ) );
+			__m256i aj = _mm256_loadu_si256( (const __m256i *)pj ), bj = _mm256_loadu_si256( (const __m256i *)( pj + 4 ) ), dj = _mm256_loadu_si256( (const __m256i *)( pj + 8 ) );
+			__m256i xd = _mm256_xor_si256( di, dj );
+			__m256i gor = _mm256_blend_epi32( _mm256_or_si256( ai, aj ), _mm256_or_si256( bi, bj ), 0xF0 ); // [G|G, G'|G']
+			__m256i x0 = _mm256_permute2x128_si256( _mm256_xor_si256( ai, aj ), xd, 0x21 );          // [b0^b0, b0'^b0']
+			__m256i x1 = _mm256_blend_epi32( _mm256_xor_si256( bi, bj ), xd, 0xF0 );                 // [b1^b1, b1'^b1']
+			__m256i t0 = _mm256_or_si256( gor, x0 ), t1 = _mm256_or_si256( gor, x1 );
+			bA = _mm256_add_epi8( bA, MSADIST_POPB( gor ) );
+			bB = _mm256_add_epi8( bB, MSADIST_POPB( _mm256_or_si256( t0, x1 ) ) );
+			if( !skip1 ) b1 = _mm256_add_epi8( b1, MSADIST_POPB( _mm256_andnot_si256( t1, x0 ) ) );
+			b2 = _mm256_add_epi8( b2, MSADIST_POPB( _mm256_andnot_si256( t0, x1 ) ) );
+		}
+		sA = _mm256_add_epi64( sA, _mm256_sad_epu8( bA, z ) );
+		sB = _mm256_add_epi64( sB, _mm256_sad_epu8( bB, z ) );
+		if( !skip1 ) s1 = _mm256_add_epi64( s1, _mm256_sad_epu8( b1, z ) );
+		s2 = _mm256_add_epi64( s2, _mm256_sad_epu8( b2, z ) );
+	}
+	MSADIST_HSUM( sA, nA ); MSADIST_HSUM( sB, nB ); MSADIST_HSUM( s1, n1 ); MSADIST_HSUM( s2, n2 );
+	if( nblk & 1 ) for( h=0; h<2; h++ ) // last block
+	{
+		uint64_t gor = pi[h] | pj[h], x0 = pi[2+h] ^ pj[2+h], x1 = pi[4+h] ^ pj[4+h];
+		uint64_t t0 = gor | x0, t1 = gor | x1;
+		nA += __builtin_popcountll( gor );
+		nB += __builtin_popcountll( t0 | x1 );
+		n1 += __builtin_popcountll( x0 & ~t1 );
+		n2 += __builtin_popcountll( x1 & ~t0 );
+	}
+	if( skip1 ) n1 = 0;
+	return( msadist_xorsum( f, nA, nB, n1, n2, nE ) );
+}
+
+__attribute__((target("avx2,popcnt")))
+static long long msadist_xorres_avx2_3( const msadistfast_t *f, const uint64_t *pi, const uint64_t *pj, long long nE )
+{
+	return( msadist_xorresbody( f, pi, pj, nE, 1 ) );
+}
+
+__attribute__((target("avx2,popcnt")))
+static long long msadist_xorres_avx2_4( const msadistfast_t *f, const uint64_t *pi, const uint64_t *pj, long long nE )
+{
+	return( msadist_xorresbody( f, pi, pj, nE, 0 ) );
+}
+
+// AVX2: gap runs of row i with every later row, 4 rows per vector (64-bit lanes,
+// rows 4g..4g+3 from the transposed masks g4).  Per lane the same multiword sum
+// as MSADIST_RUNWORD: s = a + (a & ~b) + carry, carry-out = top bit of
+// ( (a & ~b) | ( a & ~s ) ) (the majority of the top bits, as a & ~b is inside a).
+// ne[j] = gap runs of pair (i,j) for i < j < nseq.
+__attribute__((target("avx2")))
+static void msadist_gaprow_avx2( const msadistfast_t *f, int i, int *ne )
+{
+	const __m256i lut4 = _mm256_setr_epi8( 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4 );
+	const __m256i m4 = _mm256_set1_epi8( 0x0f ), z = _mm256_setzero_si256();
+	const int W = f->W, n = f->nseq;
+	const uint64_t *gi = f->g4 + (size_t)( i >> 2 ) * W * 4 + ( i & 3 ); // word w of row i: gi[4*w]
+	int g, w, w0, w1, l;
+	long long v[4];
+	for( g=( i + 1 ) >> 2; g*4<n; g++ )
+	{
+		const uint64_t *gj = f->g4 + (size_t)g * W * 4;
+		__m256i ci = z, cj = z, sum = z;
+		for( w0=0; w0<W; w0=w1 )
+		{
+			__m256i b8 = z; // byte counts, at most 8 per word
+			w1 = w0 + 31 < W ? w0 + 31 : W;
+			for( w=w0; w<w1; w++ )
+			{
+				const __m256i a = _mm256_set1_epi64x( (long long)gi[4*w] );
+				const __m256i b = _mm256_load_si256( (const __m256i *)( gj + 4*w ) );
+				const __m256i xa = _mm256_andnot_si256( b, a ), xb = _mm256_andnot_si256( a, b );
+				const __m256i sa = _mm256_add_epi64( _mm256_add_epi64( a, xa ), ci );
+				const __m256i sb = _mm256_add_epi64( _mm256_add_epi64( b, xb ), cj );
+				ci = _mm256_srli_epi64( _mm256_or_si256( xa, _mm256_andnot_si256( sa, a ) ), 63 );
+				cj = _mm256_srli_epi64( _mm256_or_si256( xb, _mm256_andnot_si256( sb, b ) ), 63 );
+				b8 = _mm256_add_epi8( b8, MSADIST_POPB( _mm256_or_si256( _mm256_andnot_si256( a, sa ), _mm256_andnot_si256( b, sb ) ) ) );
+			}
+			sum = _mm256_add_epi64( sum, _mm256_sad_epu8( b8, z ) );
+		}
+		_mm256_storeu_si256( (__m256i *)v, sum );
+		for( l=0; l<4; l++ ) if( 4*g + l > i && 4*g + l < n ) ne[4*g+l] = (int)v[l];
+	}
+}
+#endif // FMSIMD_X86
+
+// class of column c of a row from its planes: 4 for a gap, else the 2-bit code
+static inline int msadist_class( const uint64_t *pl, uint32_t c )
+{
+	const uint64_t *q = pl + ( c >> 7 ) * 6 + ( ( c >> 6 ) & 1 );
+	int sh = c & 63;
+	if( ( q[0] >> sh ) & 1 ) return( 4 );
+	return( (int)( ( ( q[2] >> sh ) & 1 ) | ( ( ( q[4] >> sh ) & 1 ) << 1 ) ) );
+}
+
+// Exceptions: an exception is code 0 in the planes, so the plane score counted
+// Td[code(a)^code(b)] at its column; add amino_dis[a][b] - Td[code(a)^code(b)] for
+// every column where one row holds an exception and the other a residue.  The
+// two sorted lists carry the exception bytes; the other row's gap/code comes
+// from its planes (just read by the kernel), so no sequence byte is loaded.
+static long long msadist_exccorr( const msadistfast_t *f, int i, int j )
+{
+	const uint32_t *pi = f->excol[i], *pj = f->excol[j], *ei = pi + f->exn[i], *ej = pj + f->exn[j];
+	const uint64_t *pli = f->planes + (size_t)i * 3 * f->W, *plj = f->planes + (size_t)j * 3 * f->W;
+	long long s = 0;
+	while( pi < ei && pj < ej )
+	{
+		uint32_t ci = *pi >> 8, cj = *pj >> 8;
+		if( ci == cj ) { s += f->CB[( ( *pi & 0xff ) << 7 ) | ( *pj & 0xff )]; pi++; pj++; }
+		else if( ci < cj ) { s += f->CXa[( ( *pi & 0xff ) << 3 ) | msadist_class( plj, ci )]; pi++; }
+		else { s += f->CXb[( ( *pj & 0xff ) << 3 ) | msadist_class( pli, cj )]; pj++; }
+	}
+	for( ; pi<ei; pi++ ) s += f->CXa[( ( *pi & 0xff ) << 3 ) | msadist_class( plj, *pi >> 8 )];
+	for( ; pj<ej; pj++ ) s += f->CXb[( ( *pj & 0xff ) << 3 ) | msadist_class( pli, *pj >> 8 )];
+	return( s );
+}
+
+static inline __attribute__((always_inline)) long long msadist_genericbody( const msadistfast_t *f, int i, int j )
 {
 	const uint64_t *mi = f->masks + (size_t)i * 2 * f->W, *mj = f->masks + (size_t)j * 2 * f->W;
 	const unsigned char *si = (const unsigned char *)f->seq[i], *sj = (const unsigned char *)f->seq[j];
@@ -1636,37 +2317,203 @@ static inline long long msadist_genericscore( const msadistfast_t *f, int i, int
 	for( w=0; w<W; w++ )
 	{
 		const unsigned char *a = si + w*64, *b = sj + w*64;
-		rr = mi[2*w+1] & mj[2*w+1];
+		rr = mi[W+w] & mj[W+w];
 		while( rr )
 		{
 			int k = __builtin_ctzll( rr );
 			s += T[(a[k]<<7)|b[k]];
 			rr &= rr - 1;
 		}
-		MSADIST_RUNWORD( mi[2*w], mj[2*w], ci, cj, e );
+		MSADIST_RUNWORD( mi[w], mj[w], ci, cj, e );
 		nE += __builtin_popcountll( e );
 	}
 	return( s + (long long)f->penal * nE );
 }
 
-// exact value of naivepairscorefast( seq[i], seq[j], skip[i], skip[j], penal ) for this alignment
-static inline double msadistfast_score( const msadistfast_t *f, int i, int j )
+static long long msadist_genericscore_c( const msadistfast_t *f, int i, int j )
+{
+	return( msadist_genericbody( f, i, j ) );
+}
+
+#if FMSIMD_X86
+__attribute__((target("popcnt")))
+static long long msadist_genericscore_popcnt( const msadistfast_t *f, int i, int j )
+{
+	return( msadist_genericbody( f, i, j ) );
+}
+#endif
+
+// Column path, row i: acc[j] += amino_dis[ seq[i][c] ][ seq[j][c] ] for every
+// later row j and every column c where both have a residue (acc[j] starts at 0;
+// the caller clears acc[i+1..] after use).
+#if FMSIMD_X86
+// Dense column (AVX2): acc[j] += amino_dis[a][ residue of row j ] for the rows j of
+// the 32-row blocks from j0 & ~31 to np32 (codes of gaps and padding rows give 0).
+// Rows j < j0 of the first block and the padding rows also receive values; the
+// caller clears them (msadist_colrow).
+__attribute__((target("avx2")))
+static void msadist_densecol_avx2( const uint8_t *code, const uint8_t *tab, int j0, int np32, int *acc )
+{
+	const __m256i t0l = _mm256_broadcastsi128_si256( _mm_loadu_si128( (const __m128i *)tab ) );
+	const __m256i t1l = _mm256_broadcastsi128_si256( _mm_loadu_si128( (const __m128i *)( tab + 16 ) ) );
+	const __m256i t0h = _mm256_broadcastsi128_si256( _mm_loadu_si128( (const __m128i *)( tab + 32 ) ) );
+	const __m256i t1h = _mm256_broadcastsi128_si256( _mm_loadu_si128( (const __m128i *)( tab + 48 ) ) );
+	const __m256i m15 = _mm256_set1_epi8( 15 ), m16 = _mm256_set1_epi8( 16 );
+	int j;
+	for( j=j0&~31; j<np32; j+=32 )
+	{
+		const __m256i c = _mm256_loadu_si256( (const __m256i *)( code + j ) );
+		const __m256i lo4 = _mm256_and_si256( c, m15 );
+		const __m256i hi = _mm256_cmpeq_epi8( _mm256_and_si256( c, m16 ), m16 ); // codes 16..31
+		const __m256i vl = _mm256_blendv_epi8( _mm256_shuffle_epi8( t0l, lo4 ), _mm256_shuffle_epi8( t1l, lo4 ), hi );
+		const __m256i vh = _mm256_blendv_epi8( _mm256_shuffle_epi8( t0h, lo4 ), _mm256_shuffle_epi8( t1h, lo4 ), hi );
+		const __m256i w0 = _mm256_unpacklo_epi8( vl, vh ), w1 = _mm256_unpackhi_epi8( vl, vh ); // int16: rows j+0..7,16..23 / j+8..15,24..31
+		__m256i *a = (__m256i *)( acc + j );
+		_mm256_storeu_si256( a,     _mm256_add_epi32( _mm256_loadu_si256( a ),     _mm256_cvtepi16_epi32( _mm256_castsi256_si128( w0 ) ) ) );
+		_mm256_storeu_si256( a + 1, _mm256_add_epi32( _mm256_loadu_si256( a + 1 ), _mm256_cvtepi16_epi32( _mm256_castsi256_si128( w1 ) ) ) );
+		_mm256_storeu_si256( a + 2, _mm256_add_epi32( _mm256_loadu_si256( a + 2 ), _mm256_cvtepi16_epi32( _mm256_extracti128_si256( w0, 1 ) ) ) );
+		_mm256_storeu_si256( a + 3, _mm256_add_epi32( _mm256_loadu_si256( a + 3 ), _mm256_cvtepi16_epi32( _mm256_extracti128_si256( w1, 1 ) ) ) );
+	}
+}
+#endif
+
+// acc must hold np32 + 32 ints when f->ndense
+static void msadist_colrow( const msadistfast_t *f, int i, int *acc )
+{
+	const unsigned char *s = (const unsigned char *)f->seq[i];
+	const uint64_t *mi = f->masks + (size_t)i * 2 * f->W;
+	const uint32_t *rp = f->rpos + f->roff[i], *ce = f->centry;
+	int w, c, k = 0, j;
+	for( w=0; w<f->W; w++ )
+	{
+		uint64_t r = mi[f->W+w];
+		while( r )
+		{
+			const int *Tr;
+			const uint32_t *e, *end;
+			c = w*64 + __builtin_ctzll( r );
+#if FMSIMD_X86
+			if( f->ndense && f->dcol[c] >= 0 )
+			{
+				msadist_densecol_avx2( f->dcode + (size_t)f->dcol[c] * f->np32, f->dtab + s[c] * 64, i + 1, f->np32, acc );
+				k++;
+				r &= r - 1;
+				continue;
+			}
+#endif
+			Tr = f->T + ( s[c] << 7 );
+			e = ce + rp[k++] + 1;
+			end = ce + f->coff[c+1];
+			for( ; e<end; e++ ) acc[*e >> 8] += Tr[*e & 0xff];
+			r &= r - 1;
+		}
+	}
+	if( f->ndense ) // the dense columns also wrote rows ( i+1 ) & ~31 .. i and the padding rows
+	{
+		for( j=( i + 1 ) & ~31; j<=i; j++ ) acc[j] = 0;
+		for( j=f->nseq; j<f->np32; j++ ) acc[j] = 0;
+	}
+}
+
+// gap runs of pair (i,j) from the gap masks (W contiguous words per row)
+static inline __attribute__((always_inline)) long long msadist_gaprunsbody( const msadistfast_t *f, int i, int j )
+{
+	const uint64_t *mi = f->masks + (size_t)i * 2 * f->W, *mj = f->masks + (size_t)j * 2 * f->W, *me = mi + f->W;
+	long long nE = 0;
+#if FMSIMD_X86
+	unsigned char ci = 0, cj = 0;
+	uint64_t e0, e1;
+	for( ; mi<me; mi+=2, mj+=2 ) // W is even
+	{
+		MSADIST_ADC2( mi[0], mi[1], mj[0], mj[1], ci, cj, e0, e1 );
+		nE += __builtin_popcountll( e0 ) + __builtin_popcountll( e1 );
+	}
+#else
+	uint64_t ci = 0, cj = 0, e;
+	for( ; mi<me; mi++, mj++ )
+	{
+		MSADIST_RUNWORD( mi[0], mj[0], ci, cj, e );
+		nE += __builtin_popcountll( e );
+	}
+#endif
+	return( nE );
+}
+
+static long long msadist_gapruns_c( const msadistfast_t *f, int i, int j )
+{
+	return( msadist_gaprunsbody( f, i, j ) );
+}
+
+#if FMSIMD_X86
+__attribute__((target("popcnt")))
+static long long msadist_gapruns_popcnt( const msadistfast_t *f, int i, int j )
+{
+	return( msadist_gaprunsbody( f, i, j ) );
+}
+#endif
+
+// Per-row work before the pairs (i,j), j > i: the column path's residue sums
+// (acc, must start zeroed; the caller clears acc[i+1..] afterwards) and, with
+// ne4, the gap runs of all those pairs (ne).  Either pointer may be NULL when
+// unused (f->colpath == 0, f->ne4 == 0).
+static void msadist_rowprep( const msadistfast_t *f, int i, int *acc, int *ne )
+{
+	if( f->colpath ) msadist_colrow( f, i, acc );
+#if FMSIMD_X86
+	if( f->ne4 ) msadist_gaprow_avx2( f, i, ne );
+#endif
+	(void)ne;
+}
+
+// exact value of naivepairscorefast( seq[i], seq[j], skip[i], skip[j], penal ) for this
+// alignment; acc and ne as left by msadist_rowprep( f, i, acc, ne )
+static inline double msadistfast_score( const msadistfast_t *f, int i, int j, const int *acc, const int *ne )
 {
 	long long s;
-	if( f->xorpath )
-		s = msadist_xorscore( f, f->planes + (size_t)i * 3 * f->W, f->planes + (size_t)j * 3 * f->W );
+	if( f->colpath )
+	{
+		if( f->ne4 ) s = ne[j];
+		else
+#if FMSIMD_X86
+		if( f->kern >= 1 ) s = msadist_gapruns_popcnt( f, i, j );
+		else
+#endif
+			s = msadist_gapruns_c( f, i, j );
+		s = acc[j] + (long long)f->penal * s;
+	}
+	else if( f->xorpath )
+	{
+		const uint64_t *pi = f->planes + (size_t)i * 3 * f->W, *pj = f->planes + (size_t)j * 3 * f->W;
+#if MSADIST_NEON
+		if( f->kern >= 1 ) s = msadist_xorscore_neon( f, pi, pj );
+		else
+#elif FMSIMD_X86
+		if( f->ne4 ) s = f->skip1 ? msadist_xorres_avx2_3( f, pi, pj, ne[j] ) : msadist_xorres_avx2_4( f, pi, pj, ne[j] );
+		else if( f->kern == 2 ) s = msadist_xorscore_avx2( f, pi, pj );
+		else if( f->kern == 1 ) s = msadist_xorscore_popcnt( f, pi, pj );
+		else
+#endif
+			s = msadist_xorscore_c( f, pi, pj );
+		if( f->nexckinds && ( f->exn[i] | f->exn[j] ) ) s += msadist_exccorr( f, i, j );
+	}
 	else
-		s = msadist_genericscore( f, i, j );
+	{
+#if FMSIMD_X86
+		if( f->kern >= 1 ) s = msadist_genericscore_popcnt( f, i, j );
+		else
+#endif
+			s = msadist_genericscore_c( f, i, j );
+	}
 	return( (double)s );
 }
 /* END msadistfast kernel */
 
-static double msadist_pairscore( msadistmtxthread_arg_t *targ, int i, int j )
+static double msadist_pairscore( msadistmtxthread_arg_t *targ, int i, int j, const int *acc, const int *ne )
 {
 	msadistfast_t *f = (msadistfast_t *)targ->fast;
 	double v;
 	if( f == NULL ) return( naivepairscorefast( targ->seq[i], targ->seq[j], targ->skiptable[i], targ->skiptable[j], penalty_dist ) );
-	v = msadistfast_score( f, i, j );
+	v = msadistfast_score( f, i, j, acc, ne );
 	if( f->check )
 	{
 		double r = naivepairscorefast( targ->seq[i], targ->seq[j], targ->skiptable[i], targ->skiptable[j], penalty_dist );
@@ -1718,6 +2565,9 @@ static void *msadistmtxthread( void *arg ) // enablemultithread == 0 demo tsukau
 	double ssi, ssj, bunbo, iscoretmp;
 	int i, j;
 	int nlim = njob-1;
+	msadistfast_t *mf = (msadistfast_t *)targ->fast; // fast-mafft
+	int *acc = ( mf && mf->colpath ) ? calloc( njob + 64, sizeof( int ) ) : NULL; // column path: residue sums of row i with every later row (+64: dense-column blocks)
+	int *ne = ( mf && mf->ne4 ) ? calloc( njob, sizeof( int ) ) : NULL; // AVX2: gap runs of row i with every later row
 
 	while( 1 )
 	{
@@ -1730,6 +2580,7 @@ static void *msadistmtxthread( void *arg ) // enablemultithread == 0 demo tsukau
 			if( i == nlim )
 			{
 				pthread_mutex_unlock( targ->mutex );
+				free( acc ); free( ne );
 				return( NULL );
 			}
 			jobpospt->i += 1;
@@ -1740,11 +2591,12 @@ static void *msadistmtxthread( void *arg ) // enablemultithread == 0 demo tsukau
 #endif
 		{
 			i = (jobpospt->i)++;
-			if( i == nlim ) return( NULL );
+			if( i == nlim ) { free( acc ); free( ne ); return( NULL ); }
 			if( i % 100 == 0 ) fprintf( stderr, "\r% 5d / %d", i, njob );
 		}
 
 		ssi = selfscore[i];
+		if( acc || ne ) msadist_rowprep( mf, i, acc, ne );
 		for( j=i+1; j<njob; j++ )
 		{
 			ssj = selfscore[j];
@@ -1755,7 +2607,7 @@ static void *msadistmtxthread( void *arg ) // enablemultithread == 0 demo tsukau
 				iscoretmp = 2.0; // 2013/Oct/17
 			else
 			{
-				iscoretmp = ( 1.0 - msadist_pairscore( targ, i, j ) / bunbo ) * 2.0; // 2014/Aug/15 fast; fast-mafft: exact replacement for naivepairscorefast()
+				iscoretmp = ( 1.0 - msadist_pairscore( targ, i, j, acc, ne ) / bunbo ) * 2.0; // 2014/Aug/15 fast; fast-mafft: exact replacement for naivepairscorefast()
 				if( iscoretmp > 10 ) iscoretmp = 10.0;  // 2015/Mar/17
 	
 			}
@@ -1768,6 +2620,7 @@ static void *msadistmtxthread( void *arg ) // enablemultithread == 0 demo tsukau
 //			printf( "i,j=%d,%d, iscoretmp=%f\n", i, j, iscoretmp );
 
 		}
+		if( acc ) memset( acc + i + 1, 0, ( njob - i - 1 ) * sizeof( int ) );
 	}
 }
 #else
@@ -1914,17 +2767,29 @@ static void *distancematrixthread( void *arg )
  * Rows are handed out 16 at a time (a "super-row"); for each group of 4
  * columns the 4 column tables are loaded once for all 4 row blocks.
  *
+ * x86-64 (work/x86simd): the same identity with psadbw (SSE2) / vpsadbw (AVX2),
+ * which sums |a-b| of 8 bytes into a 64-bit lane, so there is no limit on the
+ * counts and every block uses it (plus the saturation correction).
+ *
  * Amino acids (tsize 46656): each row keeps its list of distinct tuples with
  * their counts (u16).  For row i a dense u16 table of c_i is filled once and
  * each j sums min( table[p], c_j(p) ) over j's list.  If any count exceeds
  * 65535 the original code is used.  Other tuple sizes use the original code.
+ * Inverted index (kind 3, work/x86simd): for every tuple the list of rows that
+ * hold it, ascending; row i adds min( c_i(p), c_j(p) ) to acc[j] for every
+ * tuple p of i and every later row j in p's list.  That costs the sum over
+ * tuples of (rows holding it)^2/2 instead of n^2/2 times tuples per row
+ * (15-70x fewer steps on homfam sets); it is used when the estimate says so.
  *
  * Debug (environment):
  *   MAFFT_SEXTET=ref     original loop
  *   MAFFT_SEXTET=check   also run commonsextet_p() for every pair and exit(1)
  *                        on any bitwise difference of the stored double
- *   MAFFT_SEXTET=scalar  DNA: skip the NEON block path (plain loop + overflow lists)
+ *   MAFFT_SEXTET=scalar  DNA: skip the SIMD block path (plain loop + overflow lists);
+ *                        MAFFT_SIMD=scalar does the same
  *   MAFFT_SEXTET=list    DNA: use the list path
+ *   MAFFT_SEXTET=inv     list path: always use the inverted index (if it fits)
+ *   MAFFT_SEXTET=noinv   list path: never use the inverted index
  *   MAFFT_SEXTET=counts  store counts only; the original conversion loop runs
  *   MAFFT_SEXTET=nolftab compute lenfac for every pair (no length table)
  *   MAFFT_SEXTET=time    print the time of each phase
@@ -1949,8 +2814,10 @@ static void *distancematrixthread( void *arg )
 typedef struct _sextetfast
 {
 	int n, npad;
-	int kind;        // 1: dense DNA tables, 2: tuple lists
+	int kind;        // 1: dense DNA tables, 2: tuple lists, 3: inverted index of the tuple lists
 	int check, scalar, timing;
+	int simd;        // fmsimd level (scalar, MAFFT_SIMD and the CPU)
+	long nsimd, nslow; // dense path, with timing: 4x4 blocks by the SIMD kernel / by the plain loop
 	int **pointt;
 	double **mtx;
 	int *nogaplen;
@@ -1969,6 +2836,12 @@ typedef struct _sextetfast
 	int *ln;         // per row: number of distinct tuples
 	size_t *off;     // per row: offset into lp/lc
 	uint16_t *lp, *lc; // tuple, count
+	/* inverted index (kind 3): for every tuple the rows that hold it, ascending */
+	uint32_t *post;  // ( row << cb ) | count
+	size_t *poff;    // tw+1 offsets into post
+	uint32_t *ppos;  // per list entry (same layout as lp/lc): index of the row's own entry in post
+	int cb;          // count bits
+	double listwork, invwork; // estimated operations of the two pair loops
 	/* jobs */
 	int phase;       // 0: build tables/lists, 1: pairs
 	int jobpos;
@@ -2121,6 +2994,69 @@ static void sextet_absdiff4x4( const uint8_t *ti, const uint8_t *tj, int mc, uin
 }
 #endif
 
+#if FMSIMD_X86
+// d[4r+c] = sum_p | ti[r][p] - tj[c][p] | for 4 rows ti and 4 columns tj, any
+// byte values (psadbw sums 8 absolute byte differences into a 64-bit lane;
+// a pair's total is at most 4096*255).  Two passes of 4 rows x 2 columns keep
+// the 8 accumulators and 6 loaded vectors in the 16 vector registers.
+static void sextet_absdiff4x4_sse2( const uint8_t *ti, const uint8_t *tj, uint32_t *d )
+{
+	const uint8_t *i0 = ti, *i1 = ti + SEXTET_DW, *i2 = ti + 2 * SEXTET_DW, *i3 = ti + 3 * SEXTET_DW;
+	int h, k;
+	for( h=0; h<4; h+=2 )
+	{
+		const uint8_t *j0 = tj + h * SEXTET_DW, *j1 = j0 + SEXTET_DW;
+		__m128i a00 = _mm_setzero_si128(), a01 = a00, a10 = a00, a11 = a00, a20 = a00, a21 = a00, a30 = a00, a31 = a00, s;
+		for( k=0; k<SEXTET_DW; k+=16 )
+		{
+			__m128i y0 = _mm_load_si128( (const __m128i *)( j0 + k ) ), y1 = _mm_load_si128( (const __m128i *)( j1 + k ) );
+			__m128i x0 = _mm_load_si128( (const __m128i *)( i0 + k ) ), x1 = _mm_load_si128( (const __m128i *)( i1 + k ) );
+			__m128i x2 = _mm_load_si128( (const __m128i *)( i2 + k ) ), x3 = _mm_load_si128( (const __m128i *)( i3 + k ) );
+			a00 = _mm_add_epi64( a00, _mm_sad_epu8( x0, y0 ) ); a01 = _mm_add_epi64( a01, _mm_sad_epu8( x0, y1 ) );
+			a10 = _mm_add_epi64( a10, _mm_sad_epu8( x1, y0 ) ); a11 = _mm_add_epi64( a11, _mm_sad_epu8( x1, y1 ) );
+			a20 = _mm_add_epi64( a20, _mm_sad_epu8( x2, y0 ) ); a21 = _mm_add_epi64( a21, _mm_sad_epu8( x2, y1 ) );
+			a30 = _mm_add_epi64( a30, _mm_sad_epu8( x3, y0 ) ); a31 = _mm_add_epi64( a31, _mm_sad_epu8( x3, y1 ) );
+		}
+#define SEXTET_HS128( a ) ( s = _mm_add_epi64( (a), _mm_unpackhi_epi64( (a), (a) ) ), (uint32_t)_mm_cvtsi128_si32( s ) )
+		d[0+h] = SEXTET_HS128( a00 );  d[1+h] = SEXTET_HS128( a01 );
+		d[4+h] = SEXTET_HS128( a10 );  d[5+h] = SEXTET_HS128( a11 );
+		d[8+h] = SEXTET_HS128( a20 );  d[9+h] = SEXTET_HS128( a21 );
+		d[12+h] = SEXTET_HS128( a30 ); d[13+h] = SEXTET_HS128( a31 );
+#undef SEXTET_HS128
+	}
+}
+
+// the same with 256-bit vectors (vpsadbw)
+__attribute__((target("avx2")))
+static void sextet_absdiff4x4_avx2( const uint8_t *ti, const uint8_t *tj, uint32_t *d )
+{
+	const uint8_t *i0 = ti, *i1 = ti + SEXTET_DW, *i2 = ti + 2 * SEXTET_DW, *i3 = ti + 3 * SEXTET_DW;
+	int h, k;
+	for( h=0; h<4; h+=2 )
+	{
+		const uint8_t *j0 = tj + h * SEXTET_DW, *j1 = j0 + SEXTET_DW;
+		__m256i a00 = _mm256_setzero_si256(), a01 = a00, a10 = a00, a11 = a00, a20 = a00, a21 = a00, a30 = a00, a31 = a00;
+		__m128i s;
+		for( k=0; k<SEXTET_DW; k+=32 )
+		{
+			__m256i y0 = _mm256_load_si256( (const __m256i *)( j0 + k ) ), y1 = _mm256_load_si256( (const __m256i *)( j1 + k ) );
+			__m256i x0 = _mm256_load_si256( (const __m256i *)( i0 + k ) ), x1 = _mm256_load_si256( (const __m256i *)( i1 + k ) );
+			__m256i x2 = _mm256_load_si256( (const __m256i *)( i2 + k ) ), x3 = _mm256_load_si256( (const __m256i *)( i3 + k ) );
+			a00 = _mm256_add_epi64( a00, _mm256_sad_epu8( x0, y0 ) ); a01 = _mm256_add_epi64( a01, _mm256_sad_epu8( x0, y1 ) );
+			a10 = _mm256_add_epi64( a10, _mm256_sad_epu8( x1, y0 ) ); a11 = _mm256_add_epi64( a11, _mm256_sad_epu8( x1, y1 ) );
+			a20 = _mm256_add_epi64( a20, _mm256_sad_epu8( x2, y0 ) ); a21 = _mm256_add_epi64( a21, _mm256_sad_epu8( x2, y1 ) );
+			a30 = _mm256_add_epi64( a30, _mm256_sad_epu8( x3, y0 ) ); a31 = _mm256_add_epi64( a31, _mm256_sad_epu8( x3, y1 ) );
+		}
+#define SEXTET_HS256( a ) ( s = _mm_add_epi64( _mm256_castsi256_si128( a ), _mm256_extracti128_si256( (a), 1 ) ), s = _mm_add_epi64( s, _mm_unpackhi_epi64( s, s ) ), (uint32_t)_mm_cvtsi128_si32( s ) )
+		d[0+h] = SEXTET_HS256( a00 );  d[1+h] = SEXTET_HS256( a01 );
+		d[4+h] = SEXTET_HS256( a10 );  d[5+h] = SEXTET_HS256( a11 );
+		d[8+h] = SEXTET_HS256( a20 );  d[9+h] = SEXTET_HS256( a21 );
+		d[12+h] = SEXTET_HS256( a30 ); d[13+h] = SEXTET_HS256( a31 );
+#undef SEXTET_HS256
+	}
+}
+#endif
+
 // lenfac of the conversion loop of the original code (below the pair loop in
 // disttbfast()) for nogaplen[i] = li, nogaplen[j] = lj; same statements
 static double sextet_lenfac( int li, int lj )
@@ -2174,7 +3110,8 @@ static void sextet_densejob( sextetfast_t *s, int i0 )
 	int n = s->n;
 	int i1 = MIN( i0 + SEXTET_SR, n );
 	int ib, jb, r, c, i, j, mcb, mcj;
-#if SEXTET_NEON
+	long nsimd = 0, nslow = 0;
+#if SEXTET_NEON || FMSIMD_X86
 	uint32_t d[16];
 #endif
 
@@ -2185,7 +3122,7 @@ static void sextet_densejob( sextetfast_t *s, int i0 )
 		{
 			mcb = MAX( mcj, MAX( MAX( s->mc[ib], s->mc[ib+1] ), MAX( s->mc[ib+2], s->mc[ib+3] ) ) );
 #if SEXTET_NEON
-			if( mcb <= 127 && !s->scalar )
+			if( mcb <= 127 && s->simd >= FMSIMD_BASE )
 			{
 				sextet_absdiff4x4( s->tab + (size_t)ib * SEXTET_DW, s->tab + (size_t)jb * SEXTET_DW, mcb, d );
 				for( r=0; r<4; r++ ) for( c=0; c<4; c++ )
@@ -2194,9 +3131,28 @@ static void sextet_densejob( sextetfast_t *s, int i0 )
 					if( i < n && j < n && j >= i )
 						sextet_store( s, i, j, ( s->tot[i] + s->tot[j] - (int)d[r*4+c] ) / 2 );
 				}
+				nsimd++;
+				continue;
+			}
+#elif FMSIMD_X86
+			// psadbw takes any byte values, so there is no limit on the counts; tuples
+			// where both rows have a saturated count (>= 255) get the overflow correction
+			if( s->simd >= FMSIMD_BASE )
+			{
+				if( s->simd >= FMSIMD_AVX2 ) sextet_absdiff4x4_avx2( s->tab + (size_t)ib * SEXTET_DW, s->tab + (size_t)jb * SEXTET_DW, d );
+				else sextet_absdiff4x4_sse2( s->tab + (size_t)ib * SEXTET_DW, s->tab + (size_t)jb * SEXTET_DW, d );
+				for( r=0; r<4; r++ ) for( c=0; c<4; c++ )
+				{
+					i = ib + r; j = jb + c;
+					if( i < n && j < n && j >= i )
+						sextet_store( s, i, j, ( s->tot[i] + s->tot[j] - (int)d[r*4+c] ) / 2 + ( ( s->ovn[i] && s->ovn[j] ) ? sextet_ovcorr( s, i, j ) : 0 ) );
+				}
+				nsimd++;
 				continue;
 			}
 #endif
+			(void)mcb;
+			nslow++;
 			for( r=0; r<4; r++ ) for( c=0; c<4; c++ )
 			{
 				i = ib + r; j = jb + c;
@@ -2205,6 +3161,7 @@ static void sextet_densejob( sextetfast_t *s, int i0 )
 			}
 		}
 	}
+	if( s->timing ) { __sync_fetch_and_add( &s->nsimd, nsimd ); __sync_fetch_and_add( &s->nslow, nslow ); }
 }
 
 static void sextet_listrow( sextetfast_t *s, int i, uint16_t *tab )
@@ -2232,6 +3189,95 @@ static void sextet_listrow( sextetfast_t *s, int i, uint16_t *tab )
 		sextet_store( s, i, j, (int)( v0 + v1 ) );
 	}
 	for( k=0; k<m; k++ ) tab[lp[k]] = 0;
+}
+
+// Inverted index: for every tuple p of row i, every later row j that holds p
+// gets min( c_i(p), c_j(p) ) added to acc[j]; acc[j] is then the count of
+// pair (i,j), the same integer as the list loop computes.  The work is the
+// sum over tuples of (rows holding it)^2/2 instead of n^2/2 * tuples per row.
+static void sextet_invrow( sextetfast_t *s, int i, int *acc )
+{
+	int n = s->n, j, k, m = s->ln[i], cb = s->cb, self = 0;
+	const uint16_t *lp = s->lp + s->off[i], *lc = s->lc + s->off[i];
+	const uint32_t *pp = s->ppos + s->off[i];
+	const uint32_t mask = ( 1u << cb ) - 1;
+	for( k=0; k<m; k++ )
+	{
+		const uint32_t ci = lc[k];
+		const uint32_t *e = s->post + pp[k] + 1, *end = s->post + s->poff[lp[k]+1];
+		self += ci;
+		for( ; e<end; e++ )
+		{
+			uint32_t cj = *e & mask;
+			acc[*e >> cb] += ( ci < cj ) ? ci : cj;
+		}
+	}
+	sextet_store( s, i, i, self );
+	for( j=i+1; j<n; j++ )
+	{
+		sextet_store( s, i, j, acc[j] );
+		acc[j] = 0;
+	}
+}
+
+// Builds the inverted index from the tuple lists and decides between it and
+// the list loop by their operation counts.  Returns 1 to use it.
+static int sextet_buildinv( sextetfast_t *s, int force )
+{
+	int n = s->n, tw = s->tw, i, k, rb;
+	size_t tot = s->off[n], q, *cur;
+	double inv = 0.0, list = 0.0;
+	uint32_t maxc = 0;
+
+	for( rb=1; ( 1L << rb ) < n; rb++ ) ;
+	s->cb = 32 - rb;
+	if( s->cb < 2 || tot >= 0xffffffffUL ) return( 0 );
+	s->poff = calloc( tw + 1, sizeof( size_t ) );
+	if( !s->poff ) return( 0 );
+	for( i=0; i<n; i++ )
+	{
+		const uint16_t *lp = s->lp + s->off[i], *lc = s->lc + s->off[i];
+		for( k=0; k<s->ln[i]; k++ )
+		{
+			s->poff[lp[k]+1]++;
+			if( lc[k] > maxc ) maxc = lc[k];
+		}
+		list += (double)s->ln[i] * ( i + 1 ); // row i's list is read for every row <= i
+	}
+	for( k=0; k<tw; k++ ) inv += (double)s->poff[k+1] * ( s->poff[k+1] + 1 ) / 2;
+	s->listwork = list;
+	s->invwork = inv;
+	// a scattered add costs about twice a list step
+	if( ( !force && 2.0 * inv >= list ) || (double)maxc >= (double)( 1u << s->cb ) )
+	{
+		free( s->poff ); s->poff = NULL;
+		return( 0 );
+	}
+	for( k=0; k<tw; k++ ) s->poff[k+1] += s->poff[k];
+	s->post = malloc( ( tot + 1 ) * sizeof( uint32_t ) );
+	s->ppos = malloc( ( tot + 1 ) * sizeof( uint32_t ) );
+	cur = malloc( tw * sizeof( size_t ) );
+	if( !s->post || !s->ppos || !cur )
+	{
+		free( cur );
+		free( s->post ); free( s->ppos ); free( s->poff );
+		s->post = s->ppos = NULL; s->poff = NULL;
+		return( 0 );
+	}
+	memcpy( cur, s->poff, tw * sizeof( size_t ) );
+	for( i=0; i<n; i++ ) // ascending rows, so every posting list is in row order
+	{
+		const uint16_t *lp = s->lp + s->off[i], *lc = s->lc + s->off[i];
+		uint32_t *pp = s->ppos + s->off[i];
+		for( k=0; k<s->ln[i]; k++ )
+		{
+			q = cur[lp[k]]++;
+			s->post[q] = ( (uint32_t)i << s->cb ) | lc[k];
+			pp[k] = (uint32_t)q;
+		}
+	}
+	free( cur );
+	return( 1 );
 }
 
 // Reference for the check: the original count (commonsextet_p) and, with
@@ -2287,7 +3333,7 @@ static void *sextet_thread( void *arg )
 {
 	sextetfast_t *s = (sextetfast_t *)arg;
 	int i, i0, i1, step;
-	int *cnt;
+	int *cnt, *acc = NULL;
 	uint16_t *tab = NULL;
 
 	if( s->phase == 0 )
@@ -2309,16 +3355,23 @@ static void *sextet_thread( void *arg )
 		tab = (uint16_t *)calloc( s->tw, sizeof( uint16_t ) );
 		if( !tab ) ErrorExit( "Cannot allocate tab\n" );
 	}
+	if( s->kind == 3 )
+	{
+		acc = (int *)calloc( s->n, sizeof( int ) );
+		if( !acc ) ErrorExit( "Cannot allocate acc\n" );
+	}
 	while( ( i0 = sextet_claim( s, step ) ) < s->n )
 	{
 		i1 = MIN( i0 + step, s->n );
 		if( i0 % 100 == 0 || i0 / 100 != ( i1 - 1 ) / 100 ) reporterr( "\r% 5d / %d", i1, s->n );
 		if( s->kind == 1 ) sextet_densejob( s, i0 );
+		else if( s->kind == 3 ) for( i=i0; i<i1; i++ ) sextet_invrow( s, i, acc );
 		else for( i=i0; i<i1; i++ ) sextet_listrow( s, i, tab );
 		if( s->check ) for( i=i0; i<i1; i++ ) sextet_checkrow( s, i );
 	}
 	if( s->check ) commonsextet_p( NULL, NULL );
 	free( tab );
+	free( acc );
 	return( NULL );
 }
 
@@ -2332,6 +3385,7 @@ static void sextetfast_free( sextetfast_t *s )
 	}
 	free( s->tab ); free( s->tot ); free( s->mc ); free( s->ovn ); free( s->ovp ); free( s->ovc );
 	free( s->ln ); free( s->off ); free( s->lp ); free( s->lc );
+	free( s->post ); free( s->poff ); free( s->ppos );
 	free( s->self );
 	free( s->lftab );
 }
@@ -2365,6 +3419,7 @@ static int sextetfast_run( int njob, int **pointt, double **mtx, int *nogaplen )
 	s.check = ( mode && strstr( mode, "check" ) );
 	s.scalar = ( mode && strstr( mode, "scalar" ) );
 	s.timing = ( mode && strstr( mode, "time" ) );
+	s.simd = s.scalar ? FMSIMD_SCALAR : fmsimd_level();
 	if( tsize == SEXTET_DW && !( mode && strstr( mode, "list" ) ) ) s.kind = 1;
 	else if( tsize == SEXTET_DW || tsize == 46656 ) s.kind = 2;
 	else return( 0 );
@@ -2456,8 +3511,9 @@ static int sextetfast_run( int njob, int **pointt, double **mtx, int *nogaplen )
 			sextet_thread( (void *)&s );
 		if( s.phase == 0 )
 		{
-			t1 = sextet_now();
 			if( s.bad ) break;
+			if( s.kind == 2 && !( mode && strstr( mode, "noinv" ) ) && sextet_buildinv( &s, mode && strstr( mode, "inv" ) && !strstr( mode, "noinv" ) ) ) s.kind = 3;
+			t1 = sextet_now();
 		}
 	}
 	t2 = sextet_now();
@@ -2470,8 +3526,8 @@ static int sextetfast_run( int njob, int **pointt, double **mtx, int *nogaplen )
 #endif
 	sextetfast_free( &s );
 	if( s.bad ) return( 0 ); // a list count did not fit; mtx was not written
-	if( s.timing ) reporterr( "\nsextetfast: kind %d, %d threads, tables %.3f s, pairs %.3f s\n", s.kind, nthr, t1 - t0, t2 - t1 );
-	if( s.check ) reporterr( "\nsextetfast check passed: kind %d, %d rows, every pair's %s bitwise identical\n", s.kind, njob, s.convert ? "distance" : "count" );
+	if( s.timing ) reporterr( "\nsextetfast: kind %d, simd level %d, %d threads, tables %.3f s, pairs %.3f s; dense 4x4 blocks: %ld simd, %ld plain; list work %.3g, inverted work %.3g\n", s.kind, s.simd, nthr, t1 - t0, t2 - t1, s.nsimd, s.nslow, s.listwork, s.invwork );
+	if( s.check ) reporterr( "\nsextetfast check passed: kind %d, simd level %d, %d rows, every pair's %s bitwise identical\n", s.kind, s.simd, njob, s.convert ? "distance" : "count" );
 	return( s.convert ? 2 : 1 );
 }
 // MAFFT_SEXTET_DUMP: the 6-mer distance matrix, row i = mtx[i][0..n-1-i] as raw doubles
