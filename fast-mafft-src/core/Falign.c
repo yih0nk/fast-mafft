@@ -1,5 +1,6 @@
 #include "mltaln.h"
 #include "progtiming.h"
+#include "dphelp.h"
 #ifdef PROGTIMING
 TLS double pt_acc[PT_NACC];
 #endif
@@ -810,6 +811,156 @@ static void Falign_rows_free( void )
 	free( fa_rows ); fa_rows = NULL; fa_rowcap = 0;
 }
 
+/* work/prog3: the segments of a Falign call in parallel.  After the anchors are fixed, every
+   segment between two cut points is aligned on its own: its inputs are the original columns
+   cut1[i]..cut1[i+1]-1 (and cut2[...]) of seq1/seq2 plus the gap states at the cut points
+   (getkyokaigap reads the original rows), and its output is appended to the result in segment order.
+   So segments can be aligned by any thread in any order, each into its own buffers, and then
+   appended in order: every row of the result gets the same bytes as in the sequential loop.  The
+   aligners keep their working state per thread (TLS), the totalscore sum is formed in segment order.
+   Used for alg 'A' without constraint/codon options, when idle helper threads exist. */
+typedef struct
+{
+	char **seq1, **seq2;
+	int clus1, clus2, nseg, alloclen;
+	const int *cut1, *cut2;
+	double **n_dynamicmtx;
+	double *eff1, *eff2;
+	char ***r1, ***r2;      // per segment: the rows it aligns in place
+	char **sg;              // per segment: sgap1, sgap2, egap1, egap2 (4 consecutive blocks)
+	double *score;
+} psegctx_t;
+
+static void pseg_body( void *vctx, int lo, int hi )
+{
+	psegctx_t *c = (psegctx_t *)vctx;
+	int i, j;
+	for( i=lo; i<hi; i++ )
+	{
+		const int *cut1 = c->cut1, *cut2 = c->cut2;
+		int clus1 = c->clus1, clus2 = c->clus2, headgp, tailgp;
+		char **tmpres1 = c->r1[i], **tmpres2 = c->r2[i];
+		char *sgap1 = c->sg[i], *sgap2 = sgap1 + clus1, *egap1 = sgap2 + clus2, *egap2 = egap1 + clus1;
+		int len1 = cut1[c->nseg], len2 = cut2[c->nseg];
+		double dumdb = 0.0;
+		if( i == 0 ) headgp = outgap; else headgp = 1;
+		if( i == c->nseg-1 ) tailgp = outgap; else tailgp = 1;
+		if( cut1[i] )
+			getkyokaigap( sgap1, c->seq1, cut1[i]-1, clus1 );
+		else
+			for( j=0; j<clus1; j++ ) sgap1[j] = 'o';
+		if( cut2[i] )
+			getkyokaigap( sgap2, c->seq2, cut2[i]-1, clus2 );
+		else
+			for( j=0; j<clus2; j++ ) sgap2[j] = 'o';
+		if( cut1[i+1] != len1 )
+			getkyokaigap( egap1, c->seq1, cut1[i+1], clus1 );
+		else
+			for( j=0; j<clus1; j++ ) egap1[j] = 'o';
+		if( cut2[i+1] != len2 )
+			getkyokaigap( egap2, c->seq2, cut2[i+1], clus2 );
+		else
+			for( j=0; j<clus2; j++ ) egap2[j] = 'o';
+		for( j=0; j<clus1; j++ )
+		{
+			strncpy( tmpres1[j], c->seq1[j]+cut1[i], cut1[i+1]-cut1[i] );
+			tmpres1[j][cut1[i+1]-cut1[i]] = 0;
+		}
+		for( j=0; j<clus2; j++ )
+		{
+			strncpy( tmpres2[j], c->seq2[j]+cut2[i], cut2[i+1]-cut2[i] );
+			tmpres2[j][cut2[i+1]-cut2[i]] = 0;
+		}
+		if( clus1 == 1 && clus2 == 1 )
+			c->score[i] = G__align11( c->n_dynamicmtx, tmpres1, tmpres2, c->alloclen, headgp, tailgp );
+		else
+			c->score[i] = A__align( c->n_dynamicmtx, penalty, penalty_ex, tmpres1, tmpres2, c->eff1, c->eff2, clus1, clus2, c->alloclen, 0, &dumdb, sgap1, sgap2, egap1, egap2, NULL, 0, NULL, headgp, tailgp, -1, -1, NULL, NULL, NULL, 0.0, 0.0 );
+	}
+}
+
+#ifdef PROGTIMING
+static TLS int pseg_check_pending = 0;
+static TLS char **pseg_check_save1, **pseg_check_save2;
+static TLS double pseg_check_ts;
+static long pseg_checked = 0;
+static void pseg_report( void ) __attribute__(( destructor ));
+static void pseg_report( void ) { if( getenv( "MAFFT_PSEGCHECK" ) ) reporterr( "\nPSEGCHECK: %ld parallel Falign calls verified, no mismatch\n", pseg_checked ); }
+#endif
+static int pseg_force( void ) // MAFFT_PSEGFORCE=1 (timing builds): every multi-segment call takes the parallel code (testing)
+{
+#ifdef PROGTIMING
+	static int v = -1;
+	if( v < 0 ) v = ( getenv( "MAFFT_PSEGFORCE" ) != NULL );
+	return( v );
+#else
+	return( 0 );
+#endif
+}
+static int pseg_v = -1;
+static int pseg_on( void )
+{
+	if( pseg_v < 0 )
+	{
+		/* work/prog3: off by default.  The segments' private buffers hold a second copy of both groups
+		   while the segments run, on several threads at once: +0.7-0.8 GB peak RSS on 16S.T at 10
+		   threads (above the baseline's), for a gain that did not show clearly.  MAFFT_PSEG=1 turns it
+		   on in timing builds (A/B, PSEGCHECK). */
+#ifdef PROGTIMING
+		pseg_v = ( getenv( "MAFFT_PSEG" ) != NULL );
+#else
+		pseg_v = 0;
+#endif
+	}
+	return( pseg_v );
+}
+
+/* Aligns the nseg segments (cut points cut1[0..nseg], cut2[0..nseg]) and appends them, in order, to
+   result1/result2 (which start empty); returns totalscore, as the sequential loop does. */
+static double Falign_psegs( char **seq1, char **seq2, int clus1, int clus2, int nseg, const int *cut1, const int *cut2,
+	double **n_dynamicmtx, double *eff1, double *eff2, int alloclen, char **result1, char **result2 )
+{
+	psegctx_t c;
+	size_t rowbytes = 0, k;
+	char *blk, *p;
+	int i, j, totallen = 0, off1 = 0, off2 = 0;
+	double totalscore = 0.0;
+	for( i=0; i<nseg; i++ ) rowbytes += ( cut1[i+1]-cut1[i] ) + ( cut2[i+1]-cut2[i] ) + 2;
+	blk = malloc( rowbytes * ( clus1 + clus2 ) + (size_t)nseg * 2 * ( clus1 + clus2 ) );
+	c.r1 = malloc( sizeof( char ** ) * nseg ); c.r2 = malloc( sizeof( char ** ) * nseg );
+	c.sg = malloc( sizeof( char * ) * nseg ); c.score = malloc( sizeof( double ) * nseg );
+	if( !blk || !c.r1 || !c.r2 || !c.sg || !c.score ) ErrorExit( "Cannot allocate the segment buffers in Falign.\n" );
+	p = blk;
+	for( i=0; i<nseg; i++ )
+	{
+		k = ( cut1[i+1]-cut1[i] ) + ( cut2[i+1]-cut2[i] ) + 2;
+		c.r1[i] = malloc( sizeof( char * ) * clus1 ); c.r2[i] = malloc( sizeof( char * ) * clus2 );
+		for( j=0; j<clus1; j++ ) { c.r1[i][j] = p; p += k; }
+		for( j=0; j<clus2; j++ ) { c.r2[i][j] = p; p += k; }
+		c.sg[i] = p; p += 2 * ( clus1 + clus2 );
+	}
+	c.seq1 = seq1; c.seq2 = seq2; c.clus1 = clus1; c.clus2 = clus2; c.nseg = nseg; c.alloclen = alloclen;
+	c.cut1 = cut1; c.cut2 = cut2; c.n_dynamicmtx = n_dynamicmtx; c.eff1 = eff1; c.eff2 = eff2;
+	dphelp_for( nseg, 1, 1.0, 0.0, pseg_body, &c ); // one segment per claim, any thread, any order
+	for( i=0; i<nseg; i++ ) // append in order, exactly as the sequential loop
+	{
+		int nlen = strlen( c.r1[i][0] ), add2 = strlen( c.r2[i][0] );
+		totalscore += c.score[i];
+		if( totallen + nlen > alloclen )
+		{
+			fprintf( stderr, "totallen=%d +  nlen=%d > alloclen = %d\n", totallen, nlen, alloclen );
+			ErrorExit( "LENGTH OVER in Falign\n " );
+		}
+		for( j=0; j<clus1; j++ ) memcpy( result1[j]+off1, c.r1[i][j], nlen+1 );
+		for( j=0; j<clus2; j++ ) memcpy( result2[j]+off2, c.r2[i][j], add2+1 );
+		off1 += nlen;
+		off2 += add2;
+		totallen += nlen;
+	}
+	for( i=0; i<nseg; i++ ) { free( c.r1[i] ); free( c.r2[i] ); }
+	free( c.r1 ); free( c.r2 ); free( c.sg ); free( c.score ); free( blk );
+	return( totalscore );
+}
+
 double Falign( int **whichmtx, double ***scoringmatrices, double **n_dynamicmtx,
 			  char  **seq1, char  **seq2, 
 			  double *eff1, double *eff2, 
@@ -1603,6 +1754,33 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 	totalscore = 0.0;
 	*fftlog = -1;
 //	reporterr( "\nin Falign(), *fftlog = %d\n", *fftlog );
+#ifdef enablemultithread
+	/* work/prog3: segments in parallel (Falign_psegs) when helpers are idle and there is enough work */
+	if( count - 1 >= 2 && pseg_on() && alg == 'A' && !scoringmatrices && !kobetsubunkatsu && !codonpos && !codonscore && chudanpt == NULL
+	    && ( pseg_force() || ( dphelp_idle() > 0 && (double)( clus1 + clus2 ) * ( len1 + len2 ) >= 2.0e5 ) ) )
+	{
+		totalscore = Falign_psegs( seq1, seq2, clus1, clus2, count-1, cut1, cut2, n_dynamicmtx, eff1, eff2, alloclen, result1, result2 );
+		*fftlog = count - 2; // as after count-1 increments from -1
+#ifdef PROGTIMING
+		if( getenv( "MAFFT_PSEGCHECK" ) ) // the sequential loop again, into copies, compared bitwise
+		{
+			char **save1 = malloc( sizeof( char * ) * clus1 ), **save2 = malloc( sizeof( char * ) * clus2 );
+			double ts = totalscore;
+			for( j=0; j<clus1; j++ ) { save1[j] = strdup( result1[j] ); result1[j][0] = 0; }
+			for( j=0; j<clus2; j++ ) { save2[j] = strdup( result2[j] ); result2[j][0] = 0; }
+			pseg_check_pending = 1;
+			pseg_check_save1 = save1; pseg_check_save2 = save2; pseg_check_ts = ts;
+			totalscore = 0.0;
+			*fftlog = -1;
+			goto pseg_sequential;
+		}
+#endif
+		goto pseg_done;
+	}
+#endif
+#ifdef PROGTIMING
+	pseg_sequential:
+#endif
 	for( i=0; i<count-1; i++ )
 	{
 		*fftlog += 1;
@@ -1862,6 +2040,22 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 
 #if KEIKA
 	fprintf( stderr, "DP ... done   \n" );
+#endif
+#ifdef PROGTIMING
+	if( pseg_check_pending )
+	{
+		pseg_check_pending = 0;
+		for( j=0; j<clus1; j++ ) if( strcmp( pseg_check_save1[j], result1[j] ) ) { reporterr( "\nPSEGCHECK MISMATCH, group 1 row %d\n", j ); exit( 1 ); }
+		for( j=0; j<clus2; j++ ) if( strcmp( pseg_check_save2[j], result2[j] ) ) { reporterr( "\nPSEGCHECK MISMATCH, group 2 row %d\n", j ); exit( 1 ); }
+		if( memcmp( &pseg_check_ts, &totalscore, sizeof( double ) ) ) { reporterr( "\nPSEGCHECK MISMATCH in totalscore\n" ); exit( 1 ); }
+		for( j=0; j<clus1; j++ ) free( pseg_check_save1[j] );
+		for( j=0; j<clus2; j++ ) free( pseg_check_save2[j] );
+		free( pseg_check_save1 ); free( pseg_check_save2 );
+		__atomic_add_fetch( &pseg_checked, 1, __ATOMIC_RELAXED );
+	}
+#endif
+#ifdef enablemultithread
+	pseg_done:
 #endif
 
 	for( j=0; j<clus1; j++ ) strcpy( seq1[j], result1[j] );

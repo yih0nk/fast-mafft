@@ -1,6 +1,7 @@
 #include "mltaln.h"
 #include "progtiming.h"
 #include "dphelp.h"
+#include "lazygap.h"
 #ifdef PROGTIMING
 int pt_nofastdp = -1; /* A/B switch for timing builds: MAFFT_NOFASTDP=1 disables the fast DP path */
 static int pt_fastdp_enabled( void ) { if( pt_nofastdp < 0 ) pt_nofastdp = ( getenv( "MAFFT_NOFASTDP" ) != NULL ); return( !pt_nofastdp ); }
@@ -415,7 +416,7 @@ static void match_calc( double **n_dynamicmtx, double *match, double **cpmx1, do
    whenever acc is not -0.0; acc starts at +0.0 and can never become -0.0 (weights are >= 0 and
    exact cancellation rounds to +0.0), so every match[j] is bit-identical.  The loop over j is
    independent per column and vectorizes. */
-#define DENSE_MAXU 8
+#define DENSE_MAXU 32 // work/prog3: was 8; every letter of the alphabet (26) fits now
 static TLS int dense_nu = -1;
 static TLS int dense_u[DENSE_MAXU];
 
@@ -682,15 +683,16 @@ static void Atracking_localhom( double *impwmpt, double *lasthorizontalw, double
 	}
 }
 
-static void createcpmxresult( double **cpmxresult, int limk, double eff1, double eff2, double ***cpmx1, double ***cpmx2, char *gaptable1, char *gaptable2, int usehist1, int usehist2 ) // allocate, free ryouhou suru.
+typedef struct { double **cpmxresult; int limk, alen; double eff1, eff2; double ***cpmx1, ***cpmx2; char *gaptable1, *gaptable2; int usehist1, usehist2; } createcpmxctx_t;
+static void createcpmx_letters( void *vctx, int lo, int hi ) // the per-letter body of createcpmxresult (unchanged)
 {
+	createcpmxctx_t *c = (createcpmxctx_t *)vctx;
+	double **cpmxresult = c->cpmxresult, ***cpmx1 = c->cpmx1, ***cpmx2 = c->cpmx2;
+	double eff1 = c->eff1, eff2 = c->eff2;
+	char *gaptable1 = c->gaptable1, *gaptable2 = c->gaptable2;
+	int limk = c->limk, alen = c->alen, usehist1 = c->usehist1, usehist2 = c->usehist2;
 	int i, j, p;
-	int alen = strlen( gaptable1 );
-
-//	reporterr( "eff1 = %f, eff2=%f\n", eff1, eff2 );
-
-#if 1 // sukoshi osoi
-	for( i=0; i<nalphabets; i++ )
+	for( i=lo; i<hi; i++ )
 	{
 		cpmxresult[i] = calloc( limk+1, sizeof( double ) );
 		for( j=0; j<alen; j++ ) cpmxresult[i][j] = 0.0;
@@ -723,6 +725,27 @@ static void createcpmxresult( double **cpmxresult, int limk, double eff1, double
 			(*cpmx2)[i] = NULL;
 		}
 	}
+}
+
+static void createcpmxresult( double **cpmxresult, int limk, double eff1, double eff2, double ***cpmx1, double ***cpmx2, char *gaptable1, char *gaptable2, int usehist1, int usehist2 ) // allocate, free ryouhou suru.
+{
+	int i, j, p;
+	int alen = strlen( gaptable1 );
+
+//	reporterr( "eff1 = %f, eff2=%f\n", eff1, eff2 );
+
+#if 1 // sukoshi osoi
+	/* work/prog3: the letters are independent (each writes and frees only its own rows); large
+	   profiles are shared with idle helper threads (createcpmx_letters, same operations per entry) */
+	createcpmxctx_t c;
+	c.cpmxresult = cpmxresult; c.limk = limk; c.alen = alen; c.eff1 = eff1; c.eff2 = eff2;
+	c.cpmx1 = cpmx1; c.cpmx2 = cpmx2; c.gaptable1 = gaptable1; c.gaptable2 = gaptable2; c.usehist1 = usehist1; c.usehist2 = usehist2;
+#ifdef enablemultithread
+	dphelp_for( nalphabets, 1, (double)nalphabets * alen, 2.0e5, createcpmx_letters, &c );
+#else
+	createcpmx_letters( &c, 0, nalphabets );
+#endif
+	(void)i; (void)j; (void)p;
 #if 1
 	if( usehist1 ) 
 	{
@@ -911,6 +934,9 @@ static void createfgresult( double **gapfresult, int limk, double eff1, double e
 #endif
 }
 
+TLS a_lazy_t A_lz; // work/prog3: see lazygap.h
+static TLS int atr_len1 = -1, atr_len2 = -1; // work/prog3: lengths for Atracking when rows are not current
+
 static double Atracking( double *lasthorizontalw, double *lastverticalw, 
 						double fpenalty, double fpenalty_ex,
 						char **seq1, char **seq2, 
@@ -937,8 +963,8 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
 	double wm;
 	char *gaptable1, *gt1bk;
 	char *gaptable2, *gt2bk;
-	lgth1 = strlen( seq1[0] );
-	lgth2 = strlen( seq2[0] );
+	lgth1 = ( atr_len1 >= 0 ) ? atr_len1 : strlen( seq1[0] ); // work/prog3: the rows may be stale (lazygap.h)
+	lgth2 = ( atr_len2 >= 0 ) ? atr_len2 : strlen( seq2[0] );
 
 
 	if( gt1 == NULL )
@@ -1023,14 +1049,10 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
 #endif
 	}
 
-    for( i=0; i<lgth1+1; i++ ) 
-    {
-        ijp[i][0] = i + 1;
-    }
-    for( j=0; j<lgth2+1; j++ ) 
-    {
-        ijp[0][j] = -( j + 1 );
-    }
+	/* work/prog3: row 0 and column 0 of ijp are no longer filled in (lgth1 + lgth2 scattered writes,
+	   one per row of a matrix that can have 10^4 rows); the walk below uses the values they would
+	   hold: ijp[0][j] = -( j + 1 ) (written last, so also ijp[0][0] = -1) and ijp[i][0] = i + 1. */
+#define ATR_IJP( ii, jj ) ( (ii) == 0 ? -( (jj) + 1 ) : (jj) == 0 ? (ii) + 1 : ijp[ii][jj] )
 
 	gaptable1 = gt1bk + lgth1+lgth2;
 	*gaptable1 = 0;
@@ -1041,18 +1063,19 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
 	limk = lgth1+lgth2 + 1;
 	for( k=0; k<limk; k++ ) 
 	{
-		if( ijp[iin][jin] >= warpbase )
+		int ijv = ATR_IJP( iin, jin );
+		if( ijv >= warpbase )
 		{
-			ifi = warpis[ijp[iin][jin]-warpbase];
-			jfi = warpjs[ijp[iin][jin]-warpbase];
+			ifi = warpis[ijv-warpbase];
+			jfi = warpjs[ijv-warpbase];
 		}
-		else if( ijp[iin][jin] < 0 ) 
+		else if( ijv < 0 ) 
 		{
-			ifi = iin-1; jfi = jin+ijp[iin][jin];
+			ifi = iin-1; jfi = jin+ijv;
 		}
-		else if( ijp[iin][jin] > 0 )
+		else if( ijv > 0 )
 		{
-			ifi = iin-ijp[iin][jin]; jfi = jin-1;
+			ifi = iin-ijv; jfi = jin-1;
 		}
 		else
 		{
@@ -1101,6 +1124,7 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
 		iin = ifi; jin = jfi;
 	}
 
+#undef ATR_IJP
 //	reporterr( "gaptable1=%s\n", gaptable1 );
 //	reporterr( "gaptable2=%s\n", gaptable2 );
 	if( strchr( gaptable1, '-' ) ) *ngap1 = 1; else *ngap1 = 0;
@@ -1376,6 +1400,202 @@ static void Adp_row_fast( int i, int lastj, double * restrict colw, int * restri
 		ijpi[j] = ijv; \
 	}
 
+/* work/prog3: the inner cells of a row, j in [ja, jb), scalar (the reference for the vector kernels) */
+static void Adp_cells_scalar( int i, int ja, int jb,
+	double * restrict mloc, int * restrict mploc, double * restrict curw, int * restrict ijpi,
+	const double * restrict prew, const double * restrict gf2, const double * restrict fg2, const double * restrict og2,
+	const double * restrict c0, const double * restrict c1, const double * restrict c2, const double * restrict c3,
+	const double *scu,
+	double fgcp1va, double ogcp1va, double gf1va, double gf1vapre, double fpenalty_ex,
+	double *mip, int *mpip, double *wmp )
+{
+	const double s0 = scu[0], s1 = scu[1], s2 = scu[2], s3 = scu[3];
+	double mil = *mip, wmv = *wmp;
+	int mpil = *mpip, ijv, j;
+	for( j=ja; j<jb; j++ )
+		ADP_CELL( 0, 1 )
+	*mip = mil;
+	*mpip = mpil;
+	*wmp = wmv;
+}
+
+/* work/prog3: vector kernels for the inner cells (adpvec_body.h explains why they are exact).
+   Adp_cells_v{2,4}: 4-letter inline match (as Adp_row_fused4); Adp_cellsm_v{2,4}: match in curw. */
+#if defined( __aarch64__ ) || defined( __ARM_NEON ) || defined( __x86_64__ ) || defined( __i386__ )
+#define ADPV_HAVE 1
+#if ( defined( __x86_64__ ) || defined( __i386__ ) ) && !defined( __AVX2__ ) && ( defined( __GNUC__ ) || defined( __clang__ ) )
+#define ADPV_X86DISPATCH 1
+#define ADPV_ATTR4 __attribute__(( target( "avx2" ) )) // runtime dispatch below; FMA only if the build flags enable it
+#else
+#define ADPV_ATTR4
+#endif
+#define ADPV_ATTR
+#define ADPV_VB 16
+#define ADPV_MROW 0
+#define ADPV_NAME Adp_cells_v2
+#include "adpvec_body.h"
+#undef ADPV_NAME
+#undef ADPV_MROW
+#define ADPV_MROW 1
+#define ADPV_NAME Adp_cellsm_v2
+#include "adpvec_body.h"
+#undef ADPV_NAME
+#undef ADPV_MROW
+#undef ADPV_VB
+#undef ADPV_ATTR
+#define ADPV_ATTR ADPV_ATTR4
+#define ADPV_VB 32
+#define ADPV_MROW 0
+#define ADPV_NAME Adp_cells_v4
+#include "adpvec_body.h"
+#undef ADPV_NAME
+#undef ADPV_MROW
+#define ADPV_MROW 1
+#define ADPV_NAME Adp_cellsm_v4
+#include "adpvec_body.h"
+#undef ADPV_NAME
+#undef ADPV_MROW
+#undef ADPV_VB
+#undef ADPV_ATTR
+#endif
+
+typedef void (*adp_cells_fn)( int, int, int, double *, int *, double *, int *,
+	const double *, const double *, const double *, const double *,
+	const double *, const double *, const double *, const double *, const double *,
+	double, double, double, double, double, double *, int *, double * );
+
+/* work/prog3: the inner cells with the match score already in curw[j] (ADP_CELL( 0, 0 )), scalar */
+static void Adp_cellsm_scalar( int i, int ja, int jb,
+	double * restrict mloc, int * restrict mploc, double * restrict curw, int * restrict ijpi,
+	const double * restrict prew, const double * restrict gf2, const double * restrict fg2, const double * restrict og2,
+	const double * restrict c0, const double * restrict c1, const double * restrict c2, const double * restrict c3,
+	const double *scu,
+	double fgcp1va, double ogcp1va, double gf1va, double gf1vapre, double fpenalty_ex,
+	double *mip, int *mpip, double *wmp )
+{
+	const double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0; // (unused: ADP_CELL( 0, 0 ) reads curw)
+	double mil = *mip, wmv = *wmp;
+	int mpil = *mpip, ijv, j;
+	for( j=ja; j<jb; j++ )
+		ADP_CELL( 0, 0 )
+	*mip = mil;
+	*mpip = mpil;
+	*wmp = wmv;
+}
+
+typedef void (*adp_mrow_fn)( int, int, unsigned int, const double *, const double * const *, const unsigned int *, double * );
+static adp_mrow_fn adp_mrow = NULL; // set by adp_cells_init
+static void Adp_mrow_blk_g( int ja, int jb, unsigned int rowmask, const double *su, const double * const *cu, const unsigned int *bm, double * restrict curw );
+#ifdef ADPV_X86DISPATCH
+static void Adp_mrow_blk_avx2( int ja, int jb, unsigned int rowmask, const double *su, const double * const *cu, const unsigned int *bm, double * restrict curw );
+#endif
+
+/* Which kernels: MAFFT_ADPVEC=0 scalar, 2 two lanes, 4 four lanes.  Default: four lanes on x86 with
+   AVX2 (checked at run time unless the build targets AVX2), two lanes on other x86, scalar on ARM
+   (on Apple M-series cores the scalar fused loop is as fast as two NEON lanes: measured, see
+   notes/progressive-lever-3.md). */
+static adp_cells_fn adp_cells4 = NULL, adp_cellsm = NULL;
+static void adp_cells_init( void )
+{
+	adp_cells_fn f4 = Adp_cells_scalar, fm = Adp_cellsm_scalar;
+#ifdef ADPV_HAVE
+	char *e = getenv( "MAFFT_ADPVEC" );
+	int w = e ? atoi( e ) : -1;
+	if( w < 0 )
+	{
+#if defined( __x86_64__ ) || defined( __i386__ )
+#ifdef ADPV_X86DISPATCH
+		__builtin_cpu_init();
+		w = __builtin_cpu_supports( "avx2" ) ? 4 : 2;
+#else
+		w = 4;
+#endif
+#else
+		w = 0;
+#endif
+	}
+#ifdef ADPV_X86DISPATCH
+	if( w == 4 ) { __builtin_cpu_init(); if( !__builtin_cpu_supports( "avx2" ) ) w = 2; }
+#endif
+	if( w == 2 ) { f4 = Adp_cells_v2; fm = Adp_cellsm_v2; }
+	else if( w == 4 ) { f4 = Adp_cells_v4; fm = Adp_cellsm_v4; }
+#endif
+	{
+		adp_mrow_fn fr = Adp_mrow_blk_g;
+#ifdef ADPV_X86DISPATCH
+		__builtin_cpu_init();
+		if( __builtin_cpu_supports( "avx2" ) ) fr = Adp_mrow_blk_avx2;
+#endif
+		__atomic_store_n( &adp_mrow, fr, __ATOMIC_RELAXED );
+	}
+	__atomic_store_n( &adp_cellsm, fm, __ATOMIC_RELAXED );
+	__atomic_store_n( &adp_cells4, f4, __ATOMIC_RELEASE ); // every thread computes the same values
+}
+static inline adp_cells_fn adp_cells_get( int mrow )
+{
+	if( __atomic_load_n( &adp_cells4, __ATOMIC_ACQUIRE ) == NULL ) adp_cells_init();
+	return( mrow ? adp_cellsm : adp_cells4 );
+}
+
+#ifdef PROGTIMING
+/* MAFFT_VECCHECK=1: every vectorized cell range is also computed by the scalar kernel on shadow
+   copies of the row state, and everything both produce is compared bitwise. */
+static int pt_veccheck_v = -1;
+static int pt_veccheck( void ) { if( pt_veccheck_v < 0 ) pt_veccheck_v = ( getenv( "MAFFT_VECCHECK" ) != NULL ); return( pt_veccheck_v ); }
+static TLS double *vc_m = NULL, *vc_cur = NULL; static TLS int *vc_mp = NULL, *vc_ijp = NULL; static TLS int vc_cap = 0;
+static long vc_ranges = 0, vc_cells = 0; // atomic counters, reported at exit
+static void vc_report( void ) __attribute__(( destructor ));
+static void vc_report( void ) { if( pt_veccheck_v > 0 ) reporterr( "\nVECCHECK: %ld cell ranges, %ld cells verified, no mismatch\n", vc_ranges, vc_cells ); }
+#endif
+
+#ifdef PROGTIMING
+#define ADPV_CHECKING pt_veccheck()
+#else
+#define ADPV_CHECKING 0
+#endif
+/* the inner cells [ja, jb) of row i; mrow: the match scores are in curw (else 4 inline letters) */
+static inline void Adp_cells( int mrow, int i, int ja, int jb,
+	double * restrict mloc, int * restrict mploc, double * restrict curw, int * restrict ijpi,
+	const double * restrict prew, const double * restrict gf2, const double * restrict fg2, const double * restrict og2,
+	const double * restrict c0, const double * restrict c1, const double * restrict c2, const double * restrict c3,
+	const double *scu,
+	double fgcp1va, double ogcp1va, double gf1va, double gf1vapre, double fpenalty_ex,
+	double *mip, int *mpip, double *wmp )
+{
+	adp_cells_fn f = adp_cells_get( mrow );
+#ifdef PROGTIMING
+	if( pt_veccheck() && jb > ja )
+	{
+		double mi2 = *mip, wm2 = *wmp; int mpi2 = *mpip;
+		if( jb + 1 > vc_cap )
+		{
+			vc_cap = jb + 1 + jb / 2;
+			vc_m = realloc( vc_m, sizeof( double ) * vc_cap ); vc_cur = realloc( vc_cur, sizeof( double ) * vc_cap );
+			vc_mp = realloc( vc_mp, sizeof( int ) * vc_cap ); vc_ijp = realloc( vc_ijp, sizeof( int ) * vc_cap );
+		}
+		memcpy( vc_m + ja, mloc + ja, sizeof( double ) * ( jb - ja ) );
+		memcpy( vc_mp + ja, mploc + ja, sizeof( int ) * ( jb - ja ) );
+		memcpy( vc_cur + ja, curw + ja, sizeof( double ) * ( jb - ja ) ); // (the match scores, if mrow)
+		( mrow ? Adp_cellsm_scalar : Adp_cells_scalar )( i, ja, jb, vc_m, vc_mp, vc_cur, vc_ijp, prew, gf2, fg2, og2, c0, c1, c2, c3, scu,
+			fgcp1va, ogcp1va, gf1va, gf1vapre, fpenalty_ex, &mi2, &mpi2, &wm2 );
+		f( i, ja, jb, mloc, mploc, curw, ijpi, prew, gf2, fg2, og2, c0, c1, c2, c3, scu,
+			fgcp1va, ogcp1va, gf1va, gf1vapre, fpenalty_ex, mip, mpip, wmp );
+		if( memcmp( vc_m + ja, mloc + ja, sizeof( double ) * ( jb - ja ) ) || memcmp( vc_mp + ja, mploc + ja, sizeof( int ) * ( jb - ja ) )
+		 || memcmp( vc_cur + ja, curw + ja, sizeof( double ) * ( jb - ja ) ) || memcmp( vc_ijp + ja, ijpi + ja, sizeof( int ) * ( jb - ja ) )
+		 || memcmp( &mi2, mip, sizeof( double ) ) || mpi2 != *mpip || memcmp( &wm2, wmp, sizeof( double ) ) )
+		{
+			reporterr( "\nVECCHECK MISMATCH in A__align row %d, cells %d..%d (mrow=%d)\n", i, ja, jb-1, mrow );
+			exit( 1 );
+		}
+		__atomic_add_fetch( &vc_ranges, 1, __ATOMIC_RELAXED );
+		__atomic_add_fetch( &vc_cells, (long)( jb - ja ), __ATOMIC_RELAXED );
+		return;
+	}
+#endif
+	f( i, ja, jb, mloc, mploc, curw, ijpi, prew, gf2, fg2, og2, c0, c1, c2, c3, scu,
+		fgcp1va, ogcp1va, gf1va, gf1vapre, fpenalty_ex, mip, mpip, wmp );
+}
+
 static void Adp_row_fused4( int i, int lgth2,
 	double * restrict mloc, int * restrict mploc, double * restrict curw, int * restrict ijpi,
 	const double * restrict prew, const double * restrict gf2, const double * restrict fg2, const double * restrict og2,
@@ -1391,12 +1611,110 @@ static void Adp_row_fused4( int i, int lgth2,
 
 	j = 1;
 	if( 1 < lgth2 ) ADP_CELL( 1, 1 ) else ADP_CELL( 1, 0 )
-	for( j=2; j<lgth2; j++ )
-		ADP_CELL( 0, 1 )
+	if( lgth2 > 2 ) // work/prog3: the inner cells 2..lgth2-1, vectorized
+	{
+		if( adp_cells_get( 0 ) == Adp_cells_scalar && !ADPV_CHECKING ) // the loop of v3, inline (as compiled before)
+		{
+			for( j=2; j<lgth2; j++ )
+				ADP_CELL( 0, 1 )
+		}
+		else
+			Adp_cells( 0, i, 2, lgth2, mloc, mploc, curw, ijpi, prew, gf2, fg2, og2, c0, c1, c2, c3, scu,
+				fgcp1va, ogcp1va, gf1va, gf1vapre, fpenalty_ex, &mil, &mpil, &wmv );
+	}
 	if( lgth2 >= 2 )
 	{
 		j = lgth2;
 		ADP_CELL( 0, 0 )
+	}
+	*mip = mil;
+	*mpip = mpil;
+	*wmp = wmv;
+}
+
+/* work/prog3: MAFFT_NOGENERAL=1 (timing builds) turns the general-letter path off (A/B) */
+static int adp_general_v = -1;
+static int adp_general_on( void )
+{
+#ifdef PROGTIMING
+	if( adp_general_v < 0 ) adp_general_v = ( getenv( "MAFFT_NOGENERAL" ) == NULL );
+	return( adp_general_v );
+#else
+	return( 1 );
+#endif
+}
+
+/* work/prog3: one DP row for any number of letters (the rows Adp_row_fused4 cannot take: more than 4
+   letters with a nonzero row score, e.g. IUPAC codes in nucleotide profiles, or protein).  For each
+   block of columns, the match scores are formed first, in curw (exactly the chain of
+   match_calc_dense / Adp_row_fused4: from 0.0, one a += s*c statement per letter, in ascending
+   letter order), then the cells of the block run with the match read back (ADP_CELL( ., 0 ), the
+   operations of the original loop, see Adp_cells / adpvec_body.h).  Column lgth2 has no match score
+   and keeps the value in the buffer, as in the original. */
+#define ADP_MBLOCK 512
+#define ADPM_NAME Adp_mrow_blk_g
+#define ADPM_ATTR
+#include "mrowblk_body.h"
+#undef ADPM_NAME
+#undef ADPM_ATTR
+#ifdef ADPV_X86DISPATCH
+#define ADPM_NAME Adp_mrow_blk_avx2
+#define ADPM_ATTR __attribute__(( target( "avx2" ) ))
+#include "mrowblk_body.h"
+#undef ADPM_NAME
+#undef ADPM_ATTR
+#endif
+static void Adp_mrow( int ja, int jb, unsigned int rowmask, const double *su, const double * const *cu, const unsigned int *bm, double * restrict curw )
+{
+	if( __atomic_load_n( &adp_cells4, __ATOMIC_ACQUIRE ) == NULL ) adp_cells_init();
+	if( jb > ja ) adp_mrow( ja, jb, rowmask, su, cu, bm, curw );
+}
+
+/* the block masks of the profile (see mrowblk_body.h): bm[b] = the letters u with a nonzero weight in
+   some column 4b..4b+3 (columns 0..lgth2-1) */
+static TLS unsigned int *gen_bm = NULL; // work/prog3: block masks of the current A__align's profile 2
+static TLS int gen_bmcap = 0;
+static void Adp_blockmasks( unsigned int *bm, const double * const *cu, int nu, int lgth2 )
+{
+	int u, j, nb = lgth2 / 4 + 2;
+	for( j=0; j<nb; j++ ) bm[j] = 0;
+	for( u=0; u<nu; u++ )
+	{
+		const double *c = cu[u];
+		for( j=0; j<lgth2; j++ ) if( c[j] ) bm[j>>2] |= 1u << u;
+	}
+}
+
+static void Adp_row_denseK( int i, int lgth2, unsigned int rowmask, const double *su, const double * const *cu, const unsigned int *bm,
+	double * restrict mloc, int * restrict mploc, double * restrict curw, int * restrict ijpi,
+	const double * restrict prew, const double * restrict gf2, const double * restrict fg2, const double * restrict og2,
+	double fgcp1va, double ogcp1va, double gf1va, double gf1vapre, double fpenalty_ex,
+	double *mip, int *mpip, double *wmp )
+{
+	// requires lgth2 >= 1 and fpenalty_ex == 0.0 (as Adp_row_fused4)
+	const double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0; // (unused: ADP_CELL( ., 0 ) reads curw)
+	const double *c0 = NULL, *c1 = NULL, *c2 = NULL, *c3 = NULL;
+	double mil = *mip, wmv = *wmp;
+	int mpil = *mpip, ijv, j, b0, b1;
+
+	for( b0=1; b0<=lgth2; b0=b1 )
+	{
+		b1 = MIN( b0 + ADP_MBLOCK, lgth2 + 1 );
+		Adp_mrow( b0, MIN( b1, lgth2 ), rowmask, su, cu, bm, curw ); // columns < lgth2 only
+		j = b0;
+		if( j == 1 )
+		{
+			ADP_CELL( 1, 0 )
+			j = 2;
+		}
+		if( MIN( b1, lgth2 ) > j )
+		{
+			Adp_cells( 1, i, j, MIN( b1, lgth2 ), mloc, mploc, curw, ijpi, prew, gf2, fg2, og2, c0, c1, c2, c3, NULL,
+				fgcp1va, ogcp1va, gf1va, gf1vapre, fpenalty_ex, &mil, &mpil, &wmv );
+			j = MIN( b1, lgth2 );
+		}
+		if( j == lgth2 && j < b1 && lgth2 >= 2 )
+			ADP_CELL( 0, 0 )
 	}
 	*mip = mil;
 	*mpip = mpil;
@@ -1623,6 +1941,7 @@ void dphelp_for( int n, int chunk, double work, double minwork, void (*body)( vo
    compare-and-swap and released with a release store), so its column state moves between
    threads safely. */
 #define ADPB_MAXB 32
+typedef struct { int nu, n1; int u[DENSE_MAXU]; int k1[0x100]; } adpb_letters_t; // the poster's dense_u / dense1_k (TLS)
 typedef struct
 {
 	int done;   // rows 1..done of this band are finished (atomic)
@@ -1638,16 +1957,67 @@ typedef struct
 	double *m; int *mp; int **ijp;
 	const double *gf1, *gf2, *fgcp1, *ogcp1, *fgcp2, *ogcp2;
 	const double *initverticalw; double *lastverticalw;
-	const double *rs;               // per row: the 4 row scores of the fused kernel
-	const double **rc;              // per row: the 4 profile columns of the fused kernel
+	const double *rs;               // per row: the row scores of the (first 4) selected letters (stride 4)
+	const double **rc;              // per row: their profile columns (stride 4)
+	const int *rn;                  // work/prog3: per row: number of letters; <= 4: fused kernel (padded to 4)
+	const double *rsu;              // work/prog3: per row, the scores of every letter u of the profile (stride ks)
+	const unsigned int *rmask;      // work/prog3: per row, the letters with a nonzero score
+	const double * const *cu;       // work/prog3: the profile column of each letter u
+	const unsigned int *bm;         // work/prog3: block masks of the profile (mrowblk_body.h)
+	int ks;
+	int lazyrows;                   // work/prog3: band 0 selects each row's letters (adpb_rowsetup)
+	double **dynmtx, **cpmx1, **cpmx2;
+	adpb_letters_t letters;
 	double fpenalty_ex;
 	double *bw, *bmi; int *bmpi;    // [b*(nrows+1)+i]: values handed from band b-1 to band b
 	double wmlast;
 	adpb_band_t band[ADPB_MAXB];
 } adpb_t;
 
+/* work/prog3: the per-row letter selection of the tiled DP (see Adp_tiled); returns the count */
+static int adpb_rowsetup( double **n_dynamicmtx, double **cpmx1, double **cpmx2, int i, int ks,
+	double *rs, const double **rc, int *rn, double *rsu, unsigned int *rmask, const adpb_letters_t *L )
+{
+	double *scu = rsu + ks*i;
+	unsigned int mask = 0;
+	int u, t, nsel = 0, n;
+	for( u=0; u<L->nu; u++ ) // = dense_scores1(), with the letter lists passed explicitly (this may run on a helper thread)
+	{
+		int l = L->u[u];
+		double sc = 0.0;
+		for( t=0; t<L->n1; t++ )
+		{
+			int k = L->k1[t];
+			sc += n_dynamicmtx[k][l] * cpmx1[k][i];
+		}
+		scu[u] = sc;
+	}
+	for( u=0; u<L->nu; u++ )
+	{
+		if( scu[u] == 0.0 ) continue;
+		if( nsel < 4 )
+		{
+			rs[4*i+nsel] = scu[u];
+			rc[4*i+nsel] = cpmx2[L->u[u]];
+		}
+		mask |= 1u << u;
+		nsel++;
+	}
+	rn[i] = n = nsel;
+	rmask[i] = mask;
+	for( ; nsel<4; nsel++ )
+	{
+		rs[4*i+nsel] = 0.0;
+		rc[4*i+nsel] = cpmx2[0];
+	}
+	return( n );
+}
+
 static void adpb_row( adpb_t *p, int b, int i )
 {
+	if( b == 0 && p->lazyrows ) // work/prog3: band 0 sees every row first (the others wait for it)
+		adpb_rowsetup( p->dynmtx, p->cpmx1, p->cpmx2, i, p->ks, (double *)p->rs, (const double **)p->rc, (int *)p->rn, (double *)p->rsu, (unsigned int *)p->rmask, &p->letters );
+	{
 	const int lgth2 = p->lgth2, j0 = p->J[b], j1 = p->J[b+1], jm = MIN( j1, lgth2 );
 	double * restrict prew = p->wb[(i-1)&1];
 	double * restrict curw = p->wb[i&1];
@@ -1657,6 +2027,7 @@ static void adpb_row( adpb_t *p, int b, int i )
 	const double * restrict gf2 = p->gf2;
 	const double * restrict fg2 = p->fgcp2;
 	const double * restrict og2 = p->ogcp2;
+	const int ks = p->ks, nsel = p->rn[i], gen = ( nsel > 4 ); // work/prog3: gen: match scores formed in curw first
 	const double * restrict c0 = p->rc[4*i], * restrict c1 = p->rc[4*i+1], * restrict c2 = p->rc[4*i+2], * restrict c3 = p->rc[4*i+3];
 	const double s0 = p->rs[4*i], s1 = p->rs[4*i+1], s2 = p->rs[4*i+2], s3 = p->rs[4*i+3];
 	const double fgcp1va = p->fgcp1[i-1], ogcp1va = p->ogcp1[i], gf1va = p->gf1[i], gf1vapre = p->gf1[i-1];
@@ -1664,13 +2035,15 @@ static void adpb_row( adpb_t *p, int b, int i )
 	double mil, wmv = 0.0;
 	int mpil, ijv, j;
 
+	if( gen && jm > j0 ) // work/prog3: the match scores of the band's columns (< lgth2) first
+		Adp_mrow( j0, jm, p->rmask[i], p->rsu + ks*i, p->cu, p->bm, curw );
 	if( b == 0 )
 	{
 		prew[0] = p->initverticalw[i-1];                       // previousw[0] = initverticalw[i-1];
 		curw[0] = p->initverticalw[i];                         // currentw[0] = initverticalw[i];
 		mil = prew[0] + p->ogcp2[1] * p->gf1[i-1]; mpil = 0;   // mi = previousw[0] + ogcp2[1] * gapfreq1pt[i-1]; mpi=0;
 		j = 1;
-		if( 1 < lgth2 ) ADP_CELL( 1, 1 ) else ADP_CELL( 1, 0 )
+		if( 1 < lgth2 && !gen ) ADP_CELL( 1, 1 ) else ADP_CELL( 1, 0 )
 		j = 2;
 	}
 	else
@@ -1679,11 +2052,16 @@ static void adpb_row( adpb_t *p, int b, int i )
 		mil = p->bmi[b*nr1+i];
 		mpil = p->bmpi[b*nr1+i];
 		j = j0;
-		if( j < lgth2 ) ADP_CELL_PW( 0, 1, p->bw[b*nr1+i-1] ) else ADP_CELL_PW( 0, 0, p->bw[b*nr1+i-1] )
+		if( j < lgth2 && !gen ) ADP_CELL_PW( 0, 1, p->bw[b*nr1+i-1] ) else ADP_CELL_PW( 0, 0, p->bw[b*nr1+i-1] )
 		j = j0 + 1;
 	}
-	for( ; j<jm; j++ )
-		ADP_CELL( 0, 1 )
+	if( jm > j ) // work/prog3: the band's inner cells, vectorized
+	{
+		double scu4[4]; scu4[0] = s0; scu4[1] = s1; scu4[2] = s2; scu4[3] = s3;
+		Adp_cells( gen, i, j, jm, mloc, mploc, curw, ijpi, prew, gf2, fg2, og2, c0, c1, c2, c3, scu4,
+			fgcp1va, ogcp1va, gf1va, gf1vapre, fpenalty_ex, &mil, &mpil, &wmv );
+		j = jm;
+	}
 	if( j == lgth2 && j < j1 )
 	{
 		ADP_CELL( 0, 0 )
@@ -1699,6 +2077,7 @@ static void adpb_row( adpb_t *p, int b, int i )
 	else
 		p->wmlast = wmv;
 	if( j0 <= lgth2-1 && lgth2-1 < j1 ) p->lastverticalw[i] = curw[lgth2-1]; // lastverticalw[i] = currentw[lgth2-1];
+}
 }
 
 static void adpb_run( void *arg )
@@ -1748,15 +2127,23 @@ static void adpb_run( void *arg )
    final rows are in w0/w1 exactly as the serial loop leaves them and *wmp is its final wm. */
 static TLS double *adpb_rs = NULL;
 static TLS const double **adpb_rc = NULL;
+static TLS int *adpb_rn = NULL;
+static TLS double *adpb_rsu = NULL;
+static TLS unsigned int *adpb_rmask = NULL;
+static TLS double *adpb_cu[DENSE_MAXU];
 static TLS double *adpb_bw = NULL, *adpb_bmi = NULL;
 static TLS int *adpb_bmpi = NULL;
 static TLS int adpb_rowcap = 0, adpb_bcap = 0;
-static int adpb_minwidth = -1, adpb_mincells = -1, adpb_force = 0;
+static int adpb_minwidth = -1, adpb_mincells = -1, adpb_force = 0, adpb_widthset = 0;
 
 static void adpb_free( void )
 {
 	free( adpb_rs ); adpb_rs = NULL;
 	free( adpb_rc ); adpb_rc = NULL;
+	free( adpb_rn ); adpb_rn = NULL;
+	free( adpb_rsu ); adpb_rsu = NULL;
+	free( adpb_rmask ); adpb_rmask = NULL;
+	free( gen_bm ); gen_bm = NULL; gen_bmcap = 0;
 	free( adpb_bw ); adpb_bw = NULL;
 	free( adpb_bmi ); adpb_bmi = NULL;
 	free( adpb_bmpi ); adpb_bmpi = NULL;
@@ -1770,13 +2157,15 @@ static int Adp_tiled( int lgth1, int lgth2, int lasti, double **n_dynamicmtx, do
 {
 	adpb_t *p;
 	dphelpjob_t job;
-	int nrows = lasti - 1, nb, b, i, idle, maxb;
+	int nrows = lasti - 1, nb, b, i, idle, maxb, ks, minw;
+	adpb_letters_t letters;
 	double cells = (double)nrows * lgth2;
 
 	if( adpb_minwidth < 0 )
 	{
 #ifdef PROGTIMING
 		char *e; // tuning and test switches of the timing builds
+		adpb_widthset = ( getenv( "MAFFT_TILEWIDTH" ) != NULL );
 		adpb_minwidth = ( e = getenv( "MAFFT_TILEWIDTH" ) ) ? atoi( e ) : 384;
 		adpb_mincells = ( e = getenv( "MAFFT_TILEMINCELLS" ) ) ? atoi( e ) : 2000000;
 		adpb_force = getenv( "MAFFT_TILEFORCE" ) != NULL; // testing: tile even without helpers
@@ -1787,39 +2176,47 @@ static int Adp_tiled( int lgth1, int lgth2, int lasti, double **n_dynamicmtx, do
 		adpb_force = 0;
 #endif
 	}
-	if( nrows < 2 || lgth2 < 2 * adpb_minwidth || cells < adpb_mincells || dense_nu < 0 ) return( 0 );
+	if( nrows < 2 || cells < adpb_mincells || dense_nu < 0 ) return( 0 );
 	idle = dphelp_idle();
 	if( idle <= 0 && !adpb_force ) return( 0 );
+	/* work/prog3: narrower bands when many threads are idle (the merges at the top of the tree, which
+	   often have only ~1500 columns on the band side: 384-column bands allowed only 4 participants) */
+	minw = adpb_minwidth;
+	if( !adpb_widthset ) { if( idle >= 12 ) minw = 128; else if( idle >= 4 ) minw = 192; }
+	if( lgth2 < 2 * minw ) return( 0 );
 
-	maxb = MIN( ADPB_MAXB, lgth2 / adpb_minwidth );
+	maxb = MIN( ADPB_MAXB, lgth2 / minw );
 	nb = MIN( maxb, 3 * ( 1 + MAX( idle, 1 ) ) );
 	if( nb < 2 ) return( 0 );
 
+	ks = MAX( 1, dense_nu );
 	if( nrows + 1 > adpb_rowcap )
 	{
-		free( adpb_rs ); free( adpb_rc );
+		free( adpb_rs ); free( adpb_rc ); free( adpb_rn ); free( adpb_rsu ); free( adpb_rmask );
 		adpb_rowcap = nrows + 1 + ( nrows + 1 ) / 2;
 		adpb_rs = malloc( sizeof( double ) * 4 * adpb_rowcap );
 		adpb_rc = malloc( sizeof( double * ) * 4 * adpb_rowcap );
+		adpb_rn = malloc( sizeof( int ) * adpb_rowcap );
+		adpb_rsu = malloc( sizeof( double ) * DENSE_MAXU * adpb_rowcap );
+		adpb_rmask = malloc( sizeof( unsigned int ) * adpb_rowcap );
 	}
-	/* the row scores and profile columns of each row, selected exactly as in the serial loop */
-	for( i=1; i<=nrows; i++ )
+	letters.nu = dense_nu; letters.n1 = dense1_n;
+	memcpy( letters.u, dense_u, sizeof( int ) * dense_nu );
+	memcpy( letters.k1, dense1_k, sizeof( int ) * dense1_n );
+	/* the row scores and profile columns of each row, selected exactly as in the serial loop
+	   (work/prog3: rows with more than 4 letters take the general kernel, as rowfused == 2 there).
+	   work/prog3: they are formed by band 0 just before it processes the row (adpb_rowsetup), off the
+	   setup path; only the timing builds' A/B switch MAFFT_NOGENERAL needs them all in advance. */
 	{
-		double scu[DENSE_MAXU];
-		int u, nsel = 0;
-		dense_scores1( n_dynamicmtx, cpmx1, i, scu );
-		for( u=0; u<dense_nu; u++ )
+		int u;
+		if( !adp_general_on() )
+			for( i=1; i<=nrows; i++ )
+				if( adpb_rowsetup( n_dynamicmtx, cpmx1, cpmx2, i, ks, adpb_rs, adpb_rc, adpb_rn, adpb_rsu, adpb_rmask, &letters ) > 4 ) return( 0 );
+		if( dense_nu > 4 ) // some row may take the general kernel
 		{
-			if( scu[u] == 0.0 ) continue;
-			if( nsel == 4 ) return( 0 ); // not fusable: the caller runs its own loop
-			adpb_rs[4*i+nsel] = scu[u];
-			adpb_rc[4*i+nsel] = cpmx2[dense_u[u]];
-			nsel++;
-		}
-		for( ; nsel<4; nsel++ )
-		{
-			adpb_rs[4*i+nsel] = 0.0;
-			adpb_rc[4*i+nsel] = cpmx2[0];
+			for( u=0; u<dense_nu; u++ ) adpb_cu[u] = cpmx2[dense_u[u]];
+			if( lgth2 / 4 + 2 > gen_bmcap ) { free( gen_bm ); gen_bmcap = lgth2 / 4 + 2 + lgth2 / 8; gen_bm = malloc( sizeof( unsigned int ) * gen_bmcap ); }
+			Adp_blockmasks( gen_bm, (const double * const *)adpb_cu, dense_nu, lgth2 );
 		}
 	}
 	if( (size_t)nb * ( nrows + 1 ) > (size_t)adpb_bcap )
@@ -1840,7 +2237,10 @@ static int Adp_tiled( int lgth1, int lgth2, int lasti, double **n_dynamicmtx, do
 	p->m = m; p->mp = mp; p->ijp = ijp;
 	p->gf1 = gf1; p->gf2 = gf2; p->fgcp1 = fgcp1; p->ogcp1 = ogcp1; p->fgcp2 = fgcp2; p->ogcp2 = ogcp2;
 	p->initverticalw = initverticalw; p->lastverticalw = lastverticalw;
-	p->rs = adpb_rs; p->rc = adpb_rc;
+	p->rs = adpb_rs; p->rc = adpb_rc; p->rn = adpb_rn; p->ks = ks;
+	p->rsu = adpb_rsu; p->rmask = adpb_rmask; p->cu = (const double * const *)adpb_cu; p->bm = gen_bm;
+	p->lazyrows = adp_general_on(); p->dynmtx = n_dynamicmtx; p->cpmx1 = cpmx1; p->cpmx2 = cpmx2;
+	p->letters = letters;
 	p->fpenalty_ex = fpenalty_ex;
 	p->bw = adpb_bw; p->bmi = adpb_bmi; p->bmpi = adpb_bmpi;
 	for( b=1; b<nb; b++ ) p->bw[b*(nrows+1)+0] = w0[p->J[b]-1]; // row 0, last column of band b-1
@@ -2310,10 +2710,16 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 	int *warpipt, *warpjpt;
 	char *gt1, *gt2, *gt1bk, *gt2bk;
 	int usefused, rowfused;
+	a_lazy_t lz; // work/prog3
 	int sparse2_ready = 1; // work/prog2: match_calc's sparse tables of cpmx2 are built
 	int inplace = 0;       // work/prog2: the result rows were written in place (no mseq)
 	double fsel_s[4];
 	double *fsel_c[4];
+	double fsel_su[DENSE_MAXU]; // work/prog3: the row scores of every letter of the profile
+	unsigned int fsel_mask = 0;
+	int fsel_n = 0;
+	double *gen_cu[DENSE_MAXU];
+	int gen_ready = 0;
 	PT_DECL;
 
 //	for( i=0; i<icyc; i++ ) fprintf( stderr, "%s, %f\n", seq1[i], eff1[i] );
@@ -2376,8 +2782,19 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 
 
 	PT_START();
-	lgth1 = strlen( seq1[0] );
-	lgth2 = strlen( seq2[0] );
+	/* work/prog3: lazy gap insertion (lazygap.h); a stale side's rows are neither read nor written */
+	lz = A_lz;
+	A_lz.on = 0;
+	if( !lz.on ) { lz.stale[0] = lz.stale[1] = lz.defer[0] = lz.defer[1] = 0; }
+	lgth1 = lz.stale[0] ? lz.len[0] : strlen( seq1[0] );
+	lgth2 = lz.stale[1] ? lz.len[1] : strlen( seq2[0] );
+	if( lz.on && ( lgth1 == 0 || lgth2 == 0 || trywarp || constraint || !cpmxresult || specificityconsideration != 0.0
+	           || ( lz.stale[0] && !( cpmxchild0 && *cpmxchild0 ) ) || ( lz.stale[1] && !( cpmxchild1 && *cpmxchild1 ) ) ) )
+	{
+		reporterr( "\nA__align: unsupported lazy-gap request (lgth %d %d)\n", lgth1, lgth2 ); // the caller checks all of these
+		exit( 1 );
+	}
+	if( lz.on ) { lz.defer[0] |= lz.stale[0]; lz.defer[1] |= lz.stale[1]; }
 #if 0
 	if( lgth1 == 0 || lgth2 == 0 )
 	{
@@ -2555,12 +2972,12 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 	for( i=0; i<icyc; i++ )
 	{
 		if( mseq ) mseq1[i] = mseq[i];
-		seq1[i][lgth1] = 0;
+		if( !lz.stale[0] ) seq1[i][lgth1] = 0;
 	}
 	for( j=0; j<jcyc; j++ )
 	{
 		if( mseq ) mseq2[j] = mseq[icyc+j];
-		seq2[j][lgth2] = 0;
+		if( !lz.stale[1] ) seq2[j][lgth2] = 0;
 	}
 
 
@@ -3089,27 +3506,45 @@ for( i=0; i<lgth2; i++ )
 			/* Letters whose row score is exactly 0.0 (e.g. the gap letter, which scores 0 against
 			   everything) only add exact zeros to the match sums, so they are dropped; if at most 4
 			   letters remain, the fused kernel is used, padded with 0.0 * (weights >= 0) terms,
-			   which are exact no-ops as well (see match_calc_dense). */
-			double scu[DENSE_MAXU];
-			int u, nsel = 0;
-			dense_scores1( n_dynamicmtx, *cpmx1pt, i, scu );
+			   which are exact no-ops as well (see match_calc_dense).  work/prog3: otherwise the
+			   general kernel (Adp_row_denseK) takes the row with all its letters (rowfused = 2). */
+			int u;
+			fsel_n = 0;
+			fsel_mask = 0;
+			dense_scores1( n_dynamicmtx, *cpmx1pt, i, fsel_su );
 			for( u=0; u<dense_nu; u++ )
 			{
-				if( scu[u] == 0.0 ) continue;
-				if( nsel == 4 ) { nsel = 5; break; }
-				fsel_s[nsel] = scu[u];
-				fsel_c[nsel] = (*cpmx2pt)[dense_u[u]];
-				nsel++;
-			}
-			if( nsel <= 4 )
-			{
-				for( ; nsel<4; nsel++ )
+				if( fsel_su[u] == 0.0 ) continue;
+				if( fsel_n < 4 )
 				{
-					fsel_s[nsel] = 0.0;
-					fsel_c[nsel] = (*cpmx2pt)[0];
+					fsel_s[fsel_n] = fsel_su[u];
+					fsel_c[fsel_n] = (*cpmx2pt)[dense_u[u]];
+				}
+				fsel_mask |= 1u << u;
+				fsel_n++;
+			}
+			if( fsel_n <= 4 )
+			{
+				for( u=fsel_n; u<4; u++ )
+				{
+					fsel_s[u] = 0.0;
+					fsel_c[u] = (*cpmx2pt)[0];
 				}
 				rowfused = 1;
 			}
+			else if( adp_general_on() )
+			{
+				rowfused = 2;
+				if( !gen_ready ) // the profile's letter lists (once per call)
+				{
+					for( u=0; u<dense_nu; u++ ) gen_cu[u] = (*cpmx2pt)[dense_u[u]];
+					if( lgth2 / 4 + 2 > gen_bmcap ) { free( gen_bm ); gen_bmcap = lgth2 / 4 + 2 + lgth2 / 8; gen_bm = malloc( sizeof( unsigned int ) * gen_bmcap ); }
+					Adp_blockmasks( gen_bm, (const double * const *)gen_cu, dense_nu, lgth2 );
+					gen_ready = 1;
+				}
+			}
+			else
+				rowfused = 0;
 		}
 
 #ifdef PROGTIMING
@@ -3226,6 +3661,10 @@ fprintf( stderr, "\n" );
 				memcpy( chk_mp, mp, sizeof( int ) * ( lastj ) );
 				memcpy( chk_cur, currentw, sizeof( double ) * ( lastj ) );
 				t0 = pt_now();
+				if( rowfused == 2 )
+					Adp_row_denseK( i, lgth2, fsel_mask, fsel_su, (const double * const *)gen_cu, gen_bm, chk_m, chk_mp, chk_cur, chk_ijp, previousw, gapfreq2pt, fgcp2, ogcp2,
+						fgcp1va, ogcp1va, gf1va, gf1vapre, fpenalty_ex, &chk_mi, &chk_mpi, &chk_wm );
+				else
 				Adp_row_fused4( i, lgth2, chk_m, chk_mp, chk_cur, chk_ijp, previousw, gapfreq2pt, fgcp2, ogcp2,
 					fsel_c[0], fsel_c[1], fsel_c[2], fsel_c[3], fsel_s,
 					fgcp1va, ogcp1va, gf1va, gf1vapre, fpenalty_ex, &chk_mi, &chk_mpi, &chk_wm );
@@ -3238,6 +3677,10 @@ fprintf( stderr, "\n" );
 			}
 			{ double _f0 = pt_now();
 #endif
+			if( rowfused == 2 ) // work/prog3
+				Adp_row_denseK( i, lgth2, fsel_mask, fsel_su, (const double * const *)gen_cu, gen_bm, m, mp, currentw, ijp[i], previousw, gapfreq2pt, fgcp2, ogcp2,
+					fgcp1va, ogcp1va, gf1va, gf1vapre, fpenalty_ex, &mi, &mpi, &wm );
+			else
 			Adp_row_fused4( i, lgth2, m, mp, currentw, ijp[i], previousw, gapfreq2pt, fgcp2, ogcp2,
 				fsel_c[0], fsel_c[1], fsel_c[2], fsel_c[3], fsel_s,
 				fgcp1va, ogcp1va, gf1va, gf1vapre, fpenalty_ex, &mi, &mpi, &wm );
@@ -3465,7 +3908,9 @@ fprintf( stderr, "\n" );
 		   in place below (gapireru_inplace), instead of into mseq1/mseq2 followed by a strcpy back.
 		   Rows without inserted gaps (ngap == 0) are left as they are: the original copied them to
 		   mseq and back unchanged. */
+		if( lz.on ) { atr_len1 = lgth1; atr_len2 = lgth2; }
 		wmo = Atracking( currentw, lastverticalw, fpenalty, fpenalty_ex, seq1, seq2, NULL, NULL, ijp, icyc, jcyc, tailgp, warpis, warpjs, warpbase, &ngap1, &ngap2, reuseprofiles, &gt1, &gt2 );
+		atr_len1 = atr_len2 = -1;
 		if( !tailgp ) wm = wmo;
 		inplace = 1;
 		{
@@ -3476,8 +3921,16 @@ fprintf( stderr, "\n" );
 				fprintf( stderr, "alloclen=%d, resultlen=%d, N=%d\n", alloclen, resultlen, N );
 				ErrorExit( "LENGTH OVER!\n" );
 			}
-			if( ngap1 ) gapexp_all( seq1, icyc, gt1, lgth1, lnew1 );
-			if( ngap2 ) gapexp_all( seq2, jcyc, gt2, lgth2, lnew2 );
+			if( lz.on ) // work/prog3: hand deferred gap tables to the caller (lazygap.h)
+			{
+				A_lz.outlen = lnew1;
+				A_lz.used = 1;
+				A_lz.outgt[0] = A_lz.outgt[1] = NULL;
+				if( lz.defer[0] && ngap1 ) { A_lz.outgt[0] = malloc( lnew1 + 1 ); memcpy( A_lz.outgt[0], gt1, lnew1 ); A_lz.outgt[0][lnew1] = 0; }
+				if( lz.defer[1] && ngap2 ) { A_lz.outgt[1] = malloc( lnew2 + 1 ); memcpy( A_lz.outgt[1], gt2, lnew2 ); A_lz.outgt[1][lnew2] = 0; }
+			}
+			if( ngap1 && !lz.defer[0] ) gapexp_all( seq1, icyc, gt1, lgth1, lnew1 );
+			if( ngap2 && !lz.defer[1] ) gapexp_all( seq2, jcyc, gt2, lgth2, lnew2 );
 		}
 	}
 

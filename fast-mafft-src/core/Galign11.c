@@ -1079,7 +1079,152 @@ static void Gdp_row_fast( int i, int lastj, int lgth2, double * restrict colw, i
 		ijpi[j] = ijv; \
 	}
 
-static void Gdp_row_fused( int i, int lgth2, const double * restrict mrow, const unsigned char * restrict s2,
+/* work/prog3: GDP_CELL( 0, 1 ) with the match score given (prow[j] == mrow[s2[j]]) */
+#define GDP_CELL_P( PEXPR ) \
+	{ \
+		double mj = mloc[j], pw = prew[j-1], base, cw, mnew, gg, pc; \
+		int mpj = mploc[j], cij, take, ijv, take2; \
+		base = (PEXPR); \
+		cw = mj + fpenalty; \
+		cij = i - mpj; \
+		take = ( pw >= mj ); \
+		mnew = take ? pw : mj; \
+		mnew += fpenalty_ex; \
+		mloc[j] = mnew; \
+		mploc[j] = take ? i-1 : mpj; \
+		wmv = pw; \
+		ijv = 0; \
+		gg = mil + fpenalty; \
+		if( gg > wmv ) { wmv = gg; ijv = -( j - mpil ); } \
+		pc = pw + fpenalty_ex_i; \
+		take2 = ( pc >= mil ); \
+		mil = take2 ? pc : mil; \
+		mpil = take2 ? j-1 : mpil; \
+		take = ( cw > wmv ); \
+		ijv = take ? cij : ijv; \
+		wmv = take ? cw : wmv; \
+		curw[j] = base + wmv; \
+		ijpi[j] = ijv; \
+	}
+
+static void Gdp_cells_scalar( int i, int ja, int jb, const double * restrict prow,
+	double * restrict mloc, int * restrict mploc, double * restrict curw, int * restrict ijpi,
+	const double * restrict prew, double fpenalty, double fpenalty_ex, double fpenalty_ex_i,
+	double *mip, int *mpip, double *wmp )
+{
+	double mil = *mip, wmv = *wmp;
+	int mpil = *mpip, j;
+	for( j=ja; j<jb; j++ )
+		GDP_CELL_P( prow[j] )
+	*mip = mil;
+	*mpip = mpil;
+	*wmp = wmv;
+}
+
+#if defined( __aarch64__ ) || defined( __ARM_NEON ) || defined( __x86_64__ ) || defined( __i386__ )
+#define GDPV_HAVE 1
+#if ( defined( __x86_64__ ) || defined( __i386__ ) ) && !defined( __AVX2__ ) && ( defined( __GNUC__ ) || defined( __clang__ ) )
+#define GDPV_X86DISPATCH 1
+#define GDPV_ATTR4 __attribute__(( target( "avx2" ) ))
+#else
+#define GDPV_ATTR4
+#endif
+#define GDPV_NAME Gdp_cells_v2
+#define GDPV_VB 16
+#define GDPV_ATTR
+#include "gdpvec_body.h"
+#undef GDPV_NAME
+#undef GDPV_VB
+#undef GDPV_ATTR
+#define GDPV_NAME Gdp_cells_v4
+#define GDPV_VB 32
+#define GDPV_ATTR GDPV_ATTR4
+#include "gdpvec_body.h"
+#undef GDPV_NAME
+#undef GDPV_VB
+#undef GDPV_ATTR
+#endif
+
+typedef void (*gdp_cells_fn)( int, int, int, const double *, double *, int *, double *, int *, const double *, double, double, double, double *, int *, double * );
+static gdp_cells_fn gdp_cells = NULL;
+static gdp_cells_fn gdp_cells_get( void ) // MAFFT_ADPVEC as in Salignmm.c (0 scalar, 2, 4; default: 4 on x86 with AVX2, 2 on other x86, scalar on ARM)
+{
+	gdp_cells_fn f = __atomic_load_n( &gdp_cells, __ATOMIC_ACQUIRE );
+	if( f == NULL )
+	{
+		char *e = getenv( "MAFFT_ADPVEC" );
+		int w = e ? atoi( e ) : -1;
+		f = Gdp_cells_scalar;
+#ifdef GDPV_HAVE
+		if( w < 0 )
+		{
+#if defined( __x86_64__ ) || defined( __i386__ )
+#ifdef GDPV_X86DISPATCH
+			__builtin_cpu_init();
+			w = __builtin_cpu_supports( "avx2" ) ? 4 : 2;
+#else
+			w = 4;
+#endif
+#else
+			w = 0;
+#endif
+		}
+#ifdef GDPV_X86DISPATCH
+		if( w == 4 ) { __builtin_cpu_init(); if( !__builtin_cpu_supports( "avx2" ) ) w = 2; }
+#endif
+		if( w == 2 ) f = Gdp_cells_v2;
+		else if( w == 4 ) f = Gdp_cells_v4;
+#endif
+		__atomic_store_n( &gdp_cells, f, __ATOMIC_RELEASE );
+	}
+	return( f );
+}
+
+#ifdef PROGTIMING
+static int g_veccheck_v = -1;
+static TLS double *gvc_m = NULL, *gvc_cur = NULL; static TLS int *gvc_mp = NULL, *gvc_ijp = NULL; static TLS int gvc_cap = 0;
+static long gvc_ranges = 0, gvc_cells = 0;
+static void gvc_report( void ) __attribute__(( destructor ));
+static void gvc_report( void ) { if( g_veccheck_v > 0 ) reporterr( "\nVECCHECK(G): %ld cell ranges, %ld cells verified, no mismatch\n", gvc_ranges, gvc_cells ); }
+#endif
+
+static inline void Gdp_cells( int i, int ja, int jb, const double * restrict prow,
+	double * restrict mloc, int * restrict mploc, double * restrict curw, int * restrict ijpi,
+	const double * restrict prew, double fpenalty, double fpenalty_ex, double fpenalty_ex_i,
+	double *mip, int *mpip, double *wmp )
+{
+	gdp_cells_fn f = gdp_cells_get();
+#ifdef PROGTIMING
+	if( g_veccheck_v < 0 ) g_veccheck_v = ( getenv( "MAFFT_VECCHECK" ) != NULL );
+	if( g_veccheck_v && jb > ja ) // MAFFT_VECCHECK: the scalar kernel on shadow copies, compared bitwise
+	{
+		double mi2 = *mip, wm2 = *wmp; int mpi2 = *mpip;
+		if( jb + 1 > gvc_cap )
+		{
+			gvc_cap = jb + 1 + jb / 2;
+			gvc_m = realloc( gvc_m, sizeof( double ) * gvc_cap ); gvc_cur = realloc( gvc_cur, sizeof( double ) * gvc_cap );
+			gvc_mp = realloc( gvc_mp, sizeof( int ) * gvc_cap ); gvc_ijp = realloc( gvc_ijp, sizeof( int ) * gvc_cap );
+		}
+		memcpy( gvc_m + ja, mloc + ja, sizeof( double ) * ( jb - ja ) );
+		memcpy( gvc_mp + ja, mploc + ja, sizeof( int ) * ( jb - ja ) );
+		Gdp_cells_scalar( i, ja, jb, prow, gvc_m, gvc_mp, gvc_cur, gvc_ijp, prew, fpenalty, fpenalty_ex, fpenalty_ex_i, &mi2, &mpi2, &wm2 );
+		f( i, ja, jb, prow, mloc, mploc, curw, ijpi, prew, fpenalty, fpenalty_ex, fpenalty_ex_i, mip, mpip, wmp );
+		if( memcmp( gvc_m + ja, mloc + ja, sizeof( double ) * ( jb - ja ) ) || memcmp( gvc_mp + ja, mploc + ja, sizeof( int ) * ( jb - ja ) )
+		 || memcmp( gvc_cur + ja, curw + ja, sizeof( double ) * ( jb - ja ) ) || memcmp( gvc_ijp + ja, ijpi + ja, sizeof( int ) * ( jb - ja ) )
+		 || memcmp( &mi2, mip, sizeof( double ) ) || mpi2 != *mpip || memcmp( &wm2, wmp, sizeof( double ) ) )
+		{
+			reporterr( "\nVECCHECK MISMATCH in G__align11 row %d, cells %d..%d\n", i, ja, jb-1 );
+			exit( 1 );
+		}
+		__atomic_add_fetch( &gvc_ranges, 1, __ATOMIC_RELAXED );
+		__atomic_add_fetch( &gvc_cells, (long)( jb - ja ), __ATOMIC_RELAXED );
+		return;
+	}
+#endif
+	f( i, ja, jb, prow, mloc, mploc, curw, ijpi, prew, fpenalty, fpenalty_ex, fpenalty_ex_i, mip, mpip, wmp );
+}
+
+static void Gdp_row_fused( int i, int lgth2, const double * restrict mrow, const unsigned char * restrict s2, const double * restrict prow,
 	double * restrict mloc, int * restrict mploc, double * restrict curw, int * restrict ijpi,
 	const double * restrict prew, double fpenalty, double fpenalty_ex, double fpenalty_ex_i,
 	double *mip, int *mpip, double *wmp )
@@ -1089,6 +1234,12 @@ static void Gdp_row_fused( int i, int lgth2, const double * restrict mrow, const
 	int mpil = *mpip, j;
 	j = 1;
 	GDP_CELL( 1, 1 )
+	if( prow ) // work/prog3: the inner cells from the letter's precomputed match row, vectorized
+	{
+		if( lgth2 > 2 )
+			Gdp_cells( i, 2, lgth2, prow, mloc, mploc, curw, ijpi, prew, fpenalty, fpenalty_ex, fpenalty_ex_i, &mil, &mpil, &wmv );
+	}
+	else
 	for( j=2; j<lgth2; j++ )
 		GDP_CELL( 0, 1 )
 	j = lgth2;
@@ -1122,6 +1273,9 @@ double G__align11( double **n_dynamicmtx, char **seq1, char **seq2, int alloclen
 	double fpenalty = (double)penalty;
 	double fpenalty_shift = (double)penalty_shift;
 	int gfused; // work/prog2
+	static TLS double *gpbuf = NULL; static TLS size_t gpcap = 0; // work/prog3
+	int gpidx[0x100], gpstride = 0;
+	double *gprow = NULL;
 	double fpenalty_tmp;
 #if USE_PENALTY_EX
 	double fpenalty_ex = (double)penalty_ex;
@@ -1469,6 +1623,26 @@ fprintf( stderr, "\n" );
 #endif
 
 	gfused = ( !trywarp && FASTDP_ON && fpenalty_ex == 0.0 && lgth2 >= 2 ); // work/prog2: Gdp_row_fused
+	/* work/prog3: for the vector kernels, the match row of every letter of seq1 against seq2
+	   (gprow + gpidx[letter] * gpstride; the same values as amino_dynamicmtx[letter][seq2[j]]) */
+	gprow = NULL;
+	if( gfused && gdp_cells_get() != Gdp_cells_scalar && lgth2 > 2 )
+	{
+		int nl = 0, c;
+		for( c=0; c<0x100; c++ ) gpidx[c] = -1;
+		for( i=1; i<=lgth1; i++ ) { c = (unsigned char)seq1[0][i]; if( gpidx[c] < 0 ) gpidx[c] = nl++; } // rows 1..lasti-1 (lasti <= lgth1+1; seq1[0][lgth1] is the terminator, as in match_calc_mtx)
+		gpstride = lgth2 + 4;
+		if( (size_t)nl * gpstride > gpcap ) { free( gpbuf ); gpcap = (size_t)nl * gpstride + gpstride * 4; gpbuf = malloc( sizeof( double ) * gpcap ); }
+		for( c=0; c<0x100; c++ )
+			if( gpidx[c] >= 0 )
+			{
+				const double *mr = amino_dynamicmtx[c];
+				double *pr = gpbuf + (size_t)gpidx[c] * gpstride;
+				const unsigned char *s2 = (const unsigned char *)seq2[0];
+				for( j=0; j<lgth2; j++ ) pr[j] = mr[s2[j]];
+			}
+		gprow = gpbuf;
+	}
 	for( i=1; i<lasti; i++ )
 	{
 		wtmp = previousw; 
@@ -1536,7 +1710,7 @@ fprintf( stderr, "\n" );
 				memcpy( g_chk_cur, currentw, sizeof( double ) * lastj );
 				t0 = pt_now();
 				if( gfused )
-					Gdp_row_fused( i, lgth2, amino_dynamicmtx[(unsigned char)seq1[0][i]], (const unsigned char *)seq2[0], g_chk_m, g_chk_mp, g_chk_cur, g_chk_ijp, previousw, fpenalty, fpenalty_ex, fpenalty_ex_i, &g_chk_mi, &g_chk_mpi, &g_chk_wm );
+					Gdp_row_fused( i, lgth2, amino_dynamicmtx[(unsigned char)seq1[0][i]], (const unsigned char *)seq2[0], gprow ? gprow + (size_t)gpidx[(unsigned char)seq1[0][i]] * gpstride : NULL, g_chk_m, g_chk_mp, g_chk_cur, g_chk_ijp, previousw, fpenalty, fpenalty_ex, fpenalty_ex_i, &g_chk_mi, &g_chk_mpi, &g_chk_wm );
 				else
 					Gdp_row_fast( i, lastj, lgth2, dpcolw, dpcolij, dpcolg2, g_chk_m, g_chk_mp, g_chk_cur, g_chk_ijp, previousw, fpenalty, fpenalty_ex, fpenalty_ex_i, &g_chk_mi, &g_chk_mpi, &g_chk_wm );
 				t1 = pt_now();
@@ -1546,7 +1720,7 @@ fprintf( stderr, "\n" );
 			}
 #endif
 			if( gfused )
-				Gdp_row_fused( i, lgth2, amino_dynamicmtx[(unsigned char)seq1[0][i]], (const unsigned char *)seq2[0], m, mp, currentw, ijp[i], previousw, fpenalty, fpenalty_ex, fpenalty_ex_i, &mi, &mpi, &wm );
+				Gdp_row_fused( i, lgth2, amino_dynamicmtx[(unsigned char)seq1[0][i]], (const unsigned char *)seq2[0], gprow ? gprow + (size_t)gpidx[(unsigned char)seq1[0][i]] * gpstride : NULL, m, mp, currentw, ijp[i], previousw, fpenalty, fpenalty_ex, fpenalty_ex_i, &mi, &mpi, &wm );
 			else
 				Gdp_row_fast( i, lastj, lgth2, dpcolw, dpcolij, dpcolg2, m, mp, currentw, ijp[i], previousw, fpenalty, fpenalty_ex, fpenalty_ex_i, &mi, &mpi, &wm );
 			lastverticalw[i] = currentw[lgth2-1]; // lgth2==0 no toki error

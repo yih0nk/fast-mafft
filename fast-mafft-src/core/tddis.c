@@ -533,12 +533,15 @@ int fastconjuction_noname( int *memlist, char **seq, char **aseq, double *peff, 
 	for( k=0; *memlist!=-1; memlist++, k++ )
 	{
 		m = *memlist;
+		if( dln < 100 ) // work/prog3: d stops growing at 100 characters, so the rest of the sprintf calls changed nothing
+		{
 		dln += sprintf( b, " %d", m+1 ); 
 #if 1
 		if( dln < 100 ) strcat( d, b );
 #else
 		strcat( d, b );
 #endif
+		}
 		aseq[k] = seq[m];
 		if( eff[m] < mineff )
 			peff[k] = mineff;

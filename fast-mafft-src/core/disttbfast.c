@@ -3,6 +3,7 @@
 #endif
 #include "mltaln.h"
 #include "progtiming.h"
+#include "lazygap.h"
 #include "dphelp.h"
 #ifdef PROGTIMING
 typedef struct { int l, thread, clus1, clus2, len1, len2, c0, c1; double t[8]; double acc[PT_NACC]; } ptrec_t;
@@ -168,6 +169,11 @@ typedef struct _treebasethread_arg
 	// work/prog: guards the rows of aseq against ReallocateCharMtx (write lock) while member rows
 	// are copied in and out (read lock), so those copies no longer hold the global mutex
 	pthread_rwlock_t *aseqlock;
+	// work/prog3: the steps work on the rows of aseq in place (no local copies); each row grows on
+	// its own when a step that owns it needs more room (rowcap: allocated bytes of each row)
+	int *rowcap;
+	int nocopy;
+	struct _lzstate *lz; // work/prog3: deferred gap insertion (lazygap.h), NULL = off
 } treebasethread_arg_t;
 
 typedef struct _distancematrixthread_arg
@@ -3972,6 +3978,222 @@ static void tbsched_done( tbsched_t *sc, Treedep *dep, int l ) // call with the 
 	if( p != -1 && tbsched_isready( dep, p ) ) tbsched_push( sc, p );
 }
 
+/* work/prog3: deferred gap insertion (see lazygap.h).
+   op[c]    gap table that the parent of step c returned instead of inserting it into the rows of
+            group c (to be applied after everything pending inside c's subtree), or NULL
+   stale[c] some table is pending inside c's subtree (the rows of group c are not current)
+   len[c]   logical length of the rows of group c (what strlen would give if they were current)
+   Rows of single sequences are always current: their side's gaps are inserted directly. */
+typedef struct { char *gt; int lin, lout; } lzop_t;
+typedef struct _lzstate
+{
+	lzop_t **op;
+	char *stale;
+	int *len;
+	int nstep;
+	char **shadow; // MAFFT_LAZYCHECK (timing builds): every row with all of its gaps applied at once
+	int *shadowcap;
+} lzstate_t;
+
+static lzstate_t *lz_new( int njob, char **aseq, int check )
+{
+	lzstate_t *z = calloc( 1, sizeof( lzstate_t ) );
+	int i;
+	z->nstep = njob - 1;
+	z->op = calloc( njob, sizeof( lzop_t * ) );
+	z->stale = calloc( njob, sizeof( char ) );
+	z->len = calloc( njob, sizeof( int ) );
+	if( check )
+	{
+		z->shadow = calloc( njob, sizeof( char * ) );
+		z->shadowcap = calloc( njob, sizeof( int ) );
+		for( i=0; i<njob; i++ ) { z->shadowcap[i] = strlen( aseq[i] ) + 1; z->shadow[i] = malloc( z->shadowcap[i] ); strcpy( z->shadow[i], aseq[i] ); }
+	}
+	return( z );
+}
+
+static void lz_reset( lzstate_t *z, int njob, char **aseq ) // after an abandoned attempt (rows restored)
+{
+	int i;
+	for( i=0; i<z->nstep; i++ )
+	{
+		if( z->op[i] ) { free( z->op[i]->gt ); free( z->op[i] ); z->op[i] = NULL; }
+		z->stale[i] = 0; z->len[i] = 0;
+	}
+	if( z->shadow )
+		for( i=0; i<njob; i++ )
+		{
+			int n = strlen( aseq[i] ) + 1;
+			if( n > z->shadowcap[i] ) { z->shadow[i] = realloc( z->shadow[i], n ); z->shadowcap[i] = n; }
+			strcpy( z->shadow[i], aseq[i] );
+		}
+}
+
+static void lz_free( lzstate_t *z, int njob )
+{
+	int i;
+	if( z == NULL ) return;
+	for( i=0; i<z->nstep; i++ ) if( z->op[i] ) { free( z->op[i]->gt ); free( z->op[i] ); }
+	free( z->op ); free( z->stale ); free( z->len );
+	if( z->shadow ) { for( i=0; i<njob; i++ ) free( z->shadow[i] ); free( z->shadow ); free( z->shadowcap ); }
+	free( z );
+}
+
+/* insert the gaps of gt (lnew entries, 'o' = next residue, '-' = gap) into s, which holds lori chars,
+   in place from the end (the same as gapireru_inplace in Salignmm.c) */
+static void lz_gapins( char *s, int lori, const char *gt, int lnew )
+{
+	const char gapchar = '-';
+	int p, q = lori - 1;
+	s[lnew] = 0;
+	for( p=lnew-1; p>=0; p-- )
+		s[p] = ( gt[p] == '-' ) ? gapchar : s[q--];
+}
+
+/* the table that applies op first and then comp (comp: lcomp entries over op->lout chars) */
+static char *lz_compose( const char *comp, int lcomp, const lzop_t *op )
+{
+	char *out = malloc( lcomp + 1 );
+	int p, q = 0;
+	for( p=0; p<lcomp; p++ )
+		out[p] = ( comp[p] == '-' ) ? '-' : op->gt[q++];
+	out[lcomp] = 0;
+	if( q != op->lout ) { reporterr( "\nlz_compose: %d != %d\n", q, op->lout ); exit( 1 ); }
+	return( out );
+}
+
+typedef struct { int row; const char *gt; int lin, lout; } lzapp_t;
+typedef struct { char **aseq; int *rowcap; int need; lzapp_t *app; } lzappctx_t;
+static void lz_apply_rows( void *vctx, int lo, int hi )
+{
+	lzappctx_t *c = (lzappctx_t *)vctx;
+	int k;
+	for( k=lo; k<hi; k++ )
+	{
+		lzapp_t *a = c->app + k;
+		if( c->rowcap[a->row] < c->need )
+		{
+			c->aseq[a->row] = realloc( c->aseq[a->row], c->need );
+			if( c->aseq[a->row] == NULL ) ErrorExit( "Cannot reallocate a row (lazy gaps).\n" );
+			c->rowcap[a->row] = c->need;
+		}
+#ifdef PROGTIMING
+		if( (int)strlen( c->aseq[a->row] ) != a->lin ) { reporterr( "\nlazy gaps: row %d has %d characters, its table expects %d\n", a->row, (int)strlen( c->aseq[a->row] ), a->lin ); exit( 1 ); }
+#endif
+		lz_gapins( c->aseq[a->row], a->lin, a->gt, a->lout );
+	}
+}
+
+/* bring the rows of group x (step x) up to date: every table pending inside x's subtree, composed
+   per row (deepest first) and inserted once.  need: row size to guarantee (> the new length). */
+static void lz_materialize( lzstate_t *z, int x, Treedep *dep, int ***topol, char **aseq, int *rowcap, int need )
+{
+	typedef struct { int node; char *comp; int lcomp, lin; } fr_t; // lin: the input length of comp
+	fr_t *stk;
+	int nstk = 0, capstk = 64, napp = 0, capapp = 64, nown = 0, capown = 64, k, s;
+	lzapp_t *app;
+	char **own; // composed tables to free at the end
+	int *usedop, nused = 0, capused = 64;
+	if( !z->stale[x] ) return;
+	stk = malloc( sizeof( fr_t ) * capstk );
+	app = malloc( sizeof( lzapp_t ) * capapp );
+	own = malloc( sizeof( char * ) * capown );
+	usedop = malloc( sizeof( int ) * capused );
+	stk[nstk].node = x; stk[nstk].comp = NULL; stk[nstk].lcomp = 0; stk[nstk].lin = 0; nstk++;
+	while( nstk )
+	{
+		fr_t f = stk[--nstk];
+		z->stale[f.node] = 0;
+		for( s=0; s<2; s++ )
+		{
+			int c = s ? dep[f.node].child1 : dep[f.node].child0;
+			char *comp = f.comp;
+			int lcomp = f.lcomp, lin = f.lin;
+			if( c != -1 && z->op[c] )
+			{
+				lin = z->op[c]->lin; // a composite's input is the input of its innermost table
+				if( comp == NULL ) { comp = z->op[c]->gt; lcomp = z->op[c]->lout; }
+				else
+				{
+					comp = lz_compose( comp, lcomp, z->op[c] );
+					if( nown == capown ) own = realloc( own, sizeof( char * ) * ( capown *= 2 ) );
+					own[nown++] = comp;
+				}
+				if( nused == capused ) usedop = realloc( usedop, sizeof( int ) * ( capused *= 2 ) );
+				usedop[nused++] = c;
+			}
+			if( c == -1 )
+			{
+				if( comp )
+				{
+					if( napp == capapp ) app = realloc( app, sizeof( lzapp_t ) * ( capapp *= 2 ) );
+					app[napp].row = topol[f.node][s][0];
+					app[napp].gt = comp;
+					app[napp].lout = lcomp;
+					app[napp].lin = lin;
+					napp++;
+				}
+			}
+			else if( comp || z->stale[c] )
+			{
+				if( nstk == capstk ) stk = realloc( stk, sizeof( fr_t ) * ( capstk *= 2 ) );
+				stk[nstk].node = c; stk[nstk].comp = comp; stk[nstk].lcomp = lcomp; stk[nstk].lin = lin; nstk++;
+			}
+		}
+	}
+	{
+		lzappctx_t ctx;
+		ctx.aseq = aseq; ctx.rowcap = rowcap; ctx.need = need; ctx.app = app;
+#ifdef enablemultithread
+		dphelp_for( napp, MAX( 16, napp / 64 ), (double)napp * need, 4.0e6, lz_apply_rows, &ctx );
+#else
+		lz_apply_rows( &ctx, 0, napp );
+#endif
+	}
+	for( k=0; k<nown; k++ ) free( own[k] );
+	for( k=0; k<nused; k++ ) { free( z->op[usedop[k]]->gt ); free( z->op[usedop[k]] ); z->op[usedop[k]] = NULL; }
+	free( stk ); free( app ); free( own ); free( usedop );
+}
+
+#ifdef PROGTIMING
+/* MAFFT_LAZYCHECK=1: shadow rows get every gap table the moment it is made; the real rows must equal
+   them whenever they are current (checked before a step uses current rows and after every
+   materialization). */
+static void lz_check_rows( lzstate_t *z, char **aseq, int *mem, const char *what, int l )
+{
+	int i, j;
+	for( i=0; (j=mem[i])!=-1; i++ )
+		if( strcmp( z->shadow[j], aseq[j] ) )
+		{
+			reporterr( "\nLAZYCHECK MISMATCH (%s) at step %d, row %d\n", what, l, j );
+			exit( 1 );
+		}
+}
+static void lz_shadow_set( lzstate_t *z, char **aseq, int *mem ) // the rows are current: copy them
+{
+	int i, j;
+	for( i=0; (j=mem[i])!=-1; i++ )
+	{
+		int n = strlen( aseq[j] ) + 1;
+		if( n > z->shadowcap[j] ) { z->shadow[j] = realloc( z->shadow[j], n ); z->shadowcap[j] = n; }
+		strcpy( z->shadow[j], aseq[j] );
+	}
+}
+static void lz_shadow_ins( lzstate_t *z, int *mem, const char *gt, int lin, int lout ) // a deferred table
+{
+	int i, j;
+	for( i=0; (j=mem[i])!=-1; i++ )
+	{
+		if( (int)strlen( z->shadow[j] ) != lin ) { reporterr( "\nLAZYCHECK: shadow row %d has length %d, table expects %d\n", j, (int)strlen( z->shadow[j] ), lin ); exit( 1 ); }
+		if( lout + 1 > z->shadowcap[j] ) { z->shadow[j] = realloc( z->shadow[j], lout + 1 ); z->shadowcap[j] = lout + 1; }
+		lz_gapins( z->shadow[j], lin, gt, lout );
+	}
+}
+static long lz_nmat = 0, lz_ndefer = 0;
+static void lz_report( void ) __attribute__(( destructor ));
+static void lz_report( void ) { if( getenv( "MAFFT_LAZYCHECK" ) ) reporterr( "\nLAZYCHECK: %ld tables deferred, %ld materializations, no mismatch\n", lz_ndefer, lz_nmat ); }
+#endif
+
 /* work/prog2: copying the member rows in and out of the local copies, split among idle helpers
    for large groups (each row is copied by exactly one thread; strcpy as before). */
 typedef struct { char **dst, **src; int *mem; } rowcopy_t;
@@ -3997,6 +4219,12 @@ static void rowcopy_all( char **dst, char **src, int *mem, int n, int rowlen )
 	(void)rowlen;
 	if( n > 0 ) rowcopy_body( &c, 0, n );
 }
+
+#ifdef PROGTIMING
+#define PT_LZMAT( mem ) do { if( targ->lz->shadow ) { lz_check_rows( targ->lz, aseq, (mem), "materialized", l ); __atomic_add_fetch( &lz_nmat, 1, __ATOMIC_RELAXED ); } } while( 0 )
+#else
+#define PT_LZMAT( mem ) do { } while( 0 )
+#endif
 
 static void *treebasethread( void *arg )
 {
@@ -4042,6 +4270,7 @@ static void *treebasethread( void *arg )
 	double orieff1, orieff2;
 	ExtAnch *pairanch = NULL;
 	int localcopylen = 0;
+	int lz_on = 0, lz_stale0 = 0, lz_stale1 = 0, lz_defer0 = 0, lz_defer1 = 0; // work/prog3
 	char *lcblk = NULL; // work/prog2: per-thread block holding the local copies of the member rows
 	size_t lccap = 0;
 #if SKIP
@@ -4248,15 +4477,18 @@ static void *treebasethread( void *arg )
 			dynamicmtx = n_dis_consweight_multi;
 //		reporterr( "dynamicmtx[0][1] = %f\n", dynamicmtx[0][1] );
 
-		len1 = strlen( aseq[m1] );
-		len2 = strlen( aseq[m2] );
+		len1 = ( targ->lz && dep[l].child0 != -1 ) ? targ->lz->len[dep[l].child0] : strlen( aseq[m1] ); // work/prog3: rows may be stale (lazygap.h)
+		len2 = ( targ->lz && dep[l].child1 != -1 ) ? targ->lz->len[dep[l].child1] : strlen( aseq[m2] );
 		if( *alloclen <= len1 + len2 )
 		{
 			reporterr(       "\nReallocating.." );
-			pthread_rwlock_wrlock( targ->aseqlock ); // wait until no thread is copying rows of aseq
 			*alloclen = ( len1 + len2 ) + 1000;
+			if( !targ->nocopy ) // work/prog3: with nocopy, each step grows only its own rows (below)
+			{
+			pthread_rwlock_wrlock( targ->aseqlock ); // wait until no thread is copying rows of aseq
 			ReallocateCharMtx( aseq, njob, *alloclen + 10  ); 
 			pthread_rwlock_unlock( targ->aseqlock );
+			}
 			reporterr(       "done. *alloclen = %d\n", *alloclen );
 		}
 		localcopylen = *alloclen; // work/prog: the member rows are copied after the mutex is released
@@ -4293,6 +4525,29 @@ static void *treebasethread( void *arg )
 
 		pthread_mutex_unlock( targ->mutex );
 
+		if( targ->nocopy )
+		{
+			/* work/prog3: no local copies.  The rows of the two children belong to this step alone
+			   until it is marked done (the parent starts only after that, through the mutex), and no
+			   step reallocates rows it does not own any more, so the aligners can work on the rows of
+			   aseq directly.  Each row only has to be as large as the local copy was (localcopylen,
+			   i.e. alloclen at the length check, > len1+len2); rows are grown here, one by one, to
+			   localcopylen + 11 bytes (what ReallocateCharMtx( aseq, njob, alloclen + 10 ) gave every
+			   row in the original). */
+			int need = localcopylen + 11, s;
+			for( s=0; s<2; s++ )
+				for( i=0; (j=localmem[s][i])!=-1; i++ )
+					if( targ->rowcap[j] < need )
+					{
+						aseq[j] = realloc( aseq[j], need );
+						if( aseq[j] == NULL ) ErrorExit( "Cannot reallocate a row in treebasethread.\n" );
+						targ->rowcap[j] = need;
+					}
+			for( i=0; (j=localmem[0][i])!=-1; i++ ) localcopy[j] = aseq[j];
+			for( i=0; (j=localmem[1][i])!=-1; i++ ) localcopy[j] = aseq[j];
+		}
+		else
+		{
 		/* work/prog: copy the member rows outside the global mutex.  The rows belong to finished
 		   children, so nobody writes them now; the read lock only excludes a concurrent
 		   ReallocateCharMtx() by another thread.  Buffer size as in the original (alloclen at the
@@ -4323,6 +4578,7 @@ static void *treebasethread( void *arg )
 		for( i=0; (j=localmem[1][i])!=-1; i++ ) strcpy( localcopy[j], aseq[j] );
 		}
 		pthread_rwlock_unlock( targ->aseqlock );
+		}
 
 #if 1 // CHUUI@@@@
 #ifdef PROGTIMING
@@ -4424,6 +4680,52 @@ static void *treebasethread( void *arg )
 //		reporterr(       "f=%d, len1/fftlog[m1]=%f, clus1=%d, len2/fftlog[m2]=%f, clus2=%d\n", ffttry, (double)len1/fftlog[m1], clus1, (double)len2/fftlog[m2], clus2 );
 //		reporterr( "fftlog=%d,%d, ffttry=%d\n", fftlog[m1], fftlog[m2], ffttry );
 
+		/* work/prog3: deferred gap insertion (lazygap.h).  Rows a step reads must be current; a group
+		   with a cached profile that goes into A__align may stay stale, and its new gaps (and those of
+		   the other group, when the result will have a cached profile too) can be deferred again. */
+		lz_on = lz_stale0 = lz_stale1 = 0;
+		if( targ->lz )
+		{
+			lzstate_t *z = targ->lz;
+			int c0 = dep[l].child0, c1 = dep[l].child1;
+			int useA = !useexternalanchors && !( force_fft || ( use_fft && ffttry ) ) && alg == 'A' && !( clus1 == 1 && clus2 == 1 ) && len1 > 0 && len2 > 0;
+			lz_stale0 = ( c0 != -1 && z->stale[c0] );
+			lz_stale1 = ( c1 != -1 && z->stale[c1] );
+			if( lz_stale0 && !( useA && cpmxchild0 && *cpmxchild0 ) )
+			{
+				lz_materialize( z, c0, dep, topol, aseq, targ->rowcap, localcopylen + 11 );
+				lz_stale0 = 0;
+				PT_LZMAT( localmem[0] );
+			}
+			if( lz_stale1 && !( useA && cpmxchild1 && *cpmxchild1 ) )
+			{
+				lz_materialize( z, c1, dep, topol, aseq, targ->rowcap, localcopylen + 11 );
+				lz_stale1 = 0;
+				PT_LZMAT( localmem[1] );
+			}
+#ifdef PROGTIMING
+			if( z->shadow ) // the current rows must equal the shadow rows
+			{
+				if( !lz_stale0 ) lz_check_rows( z, aseq, localmem[0], "current rows, side 0", l );
+				if( !lz_stale1 ) lz_check_rows( z, aseq, localmem[1], "current rows, side 1", l );
+			}
+#endif
+			if( useA )
+			{
+				int big = ( clus1 + clus2 > 20 && l != njob-2 && specificityconsideration == 0.0 );
+				lz_defer0 = lz_stale0 || ( c0 != -1 && big );
+				lz_defer1 = lz_stale1 || ( c1 != -1 && big );
+				if( lz_defer0 || lz_defer1 )
+				{
+					A_lz.on = 1; A_lz.used = 0;
+					A_lz.stale[0] = lz_stale0; A_lz.stale[1] = lz_stale1;
+					A_lz.len[0] = len1; A_lz.len[1] = len2;
+					A_lz.defer[0] = lz_defer0; A_lz.defer[1] = lz_defer1;
+					lz_on = 1;
+				}
+			}
+		}
+
 		if( useexternalanchors )
 		{
 //			reporterr( "%%%% %d vs %d\n", m1, m2 );
@@ -4488,6 +4790,54 @@ static void *treebasethread( void *arg )
 					break;
 				default:
 					ErrorExit( "ERROR IN SOURCE FILE" );
+			}
+		}
+		if( targ->lz ) // work/prog3: record what the step left pending (lazygap.h)
+		{
+			lzstate_t *z = targ->lz;
+			int c0 = dep[l].child0, c1 = dep[l].child1, s;
+			if( lz_on )
+			{
+				if( !A_lz.used ) ErrorExit( "A__align did not take the lazy-gap request.\n" );
+				for( s=0; s<2; s++ )
+				{
+					int c = s ? c1 : c0;
+					if( A_lz.outgt[s] )
+					{
+						lzop_t *op = malloc( sizeof( lzop_t ) );
+						op->gt = A_lz.outgt[s];
+						op->lin = s ? len2 : len1;
+						op->lout = A_lz.outlen;
+						if( c == -1 || z->op[c] ) ErrorExit( "lazy gaps: bad table owner.\n" );
+						z->op[c] = op;
+					}
+				}
+#ifdef PROGTIMING
+				if( z->shadow )
+				{
+					__atomic_add_fetch( &lz_ndefer, ( A_lz.outgt[0] != NULL ) + ( A_lz.outgt[1] != NULL ), __ATOMIC_RELAXED );
+					if( lz_defer0 ) { if( A_lz.outgt[0] ) lz_shadow_ins( z, localmem[0], A_lz.outgt[0], len1, A_lz.outlen ); }
+					else lz_shadow_set( z, aseq, localmem[0] );
+					if( lz_defer1 ) { if( A_lz.outgt[1] ) lz_shadow_ins( z, localmem[1], A_lz.outgt[1], len2, A_lz.outlen ); }
+					else lz_shadow_set( z, aseq, localmem[1] );
+				}
+#endif
+				z->len[l] = A_lz.outlen;
+				z->stale[l] = lz_stale0 || lz_stale1 || ( c0 != -1 && z->op[c0] ) || ( c1 != -1 && z->op[c1] );
+			}
+			else
+			{
+				z->len[l] = strlen( mseq1[0] );
+				z->stale[l] = 0;
+#ifdef PROGTIMING
+				if( z->shadow ) { lz_shadow_set( z, aseq, localmem[0] ); lz_shadow_set( z, aseq, localmem[1] ); }
+#endif
+			}
+			if( l == njob-2 && z->stale[l] ) // the root: every pending table goes in now
+			{
+				lz_materialize( z, l, dep, topol, aseq, targ->rowcap, localcopylen + 11 );
+				PT_LZMAT( localmem[0] );
+				PT_LZMAT( localmem[1] );
 			}
 		}
 #ifdef PROGTIMING
@@ -4560,6 +4910,8 @@ static void *treebasethread( void *arg )
 
 		/* work/prog: write the aligned rows back before the step is marked done (the parent reads
 		   them only after that), under the aseq read lock instead of the global mutex. */
+		if( !targ->nocopy ) // work/prog3: the rows were aligned in place
+		{
 		pthread_rwlock_rdlock( targ->aseqlock );
 		if( clus1 + clus2 > 256 ) // work/prog2: see the copy-in above
 		{
@@ -4575,6 +4927,7 @@ static void *treebasethread( void *arg )
 			strcpy( aseq[j], localcopy[j] );
 		}
 		pthread_rwlock_unlock( targ->aseqlock );
+		}
 
 		pthread_mutex_lock( targ->mutex );
 		dep[l].done = 1;
@@ -6993,6 +7346,21 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 #endif
 			int tb_optimistic = ( !nevermemsave && alg != 'M' );
 			int tb_attempt;
+			/* work/prog3: rows are aligned in place (see treebasethread); MAFFT_COPYROWS=1 in timing
+			   builds restores the local copies (A/B) */
+#ifdef PROGTIMING
+			int tb_nocopy = ( getenv( "MAFFT_COPYROWS" ) == NULL );
+#else
+			int tb_nocopy = 1;
+#endif
+			int *tb_rowcap = calloc( njob, sizeof( int ) );
+			lzstate_t *tb_lz = NULL;
+#ifdef PROGTIMING
+			int tb_lazyok = ( getenv( "MAFFT_NOLAZY" ) == NULL ), tb_lazycheck = ( getenv( "MAFFT_LAZYCHECK" ) != NULL );
+#else
+			int tb_lazyok = 1, tb_lazycheck = 0;
+#endif
+			for( i=0; i<njob; i++ ) tb_rowcap[i] = alloclen; // AllocateCharMtx( njob, alloclen ): alloclen bytes per row
 			char **tb_saveseq = NULL;
 			int *tb_savenlen = NULL;
 			if( !tb_inorder && tb_optimistic ) // what an abandoned attempt changes, to put it back
@@ -7009,6 +7377,14 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			for( i=0; i<njob; i++ ) dep[i].done = 0; 
 			for( i=0; i<njob; i++ ) fftlog[i] = 1; 
 			tbsched_init( &tbsched, njob, dep, tb_inorder, tb_optimistic );
+			/* work/prog3: deferred gap insertion needs the rows in place, and a fixed aligner per step:
+			   either the optimistic ready queue (a memsave switch abandons the attempt) or one thread
+			   (the switch happens in the same thread, before the step looks at alg) */
+			if( tb_nocopy && ( !tbsched.inorder || nthread_yoyu == 1 ) && tb_lazyok )
+			{
+				if( tb_lz == NULL ) tb_lz = lz_new( njob, bseq, tb_lazycheck );
+			}
+			else if( tb_lz ) { lz_free( tb_lz, njob ); tb_lz = NULL; }
 			/* work/prog2: idle threads help with large alignments (with the in-order dispatch, the
 			   threads that wait for the children of their step help as well) */
 #ifdef PROGTIMING
@@ -7066,6 +7442,9 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 				targ[i].treecond = &treecond;
 				targ[i].sched = &tbsched;
 				targ[i].aseqlock = &aseqlock;
+				targ[i].rowcap = tb_rowcap;
+				targ[i].nocopy = tb_nocopy;
+				targ[i].lz = tb_lz;
 	
 				pthread_create( handle+i, NULL, treebasethread, (void *)(targ+i) );
 			}
@@ -7088,6 +7467,12 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			dphelppool = NULL;
 			if( !tbsched.abort )
 			{
+				if( tb_lz && tb_lz->stale[njob-2] ) ErrorExit( "lazy gaps: the root was not materialized.\n" );
+#ifdef PROGTIMING
+				if( tb_lz && tb_lz->shadow ) // every row against its shadow
+					for( i=0; i<njob; i++ )
+						if( strcmp( tb_lz->shadow[i], bseq[i] ) ) { reporterr( "\nLAZYCHECK MISMATCH at the end of the pass, row %d\n", i ); exit( 1 ); }
+#endif
 				tbsched_free( &tbsched );
 				break;
 			}
@@ -7098,6 +7483,7 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			reporterr( "\nAn alignment exceeds 30000 columns: redoing this pass with the original step order.\n" );
 			for( i=0; i<njob; i++ ) strcpy( bseq[i], tb_saveseq[i] );
 			for( i=0; i<njob; i++ ) nlen[i] = tb_savenlen[i];
+			if( tb_lz ) lz_reset( tb_lz, njob, bseq ); // work/prog3: pending tables belong to the abandoned attempt
 			for( i=0; i<njob-1; i++ )
 			{
 				if( cpmxhist[i] ) { FreeDoubleMtx( cpmxhist[i] ); cpmxhist[i] = NULL; }
@@ -7115,6 +7501,8 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 				free( tb_saveseq );
 				free( tb_savenlen );
 			}
+			free( tb_rowcap );
+			lz_free( tb_lz, njob );
 			pthread_mutex_destroy( &mutex );
 			pthread_cond_destroy( &treecond );
 			pthread_rwlock_destroy( &aseqlock );
