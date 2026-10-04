@@ -2925,11 +2925,21 @@ static void rowcopy_body( void *vctx, int lo, int hi )
 	int i;
 	for( i=lo; i<hi; i++ ) strcpy( c->dst[c->mem[i]], c->src[c->mem[i]] );
 }
+/* work/gccpar: DEADLOCK FIX.  rowcopy_all() is called with targ->aseqlock held for reading, and
+   dphelp_for() takes the pool mutex, which is the pass's global mutex (dphelp_post/dphelp_finish).
+   A thread that reallocates aseq holds that global mutex while it waits in
+   pthread_rwlock_wrlock( aseqlock ) for the readers to leave, so a reader that reaches
+   dphelp_post/dphelp_finish waits for the mutex forever, and so does everyone else (observed:
+   rnasim10k, --thread 10, gcc build, all threads blocked, stacks in
+   treebasethread -> dphelp_for -> dphelp_finish and treebasethread -> pthread_rwlock_wrlock).
+   The copies are now done by the calling thread alone (strcpy of the same rows, same result);
+   helpers keep doing the DP tiles, profiles and gap insertion, which run outside the lock. */
 static void rowcopy_all( char **dst, char **src, int *mem, int n, int rowlen )
 {
 	rowcopy_t c;
 	c.dst = dst; c.src = src; c.mem = mem;
-	dphelp_for( n, MAX( 32, n / 32 ), (double)n * rowlen, 8.0e6, rowcopy_body, &c );
+	(void)rowlen;
+	if( n > 0 ) rowcopy_body( &c, 0, n );
 }
 
 static void *treebasethread( void *arg )
@@ -4948,6 +4958,9 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 #endif
 //	if( njob > 10000 ) nthreadtb = 0; 
 	if( njob > 20000 ) nthreadtb = 0; 
+#ifdef GCCPAR_TBTEST
+	if( getenv( "MAFFT_SERIALTB" ) ) nthreadtb = 0; // test builds only: force the serial treebase() path
+#endif
 // 2018/Jan.  Hairetsu ga ooi toki
 // 1. topolorder_lessargs no stack ga tarinakunaru
 // 2. localcopy no tame kouritsu warui

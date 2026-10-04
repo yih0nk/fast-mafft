@@ -1171,6 +1171,17 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
        across j, so they are computed first in a separate, vectorizable pass;
    (2) the row recurrence (mi, mpi) is kept in registers instead of TLS statics;
    (3) all selects are branch-free and ijp is written once per cell. */
+/* work/gccpar: C ? A : B for an int C in {0,1}, as bit arithmetic (see ADP_CELL below) */
+#define ISEL( C, A, B ) ( (B) ^ ( ( (B) ^ (A) ) & -(C) ) )
+/* work/gccpar: C >= X ? C : X for finite (non-NaN) doubles, bit-identical in both spellings (see
+   ADP_CELL below).  x86: the "X > C ? X : C" spelling is an IEEE max, one maxsd/vmaxsd; arm64:
+   the ">=" spelling lets clang share the compare with the matching integer select. */
+#if defined( __x86_64__ ) || defined( __i386__ )
+#define DSEL_GE( C, X ) ( (X) > (C) ? (X) : (C) )
+#else
+#define DSEL_GE( C, X ) ( (C) >= (X) ? (C) : (X) )
+#endif
+
 static void Adp_row_fast( int i, int lastj, double * restrict colw, int * restrict colij, double * restrict colg2,
 	double * restrict mloc, int * restrict mploc, double * restrict curw, int * restrict ijpi,
 	const double * restrict prew, const double * restrict gf2, const double * restrict fg2, const double * restrict og2,
@@ -1194,8 +1205,8 @@ static void Adp_row_fast( int i, int lastj, double * restrict colw, int * restri
 		int take = ( g4 >= mj );
 		colw[j] = g3;
 		colij[j] = i - mpj;
-		mloc[j] = ( take ? g4 : mj ) + fpenalty_ex;
-		mploc[j] = take ? i-1 : mpj;
+		mloc[j] = DSEL_GE( g4, mj ) + fpenalty_ex;
+		mploc[j] = ISEL( take, i-1, mpj );
 	}
 #ifdef PROGTIMING
 	_t1 = pt_now(); pt_acc[21] += _t1 - _t0; _t0 = _t1;
@@ -1240,22 +1251,20 @@ static void Adp_row_fast( int i, int lastj, double * restrict colw, int * restri
 		{
 			double gg, g2 = g2c[j];
 			int take2;
-			wmv = prew[j-1];
-			ijv = 0;
+			double pw = prew[j-1];
+			int th;
 			gg = mil + fg2[j-1] * gf1va;                // = mi + *fgcp2pt * gf1va
-			if( gg > wmv )
-			{
-				wmv = gg;
-				ijv = -( j - mpil );
-			}
+			th = ( gg > pw );
+			wmv = th ? gg : pw;
+			ijv = -( j - mpil ) & -th;
 			take2 = ( g2 >= mil );
-			mil = take2 ? g2 : mil;
-			mpil = take2 ? j-1 : mpil;
+			mil = DSEL_GE( g2, mil );
+			mpil = ISEL( take2, j-1, mpil );
 			{
 				double cw = colw[j];
 				int cij = colij[j];
 				int take = ( cw > wmv );
-				ijv = take ? cij : ijv;
+				ijv = ISEL( take, cij, ijv );
 				wmv = take ? cw : wmv;
 			}
 			curw[j] += wmv;
@@ -1271,27 +1280,22 @@ static void Adp_row_fast( int i, int lastj, double * restrict colw, int * restri
 	}
 	for( j=1; j<lastj; j++ )
 	{
-		double gg;
-		wmv = prew[j-1];
-		ijv = 0;
+		double gg, pw = prew[j-1];
+		int th;
 		gg = mil + fg2[j-1] * gf1va;                // = mi + *fgcp2pt * gf1va
-		if( gg > wmv )
-		{
-			wmv = gg;
-			ijv = -( j - mpil );
-		}
+		th = ( gg > pw );
+		wmv = th ? gg : pw;
+		ijv = -( j - mpil ) & -th;
 		gg = prew[j-1] + og2[j] * gf1vapre;         // = *prept + *ogcp2pt * gf1vapre
-		if( gg >= mil )
-		{
-			mil = gg;
-			mpil = j-1;
-		}
+		th = ( gg >= mil );
+		mil = DSEL_GE( gg, mil );
+		mpil = ISEL( th, j-1, mpil );
 		mil += fpenalty_ex;
 		{
 			double cw = colw[j];
 			int cij = colij[j];
 			int take = ( cw > wmv );
-			ijv = take ? cij : ijv;
+			ijv = ISEL( take, cij, ijv );
 			wmv = take ? cw : wmv;
 		}
 		curw[j] += wmv;
@@ -1311,11 +1315,28 @@ static void Adp_row_fast( int i, int lastj, double * restrict colw, int * restri
    Column lgth2 has no match value in the original either (match_calc fills 0..lgth2-1 only), so
    its currentw entry keeps the value already in the buffer, exactly as before.  One scalar pass
    lets the out-of-order core overlap the independent per-column work with the serial mi chain. */
+/* work/gccpar: the selects of the cell are written so that gcc compiles them without branches
+   and x86 gets one instruction per double select.
+   (1) Integer selects: gcc gimplifies "c ? a : b" into an if/else whenever an arm is not a plain
+       value (i-1, -(j-mpil), i-mpj), sinks the arm into the conditional block, and its RTL
+       if-conversion then left three of the four as data-dependent branches per cell (aarch64,
+       gcc 15; v3's fused row took 1.9-2.1x the time per cell under gcc as under clang).  ISEL
+       writes the same select as bit arithmetic, which gcc folds into a straight-line COND_EXPR
+       that expands to csel/cmov on every target.  "if( gg > wm ) { wm = gg; ijv = ...; }" is
+       now a double select plus an integer mask.
+   (2) Double selects "c >= x ? c : x" go through DSEL_GE, which on x86 spells them
+       "x > c ? x : c": for non-NaN operands both pick c exactly when c >= x, so the bits are the
+       same (signed zeros included, since equal values select c either way); the second form is
+       an IEEE max that x86 compiles to one maxsd (gcc: ix86_expand_sse_fp_minmax; clang
+       likewise) instead of cmplesd/andpd/andnpd/orpd or blendvpd (clang x86-64 SSE2: 78 -> 59
+       instructions per cell together with (1)).  DP values are finite, never NaN.
+   Same comparisons for the traceback codes, same tie rules, same FP operations in the same
+   order: every value is bit-identical to v3's (and to the original loop's). */
 #define ADP_CELL( FIRST, HASMATCH ) ADP_CELL_PW( FIRST, HASMATCH, prew[j-1] )
 #define ADP_CELL_PW( FIRST, HASMATCH, PWVAL ) \
 	{ \
-		double mj = mloc[j], pw = (PWVAL), base, g3, g4, gg, g2; \
-		int mpj = mploc[j], takec, take; \
+		double mj = mloc[j], pw = (PWVAL), base, g3, g4, gg, g2, wh; \
+		int mpj = mploc[j], takec, take, th; \
 		if( HASMATCH ) \
 		{ \
 			base = 0.0; \
@@ -1329,12 +1350,12 @@ static void Adp_row_fast( int i, int lastj, double * restrict colw, int * restri
 		g3 = mj + fgcp1va * gf2[j]; \
 		g4 = pw + ogcp1va * gf2[j-1]; \
 		takec = ( g4 >= mj ); \
-		mloc[j] = ( takec ? g4 : mj ) + fpenalty_ex; \
-		mploc[j] = takec ? i-1 : mpj; \
-		wmv = pw; \
-		ijv = 0; \
+		mloc[j] = DSEL_GE( g4, mj ) + fpenalty_ex; \
+		mploc[j] = ISEL( takec, i-1, mpj ); \
 		gg = mil + fg2[j-1] * gf1va; \
-		if( gg > wmv ) { wmv = gg; ijv = -( j - mpil ); } \
+		th = ( gg > pw ); \
+		wh = th ? gg : pw; \
+		ijv = -( j - mpil ) & -th; \
 		g2 = pw + og2[j] * gf1vapre; \
 		if( FIRST ) \
 		{ \
@@ -1345,12 +1366,12 @@ static void Adp_row_fast( int i, int lastj, double * restrict colw, int * restri
 		{ \
 			double g2c = g2 + fpenalty_ex; \
 			int take2 = ( g2c >= mil ); \
-			mil = take2 ? g2c : mil; \
-			mpil = take2 ? j-1 : mpil; \
+			mil = DSEL_GE( g2c, mil ); \
+			mpil = ISEL( take2, j-1, mpil ); \
 		} \
-		take = ( g3 > wmv ); \
-		ijv = take ? i - mpj : ijv; \
-		wmv = take ? g3 : wmv; \
+		take = ( g3 > wh ); \
+		ijv = ISEL( take, i - mpj, ijv ); \
+		wmv = take ? g3 : wh; \
 		curw[j] = base + wmv; \
 		ijpi[j] = ijv; \
 	}

@@ -920,6 +920,17 @@ fprintf( stderr, "\n" );
 /* work/prog: fast evaluation of one DP row of G__align11 (trywarp == 0).  Same cells,
    expressions and comparison order as the original loop; the column recurrence runs in its
    own vectorizable pass, the row recurrence stays in registers, selects are branch-free. */
+/* work/gccpar: C ? A : B for an int C in {0,1}, written as bit arithmetic so that gcc folds it
+   into a straight-line select (csel/cmov) instead of keeping a data-dependent branch; see
+   ADP_CELL in Salignmm.c.  The cells below compute the same values in the same order as v3's. */
+#define ISEL( C, A, B ) ( (B) ^ ( ( (B) ^ (A) ) & -(C) ) )
+/* C >= X ? C : X for finite doubles; on x86 spelled as an IEEE max (one maxsd), see Salignmm.c */
+#if defined( __x86_64__ ) || defined( __i386__ )
+#define DSEL_GE( C, X ) ( (X) > (C) ? (X) : (C) )
+#else
+#define DSEL_GE( C, X ) ( (C) >= (X) ? (C) : (X) )
+#endif
+
 static void Gdp_row_fast( int i, int lastj, int lgth2, double * restrict colw, int * restrict colij, double * restrict colg2,
 	double * restrict mloc, int * restrict mploc, double * restrict curw, int * restrict ijpi,
 	const double * restrict prew, double fpenalty, double fpenalty_ex, double fpenalty_ex_i,
@@ -938,8 +949,8 @@ static void Gdp_row_fast( int i, int lastj, int lgth2, double * restrict colw, i
 		int take = ( pw >= mj );
 		colw[j] = mj + fpenalty;
 		colij[j] = i - mpj;
-		mloc[j] = take ? pw : mj;
-		mploc[j] = take ? i-1 : mpj;
+		mloc[j] = DSEL_GE( pw, mj );
+		mploc[j] = ISEL( take, i-1, mpj );
 	}
 #if USE_PENALTY_EX
 	for( j=1; j<lastj && j<lgth2; j++ ) // 2018/May/11: not for j == lgth2
@@ -972,24 +983,20 @@ static void Gdp_row_fast( int i, int lastj, int lgth2, double * restrict colw, i
 		ijpi[j] = ijv;
 		for( j=2; j<lastj; j++ )
 		{
-			double pc = pwc[j];
-			int take2;
-			wmv = prew[j-1];
-			ijv = 0;
+			double pc = pwc[j], pwj = prew[j-1];
+			int take2, th;
 			gg = mil + fpenalty;
-			if( gg > wmv )
-			{
-				wmv = gg;
-				ijv = -( j - mpil );
-			}
+			th = ( gg > pwj );
+			wmv = th ? gg : pwj;
+			ijv = -( j - mpil ) & -th;
 			take2 = ( pc >= mil );
-			mil = take2 ? pc : mil;
-			mpil = take2 ? j-1 : mpil;
+			mil = DSEL_GE( pc, mil );
+			mpil = ISEL( take2, j-1, mpil );
 			{
 				double cw = colw[j];
 				int cij = colij[j];
 				int take = ( cw > wmv );
-				ijv = take ? cij : ijv;
+				ijv = ISEL( take, cij, ijv );
 				wmv = take ? cw : wmv;
 			}
 			curw[j] += wmv;
@@ -1004,19 +1011,14 @@ static void Gdp_row_fast( int i, int lastj, int lgth2, double * restrict colw, i
 	for( j=1; j<lastj; j++ )
 	{
 		double gg, pw = prew[j-1];
-		wmv = pw;
-		ijv = 0;
+		int th;
 		gg = mil + fpenalty;
-		if( gg > wmv )
-		{
-			wmv = gg;
-			ijv = -( j - mpil );
-		}
-		if( pw >= mil )
-		{
-			mil = pw;
-			mpil = j-1;
-		}
+		th = ( gg > pw );
+		wmv = th ? gg : pw;
+		ijv = -( j - mpil ) & -th;
+		th = ( pw >= mil );
+		mil = DSEL_GE( pw, mil );
+		mpil = ISEL( th, j-1, mpil );
 #if USE_PENALTY_EX
 		mil += fpenalty_ex_i;
 #endif
@@ -1024,7 +1026,7 @@ static void Gdp_row_fast( int i, int lastj, int lgth2, double * restrict colw, i
 			double cw = colw[j];
 			int cij = colij[j];
 			int take = ( cw > wmv );
-			ijv = take ? cij : ijv;
+			ijv = ISEL( take, cij, ijv );
 			wmv = take ? cw : wmv;
 		}
 		curw[j] += wmv;
@@ -1045,20 +1047,19 @@ static void Gdp_row_fast( int i, int lastj, int lgth2, double * restrict colw, i
    before. */
 #define GDP_CELL( FIRST, HASMATCH ) \
 	{ \
-		double mj = mloc[j], pw = prew[j-1], base, cw, mnew, gg; \
-		int mpj = mploc[j], cij, take, ijv; \
+		double mj = mloc[j], pw = prew[j-1], base, cw, mnew, gg, wh; \
+		int mpj = mploc[j], take, th, ijv; \
 		if( HASMATCH ) base = mrow[s2[j]]; else base = curw[j]; \
 		cw = mj + fpenalty; \
-		cij = i - mpj; \
 		take = ( pw >= mj ); \
-		mnew = take ? pw : mj; \
+		mnew = DSEL_GE( pw, mj ); \
 		if( HASMATCH ) mnew += fpenalty_ex;  /* the original adds it for j < lgth2 only */ \
 		mloc[j] = mnew; \
-		mploc[j] = take ? i-1 : mpj; \
-		wmv = pw; \
-		ijv = 0; \
+		mploc[j] = ISEL( take, i-1, mpj ); \
 		gg = mil + fpenalty; \
-		if( gg > wmv ) { wmv = gg; ijv = -( j - mpil ); } \
+		th = ( gg > pw ); \
+		wh = th ? gg : pw; \
+		ijv = -( j - mpil ) & -th; \
 		if( FIRST ) \
 		{ \
 			if( pw >= mil ) { mil = pw; mpil = j-1; } \
@@ -1068,12 +1069,12 @@ static void Gdp_row_fast( int i, int lastj, int lgth2, double * restrict colw, i
 		{ \
 			double pc = pw + fpenalty_ex_i; \
 			int take2 = ( pc >= mil ); \
-			mil = take2 ? pc : mil; \
-			mpil = take2 ? j-1 : mpil; \
+			mil = DSEL_GE( pc, mil ); \
+			mpil = ISEL( take2, j-1, mpil ); \
 		} \
-		take = ( cw > wmv ); \
-		ijv = take ? cij : ijv; \
-		wmv = take ? cw : wmv; \
+		take = ( cw > wh ); \
+		ijv = ISEL( take, i - mpj, ijv ); \
+		wmv = take ? cw : wh; \
 		curw[j] = base + wmv; \
 		ijpi[j] = ijv; \
 	}
