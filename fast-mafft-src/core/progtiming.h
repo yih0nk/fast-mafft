@@ -10,7 +10,7 @@ static inline double pt_now( void )
 	clock_gettime( CLOCK_MONOTONIC, &ts );
 	return( ts.tv_sec + ts.tv_nsec * 1e-9 );
 }
-#define PT_NACC 32
+#define PT_NACC 48
 extern TLS double pt_acc[PT_NACC];
 #define PT_DECL double _pt_t = 0.0
 #define PT_START() ( _pt_t = pt_now() )

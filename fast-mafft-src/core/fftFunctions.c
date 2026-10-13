@@ -429,17 +429,116 @@ static void arp_build( int clus, char **seq, double *eff, int len, double **pp, 
 	*nlp = nl;
 }
 
-void alignableReagion_prep( int clus1, int clus2, char **seq1, char **seq2, double *eff1, double *eff2 )
+/* work/v8s: arp_build by column ranges with idle helper threads.  The letter set ("seen") is an OR
+   over all characters, whatever the order; each profile entry p[c*nl+slot] receives eff[j] for the
+   members j in ascending order, from 0.0, exactly as in arp_build, only the columns are split among
+   threads.  (On the critical chain of real rRNA sets this pass over a ~1,800-row group was ~35% of
+   each Falign step.)  The helper pool lives in Salignmm.c, which some programs that link this file
+   do not link, so the caller (Falign) passes its parallel-for and idle-count functions in. */
+#define ARP_MINWORK 1.0e6
+#define ARP_SERIALMIN 2.0e5 // work/v8s: from this size on, the fused pass also without helpers
+typedef void (*arp_pfor_t)( int n, int chunk, double work, double minwork, void (*body)( void *ctx, int lo, int hi ), void *ctx );
+typedef int (*arp_pidle_t)( void );
+/* one pass: every letter's sums go into a 26-wide scratch profile (a column range per claim), the letter
+   set is the OR of the claims' sets; the letters present are then copied into p in arp_build's slot
+   order.  An entry of a present letter is the same sum (members ascending, from 0.0) as in arp_build;
+   the others stay 0.0 and are dropped. */
+typedef struct { int clus, len; char **seq; double *eff, *t; int *seen; } arp1ctx_t;
+static void arp_one_cols( void *vctx, int lo, int hi )
+{
+	arp1ctx_t *c = (arp1ctx_t *)vctx;
+	double *t = c->t;
+	int seen[26], j, col, k;
+	size_t q;
+	for( k=0; k<26; k++ ) seen[k] = 0;
+	for( q=(size_t)lo*26; q<(size_t)hi*26; q++ ) t[q] = 0.0;
+	for( j=0; j<c->clus; j++ )
+	{
+		const unsigned char *sp = (const unsigned char *)c->seq[j];
+		const double e = c->eff[j];
+		for( col=lo; col<hi; col++ )
+		{
+			k = amino_n[sp[col]];
+			if( k >= 0 && k < 26 ) { t[(size_t)col*26+k] += e; seen[k] = 1; }
+		}
+	}
+	for( k=0; k<26; k++ ) if( seen[k] ) __atomic_store_n( c->seen + k, 1, __ATOMIC_RELAXED );
+}
+static TLS double *arp_tmp = NULL;
+static TLS size_t arp_tmpcap = 0;
+static int arp_build_par( int clus, char **seq, double *eff, int len, double **pp, size_t *cap, int *nlp, int *kl, arp_pfor_t pfor, arp_pidle_t pidle )
+{
+	arp1ctx_t c;
+	int seen[26], k, t, nl = 0, col, chunk = MAX( 256, len / 64 );
+	double *p;
+	const int par = ( pfor != NULL && pidle != NULL && (double)clus * len >= ARP_MINWORK && pidle() > 0 );
+	if( !par && (double)clus * len < ARP_SERIALMIN ) return( 0 ); // small: the original two passes
+	if( (size_t)len * 26 > arp_tmpcap )
+	{
+		free( arp_tmp );
+		arp_tmpcap = (size_t)len * 26 + (size_t)len * 13;
+		arp_tmp = malloc( arp_tmpcap * sizeof( double ) );
+		if( arp_tmp == NULL ) ErrorExit( "Cannot allocate profiles in alignableReagion_prep.\n" );
+	}
+	for( k=0; k<26; k++ ) seen[k] = 0;
+	c.clus = clus; c.len = len; c.seq = seq; c.eff = eff; c.t = arp_tmp; c.seen = seen;
+	if( par ) pfor( len, chunk, (double)clus * len, ARP_MINWORK, arp_one_cols, &c );
+	else arp_one_cols( &c, 0, len ); // no helper: still one pass instead of two
+	for( k=25; k>=0; k-- ) if( seen[k] ) { kl[nl] = k; nl++; }
+	if( (size_t)len * ( nl ? nl : 1 ) > *cap )
+	{
+		free( *pp );
+		*cap = (size_t)len * ( nl ? nl : 1 );
+		*cap += *cap / 2;
+		*pp = malloc( *cap * sizeof( double ) );
+		if( *pp == NULL ) ErrorExit( "Cannot allocate profiles in alignableReagion_prep.\n" );
+	}
+	p = *pp;
+	for( col=0; col<len; col++ )
+	{
+		const double *tc = arp_tmp + (size_t)col*26;
+		double *pc = p + (size_t)col*nl;
+		for( t=0; t<nl; t++ ) pc[t] = tc[kl[t]];
+	}
+	*nlp = nl;
+	return( 1 );
+}
+static int arp_build_any( int clus, char **seq, double *eff, int len, double **pp, size_t *cap, int *nlp, int *kl, arp_pfor_t pfor, arp_pidle_t pidle, int check )
+{
+	if( arp_build_par( clus, seq, eff, len, pp, cap, nlp, kl, pfor, pidle ) )
+	{
+		if( check ) // MAFFT_V8CHECK (timing builds): the original into a fresh buffer, compared bitwise
+		{
+			double *rp = NULL; size_t rcap = 0; int rnl, rkl[26];
+			arp_build( clus, seq, eff, len, &rp, &rcap, &rnl, rkl );
+			if( rnl != *nlp || memcmp( rkl, kl, sizeof( int ) * rnl ) || memcmp( rp, *pp, sizeof( double ) * (size_t)len * rnl ) )
+			{
+				reporterr( "\nV8CHECK MISMATCH in the anchor profiles (clus=%d, len=%d, nl=%d/%d)\n", clus, len, rnl, *nlp );
+				exit( 1 );
+			}
+			free( rp );
+			return( 1 );
+		}
+		return( 0 );
+	}
+	arp_build( clus, seq, eff, len, pp, cap, nlp, kl );
+	return( 0 );
+}
+
+int alignableReagion_prep( int clus1, int clus2, char **seq1, char **seq2, double *eff1, double *eff2,
+	void (*pfor)( int, int, double, double, void (*)( void *, int, int ), void * ), int (*pidle)( void ), int check ) // work/v8s: pfor/pidle may be NULL
 {
 	int i, j;
 	double totaleff;
 	arp_len1 = strlen( seq1[0] );
 	arp_len2 = strlen( seq2[0] );
-	arp_build( clus1, seq1, eff1, arp_len1, &arp_p1, &arp_cap1, &arp_nl1, arp_k1 );
-	arp_build( clus2, seq2, eff2, arp_len2, &arp_p2, &arp_cap2, &arp_nl2, arp_k2 );
+	int nchecked; // work/v8s: parallel builds verified (MAFFT_V8CHECK)
+	nchecked = arp_build_any( clus1, seq1, eff1, arp_len1, &arp_p1, &arp_cap1, &arp_nl1, arp_k1, pfor, pidle, check ); // work/v8s: parallel for large groups
+	nchecked += arp_build_any( clus2, seq2, eff2, arp_len2, &arp_p2, &arp_cap2, &arp_nl2, arp_k2, pfor, pidle, check );
 	totaleff = 0.0;
 	for( i=0; i<clus1; i++ ) for( j=0; j<clus2; j++ ) totaleff += eff1[i] * eff2[j];
 	arp_totaleff = totaleff;
+	return( nchecked );
 }
 
 void alignableReagion_prep_free( void )
@@ -447,6 +546,7 @@ void alignableReagion_prep_free( void )
 	free( arp_p1 ); arp_p1 = NULL; arp_cap1 = 0;
 	free( arp_p2 ); arp_p2 = NULL; arp_cap2 = 0;
 	free( arp_stra ); arp_stra = NULL; arp_stracap = 0;
+	free( arp_tmp ); arp_tmp = NULL; arp_tmpcap = 0; // work/v8s
 }
 
 int alignableReagion_lag( int off1, int off2, Segment *seg )

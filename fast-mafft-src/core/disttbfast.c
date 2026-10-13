@@ -8,6 +8,7 @@
 #ifdef PROGTIMING
 typedef struct { int l, thread, clus1, clus2, len1, len2, c0, c1; double t[8]; double acc[PT_NACC]; } ptrec_t;
 static ptrec_t *ptlog = NULL;
+static TLS double pt_growt = 0.0; // work/v8s
 static double pt_base = 0.0;
 static void ptlog_write( int njob, int pass )
 {
@@ -3921,6 +3922,11 @@ static int tbsched_before( tbsched_t *sc, int a, int b )
 	return( a < b );
 }
 
+static void tbsched_readyprio( tbsched_t *sc ) // work/v8s: the best ready step's priority for critical helping (dphelp.h)
+{
+	if( dphelppool ) dphelppool->readyprio = sc->nheap ? sc->prio[sc->heap[0]] : -1.0;
+}
+
 static void tbsched_push( tbsched_t *sc, int l )
 {
 	int k = sc->nheap++, up;
@@ -3932,6 +3938,7 @@ static void tbsched_push( tbsched_t *sc, int l )
 		k = up;
 	}
 	sc->heap[k] = l;
+	tbsched_readyprio( sc );
 }
 
 static int tbsched_pop( tbsched_t *sc )
@@ -3945,6 +3952,7 @@ static int tbsched_pop( tbsched_t *sc )
 		k = c;
 	}
 	if( sc->nheap ) sc->heap[k] = last;
+	tbsched_readyprio( sc );
 	return( top );
 }
 
@@ -3953,10 +3961,11 @@ static int tbsched_isready( Treedep *dep, int l )
 	return( ( dep[l].child0 == -1 || dep[dep[l].child0].done ) && ( dep[l].child1 == -1 || dep[dep[l].child1].done ) );
 }
 
-static void tbsched_init( tbsched_t *sc, int njob, Treedep *dep, int inorder, int optimistic, int limit )
+static void tbsched_init( tbsched_t *sc, int njob, Treedep *dep, int inorder, int optimistic, int limit, int ***topol, int *seqlen )
 {
 	int l, nstep = njob - 1;
 	double *size = calloc( nstep, sizeof( double ) );
+	double *lmax = calloc( nstep, sizeof( double ) ); // work/v8s: longest member sequence of each step's group
 	sc->heap = calloc( nstep, sizeof( int ) );
 	sc->parent = calloc( nstep, sizeof( int ) );
 	sc->prio = calloc( nstep, sizeof( double ) );
@@ -3984,14 +3993,36 @@ static void tbsched_init( tbsched_t *sc, int njob, Treedep *dep, int inorder, in
 		if( dep[l].child0 != -1 ) sc->parent[dep[l].child0] = l;
 		if( dep[l].child1 != -1 ) sc->parent[dep[l].child1] = l;
 	}
-	for( l=nstep-1; l>=0; l-- ) // parents always have larger indices
-		sc->prio[l] = pow( size[l], 0.75 ) + ( sc->parent[l] == -1 ? 0.0 : sc->prio[sc->parent[l]] );
+	/* work/v8s: a step's cost estimate is now size x Lmax + 3 x L0 x L1 (characters its passes read, plus
+	   the DP cells; Lmax the longest member sequence of the merged group, L0 / L1 those of the two
+	   children), summed to the root as before (prog2: size^0.75).  The old estimate ignored the
+	   lengths: on 16S.T (lengths 506-4,066) it ranked the real critical path ~1,000th of ~2,000 ready
+	   steps, which started 0.2-0.3 s late in each pass at 32 threads (a replay of the measured step
+	   times, tools/priosim.py: 1.83 -> 1.51 s and 1.51 -> 1.29 s; rnasim10k unchanged).  The order of
+	   the ready queue never changes a result (see treebasethread).  MAFFT_SCHEDPRIO=0 (timing builds)
+	   restores the old estimate. */
+	{
+		int old = 0;
+#ifdef PROGTIMING
+		old = ( getenv( "MAFFT_SCHEDPRIO" ) && atoi( getenv( "MAFFT_SCHEDPRIO" ) ) == 0 );
+#endif
+		for( l=0; l<nstep; l++ ) // children first
+		{
+			double l0 = ( dep[l].child0 == -1 ) ? ( seqlen ? (double)seqlen[topol[l][0][0]] : 1.0 ) : lmax[dep[l].child0];
+			double l1 = ( dep[l].child1 == -1 ) ? ( seqlen ? (double)seqlen[topol[l][1][0]] : 1.0 ) : lmax[dep[l].child1];
+			lmax[l] = MAX( l0, l1 );
+			sc->prio[l] = old ? pow( size[l], 0.75 ) : size[l] * lmax[l] + 3.0 * l0 * l1; // (the step's own cost, for now)
+		}
+		for( l=nstep-1; l>=0; l-- ) // parents always have larger indices
+			sc->prio[l] += ( sc->parent[l] == -1 ? 0.0 : sc->prio[sc->parent[l]] );
+	}
 	for( l=0; l<nstep; l++ ) // work/largen: steps done in an earlier phase of the pass are skipped
 	{
 		if( dep[l].done ) sc->ndone++;
 		else if( l < sc->limit && tbsched_isready( dep, l ) ) tbsched_push( sc, l );
 	}
 	free( size );
+	free( lmax );
 }
 
 static void tbsched_free( tbsched_t *sc )
@@ -4094,7 +4125,41 @@ static char *lz_compose( const char *comp, int lcomp, const lzop_t *op )
 	return( out );
 }
 
-typedef struct { int row; const char *gt; int lin, lout; } lzapp_t;
+typedef struct { int row; const char *gt; int lin, lout; char *nw, *old; } lzapp_t; // work/v8s: nw, old (lz_materialize)
+/* work/v8s: the in-place rows of a step are grown (realloc to localcopylen + 11 bytes, prog3's rule) by
+   the step's thread and idle helpers together.  Near the root, after alloclen has grown, that is a
+   realloc (copy) of every row of the alignment, ~0.1 GB on 16S.T, on the critical chain.  Each row
+   belongs to this step alone; realloc keeps its bytes, whichever thread calls it. */
+typedef struct { char **aseq; int *rowcap; const int *mem; int need; } rowgrowctx_t;
+static void rowgrow_rows( void *vctx, int lo, int hi )
+{
+	rowgrowctx_t *c = (rowgrowctx_t *)vctx;
+	int i, j;
+	for( i=lo; i<hi; i++ )
+	{
+		j = c->mem[i];
+		if( c->rowcap[j] < c->need )
+		{
+			c->aseq[j] = realloc( c->aseq[j], c->need );
+			if( c->aseq[j] == NULL ) ErrorExit( "Cannot reallocate a row in treebasethread.\n" );
+			c->rowcap[j] = c->need;
+		}
+	}
+}
+static void rowgrow_all( char **aseq, int *rowcap, const int *mem, int need )
+{
+	rowgrowctx_t c;
+	int n, ngrow = 0;
+	for( n=0; mem[n]!=-1; n++ ) if( rowcap[mem[n]] < need ) ngrow++;
+	if( ngrow == 0 ) return;
+	c.aseq = aseq; c.rowcap = rowcap; c.mem = mem; c.need = need;
+#ifdef enablemultithread
+	dphelp_for( n, MAX( 16, n / 64 ), (double)ngrow * need, 4.0e6, rowgrow_rows, &c );
+#else
+	rowgrow_rows( &c, 0, n );
+#endif
+}
+
 typedef struct { char **aseq; int *rowcap; int need; lzapp_t *app; } lzappctx_t;
 static void lz_apply_rows( void *vctx, int lo, int hi )
 {
@@ -4103,17 +4168,41 @@ static void lz_apply_rows( void *vctx, int lo, int hi )
 	for( k=lo; k<hi; k++ )
 	{
 		lzapp_t *a = c->app + k;
-		if( c->rowcap[a->row] < c->need )
-		{
-			c->aseq[a->row] = realloc( c->aseq[a->row], c->need );
-			if( c->aseq[a->row] == NULL ) ErrorExit( "Cannot reallocate a row (lazy gaps).\n" );
-			c->rowcap[a->row] = c->need;
-		}
 #ifdef PROGTIMING
 		if( (int)strlen( c->aseq[a->row] ) != a->lin ) { reporterr( "\nlazy gaps: row %d has %d characters, its table expects %d\n", a->row, (int)strlen( c->aseq[a->row] ), a->lin ); exit( 1 ); }
 #endif
-		lz_gapins( c->aseq[a->row], a->lin, a->gt, a->lout );
+		if( c->rowcap[a->row] < c->need )
+		{
+			/* work/v8s: a row that must grow gets its gaps on the way into the new buffer (one pass:
+			   the same characters in the same places as realloc + lz_gapins, forward instead of
+			   backward), instead of realloc copying it first.  The new buffers are allocated and the
+			   old ones freed by the poster, outside the parallel part (lz_materialize): on glibc,
+			   threads growing their arenas at once serialize on the address-space lock, which the
+			   page faults of the parallel part also need */
+			const char *old = c->aseq[a->row], *gt = a->gt;
+			char *nw = a->nw ? a->nw : malloc( c->need );
+			int p, q = 0;
+			if( nw == NULL ) ErrorExit( "Cannot reallocate a row (lazy gaps).\n" );
+			for( p=0; p<a->lout; p++ ) nw[p] = ( gt[p] == '-' ) ? '-' : old[q++];
+			nw[a->lout] = 0;
+			if( a->nw ) a->old = (char *)old; else free( (char *)old );
+			c->aseq[a->row] = nw;
+			c->rowcap[a->row] = c->need;
+		}
+		else
+			lz_gapins( c->aseq[a->row], a->lin, a->gt, a->lout );
 	}
+}
+
+static int lz_twophase( void ) // work/v8s: MAFFT_LZTWOPHASE=0 (timing builds) allocates in the parallel part (A/B)
+{
+#ifdef PROGTIMING
+	static int v = -1;
+	if( v < 0 ) { char *e = getenv( "MAFFT_LZTWOPHASE" ); v = !( e && atoi( e ) == 0 ); }
+	return( v );
+#else
+	return( 1 );
+#endif
 }
 
 /* bring the rows of group x (step x) up to date: every table pending inside x's subtree, composed
@@ -4163,6 +4252,7 @@ static void lz_materialize( lzstate_t *z, int x, Treedep *dep, int ***topol, cha
 					app[napp].gt = comp;
 					app[napp].lout = lcomp;
 					app[napp].lin = lin;
+					app[napp].nw = app[napp].old = NULL;
 					napp++;
 				}
 			}
@@ -4175,12 +4265,21 @@ static void lz_materialize( lzstate_t *z, int x, Treedep *dep, int ***topol, cha
 	}
 	{
 		lzappctx_t ctx;
+		int ngrow = 0;
 		ctx.aseq = aseq; ctx.rowcap = rowcap; ctx.need = need; ctx.app = app;
+		if( lz_twophase() ) // work/v8s: the new buffers of the rows that grow, by this thread (see lz_apply_rows)
+			for( k=0; k<napp; k++ )
+				if( rowcap[app[k].row] < need )
+				{
+					if( ( app[k].nw = malloc( need ) ) == NULL ) ErrorExit( "Cannot reallocate a row (lazy gaps).\n" );
+					ngrow++;
+				}
 #ifdef enablemultithread
 		dphelp_for( napp, MAX( 16, napp / 64 ), (double)napp * need, 4.0e6, lz_apply_rows, &ctx );
 #else
 		lz_apply_rows( &ctx, 0, napp );
 #endif
+		if( ngrow ) for( k=0; k<napp; k++ ) free( app[k].old ); // (NULL for the rows that did not grow)
 	}
 	for( k=0; k<nown; k++ ) free( own[k] );
 	for( k=0; k<nused; k++ ) { free( z->op[usedop[k]]->gt ); free( z->op[usedop[k]] ); z->op[usedop[k]] = NULL; }
@@ -4307,6 +4406,7 @@ static void *treebasethread( void *arg )
 	int localcopylen = 0;
 	double heavybytes = 0.0; // work/largen: traceback bytes this step counts against the heavy-step budget
 	int lz_on = 0, lz_stale0 = 0, lz_stale1 = 0, lz_defer0 = 0, lz_defer1 = 0; // work/prog3
+	int gskip[2] = { 0, 0 }; // work/v8s: side left untouched by this step (deferred, not materialized): its rows are not grown
 	char *lcblk = NULL; // work/prog2: per-thread block holding the local copies of the member rows
 	size_t lccap = 0;
 #if SKIP
@@ -4361,7 +4461,13 @@ static void *treebasethread( void *arg )
 			{
 				if( sc->abort ) break; // work/prog2: the pass is being restarted in order (see below)
 				while( sc->nheap > 0 && sc->heap[0] >= sc->limit ) tbsched_pop( sc ); // work/largen: left for a later phase
-				if( sc->nheap > 0 ) break;
+				if( sc->nheap > 0 )
+				{
+					/* work/v8s: a posted job of a step with a higher priority than every ready step (the
+					   critical path) first (dphelp.h) */
+					if( dphelppool && dphelppool->jobs && dphelp_crit_on() && dphelp_serve_crit_locked( sc->prio[sc->heap[0]] ) ) continue;
+					break;
+				}
 				if( dphelppool && dphelp_serve_locked() ) continue;
 				if( dphelppool ? ( sc->ndone == njob-1 ) : ( sc->ntaken == njob-1 ) ) break;
 				if( *nrunpt == 0 ) break; // work/largen: nothing ready, nothing running: the rest belongs to a later phase
@@ -4379,6 +4485,7 @@ static void *treebasethread( void *arg )
 				l = tbsched_pop( sc );
 				sc->ntaken++;
 				sc->started[l] = 1;
+				dphelp_myprio = sc->prio[l]; // work/v8s: this thread's step (critical helping, dphelp.h)
 			}
 		}
 		else
@@ -4629,14 +4736,39 @@ static void *treebasethread( void *arg )
 			   localcopylen + 11 bytes (what ReallocateCharMtx( aseq, njob, alloclen + 10 ) gave every
 			   row in the original). */
 			int need = localcopylen + 11, s;
-			for( s=0; s<2; s++ )
-				for( i=0; (j=localmem[s][i])!=-1; i++ )
-					if( targ->rowcap[j] < need )
+#ifdef PROGTIMING
+			double _g0 = pt_now();
+#endif
+			/* work/v8s: a side this step will hand to A__align as deferred (lazy gaps) without
+			   materializing it is neither read beyond its current length nor written (lazygap.h), so
+			   its rows need no room for the new length now; they are grown when they are materialized
+			   (lz_apply_rows grows each row as it inserts the gaps, with helpers).  Near the root that
+			   moves the realloc of ~7,000 rows per alloclen increase (30-80 ms per step on CARC, on the
+			   critical chain) into the one materialization at the root.  The prediction repeats the
+			   decisions of the lazy-gap block below (checked there). */
+			gskip[0] = gskip[1] = 0;
+			if( targ->lz )
+			{
+				int ff = ( nlen[m1] > clus1 && nlen[m2] > clus2 ); // = ffttry below
+				int useA = !useexternalanchors && !( force_fft || ( use_fft && ff ) ) && alg == 'A' && !( clus1 == 1 && clus2 == 1 ) && len1 > 0 && len2 > 0;
+				if( useA )
+				{
+					int big = ( clus1 + clus2 > 20 && l != njob-2 && specificityconsideration == 0.0 );
+					for( s=0; s<2; s++ )
 					{
-						aseq[j] = realloc( aseq[j], need );
-						if( aseq[j] == NULL ) ErrorExit( "Cannot reallocate a row in treebasethread.\n" );
-						targ->rowcap[j] = need;
+						int c = s ? dep[l].child1 : dep[l].child0;
+						double ***cc = s ? cpmxchild1 : cpmxchild0;
+						int st = ( c != -1 && targ->lz->stale[c] );
+						if( st ) gskip[s] = ( cc && *cc ); // kept stale (else materialized: grown first, see below)
+						else gskip[s] = ( c != -1 && big ); // current rows, gaps deferred
 					}
+				}
+			}
+			for( s=0; s<2; s++ ) // work/v8s: with idle helpers for large groups (rowgrow_all)
+				if( !gskip[s] ) rowgrow_all( aseq, targ->rowcap, localmem[s], need );
+#ifdef PROGTIMING
+			pt_growt = pt_now() - _g0; // work/v8s: row growth time of this step (logged as acc[41])
+#endif
 			for( i=0; (j=localmem[0][i])!=-1; i++ ) localcopy[j] = aseq[j];
 			for( i=0; (j=localmem[1][i])!=-1; i++ ) localcopy[j] = aseq[j];
 		}
@@ -4785,14 +4917,17 @@ static void *treebasethread( void *arg )
 			int useA = !useexternalanchors && !( force_fft || ( use_fft && ffttry ) ) && alg == 'A' && !( clus1 == 1 && clus2 == 1 ) && len1 > 0 && len2 > 0;
 			lz_stale0 = ( c0 != -1 && z->stale[c0] );
 			lz_stale1 = ( c1 != -1 && z->stale[c1] );
+			if( ( gskip[0] || gskip[1] ) && !useA ) ErrorExit( "work/v8s: row growth skipped for a step that does not use A__align.\n" ); // (cannot happen: see the prediction)
 			if( lz_stale0 && !( useA && cpmxchild0 && *cpmxchild0 ) )
 			{
+				if( gskip[0] ) ErrorExit( "work/v8s: row growth skipped for a side that is materialized.\n" );
 				lz_materialize( z, c0, dep, topol, aseq, targ->rowcap, localcopylen + 11 );
 				lz_stale0 = 0;
 				PT_LZMAT( localmem[0] );
 			}
 			if( lz_stale1 && !( useA && cpmxchild1 && *cpmxchild1 ) )
 			{
+				if( gskip[1] ) ErrorExit( "work/v8s: row growth skipped for a side that is materialized.\n" );
 				lz_materialize( z, c1, dep, topol, aseq, targ->rowcap, localcopylen + 11 );
 				lz_stale1 = 0;
 				PT_LZMAT( localmem[1] );
@@ -4809,6 +4944,7 @@ static void *treebasethread( void *arg )
 				int big = ( clus1 + clus2 > 20 && l != njob-2 && specificityconsideration == 0.0 );
 				lz_defer0 = lz_stale0 || ( c0 != -1 && big );
 				lz_defer1 = lz_stale1 || ( c1 != -1 && big );
+				if( ( gskip[0] && !lz_defer0 ) || ( gskip[1] && !lz_defer1 ) ) ErrorExit( "work/v8s: row growth skipped for a side that is not deferred.\n" ); // (cannot happen)
 				if( lz_defer0 || lz_defer1 )
 				{
 					A_lz.on = 1; A_lz.used = 0;
@@ -4936,7 +5072,7 @@ static void *treebasethread( void *arg )
 		}
 #ifdef PROGTIMING
 		PTT(4);
-		if( ptlog ) { int k; for( k=0; k<PT_NACC; k++ ) ptlog[l].acc[k] = pt_acc[k]; ptlog[l].l = l; ptlog[l].thread = thread_no; ptlog[l].clus1 = clus1; ptlog[l].clus2 = clus2; ptlog[l].len1 = len1; ptlog[l].len2 = len2; ptlog[l].c0 = dep[l].child0; ptlog[l].c1 = dep[l].child1; }
+		if( ptlog ) { int k; for( k=0; k<PT_NACC; k++ ) ptlog[l].acc[k] = pt_acc[k]; ptlog[l].acc[41] = pt_growt; pt_growt = 0.0; ptlog[l].l = l; ptlog[l].thread = thread_no; ptlog[l].clus1 = clus1; ptlog[l].clus2 = clus2; ptlog[l].len1 = len1; ptlog[l].len2 = len2; ptlog[l].c0 = dep[l].child0; ptlog[l].c1 = dep[l].child1; }
 #endif
 #if SCOREOUT
 		reporterr(       "score = %10.2f\n", pscore );
@@ -7566,7 +7702,7 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 				for( i=0; i<njob; i++ ) dep[i].done = 0;
 				for( i=0; i<njob; i++ ) fftlog[i] = 1;
 			}
-			tbsched_init( &tbsched, njob, dep, tb_inorder, tb_optimistic, tb_limit );
+			tbsched_init( &tbsched, njob, dep, tb_inorder, tb_optimistic, tb_limit, topol, nlen ); // work/v8s: lengths for the priorities
 			tbsched.detect = ( tb_origserial && tbsched.optimistic );
 			tbsched.heavyfactor = ( tb_keepbytes > 0 ) ? 1.0 : 0.0; // work/largen: see treebasethread()
 #ifdef GCCPAR_TBTEST
@@ -7601,7 +7737,9 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 				tbpool.nidle = 0;
 				tbpool.jobs = NULL;
 				tbpool.pending = NULL;
+				tbpool.readyprio = -1.0; // work/v8s
 				dphelppool = &tbpool;
+				if( !tbsched.inorder ) tbsched_readyprio( &tbsched ); // work/v8s: the leaves are already in the heap
 			}
 #ifdef PROGTIMING
 			if( getenv( "MAFFT_PROGLOG" ) ) { ptlog = calloc( njob, sizeof( ptrec_t ) ); pt_base = pt_now(); }

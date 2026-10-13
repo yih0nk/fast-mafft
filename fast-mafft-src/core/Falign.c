@@ -769,6 +769,191 @@ system( "/usr/bin/gnuplot list.plot" );
 
 
 
+/* work/v8s: MAFFT_V8CHECK=1 (timing builds) -- every parallel pass added by work/v8s (FFT input
+   vectors, anchor profiles, row copies) is redone by the original serial code and compared bitwise. */
+#ifdef PROGTIMING
+int v8check( void )
+{
+	static int v = -1;
+	if( v < 0 ) v = ( getenv( "MAFFT_V8CHECK" ) != NULL );
+	return( v );
+}
+static long v8check_n[4];
+static void v8check_report( void ) __attribute__(( destructor ));
+static void v8check_report( void )
+{
+	if( v8check() > 0 ) reporterr( "\nV8CHECK: %ld FFT-vector builds and transform pairs, %ld anchor-profile builds, %ld row-copy passes, %ld in-place Falign segments verified, no mismatch\n", v8check_n[0], v8check_n[1], v8check_n[2], v8check_n[3] );
+}
+void v8check_count( int k ) { __atomic_add_fetch( v8check_n + k, 1, __ATOMIC_RELAXED ); }
+#endif
+
+static int fa_inplace_on( void ) // work/v8s: MAFFT_FAINPLACE=0 (timing builds) turns the in-place single segment off (A/B)
+{
+#ifdef PROGTIMING
+	static int v = -1;
+	if( v < 0 ) { char *e = getenv( "MAFFT_FAINPLACE" ); v = !( e && atoi( e ) == 0 ); }
+	return( v );
+#else
+	return( 1 );
+#endif
+}
+
+/* work/v8s: the two forward transforms of a Falign call are independent; with an idle helper they run
+   at the same time.  fft() keeps its tables per thread (computed from n alone, the same on every
+   thread), so each transform is the same computation whichever thread runs it. */
+typedef struct { int n; Fukusosuu *a, *b; } fft2ctx_t;
+static void fft2_body( void *vctx, int lo, int hi )
+{
+	fft2ctx_t *c = (fft2ctx_t *)vctx;
+	int k;
+	for( k=lo; k<hi; k++ ) fft( c->n, k ? c->b : c->a, 0 );
+}
+static int Falign_fft2_par( int n, Fukusosuu *a, Fukusosuu *b )
+{
+#ifdef enablemultithread
+	fft2ctx_t c;
+	if( n < 4096 || dphelp_idle() <= 0 ) return( 0 );
+	c.n = n; c.a = a; c.b = b;
+#ifdef PROGTIMING
+	if( v8check() ) // the two transforms again, serially, on copies of the inputs, compared bitwise
+	{
+		Fukusosuu *ca = malloc( sizeof( Fukusosuu ) * n ), *cb = malloc( sizeof( Fukusosuu ) * n );
+		memcpy( ca, a, sizeof( Fukusosuu ) * n ); memcpy( cb, b, sizeof( Fukusosuu ) * n );
+		dphelp_for( 2, 1, (double)n, 0.0, fft2_body, &c );
+		fft( n, ca, 0 ); fft( n, cb, 0 );
+		if( memcmp( ca, a, sizeof( Fukusosuu ) * n ) || memcmp( cb, b, sizeof( Fukusosuu ) * n ) ) { reporterr( "\nV8CHECK MISMATCH in the parallel FFTs (n=%d)\n", n ); exit( 1 ); }
+		free( ca ); free( cb );
+		v8check_count( 0 );
+		return( 1 );
+	}
+#endif
+	dphelp_for( 2, 1, (double)n, 0.0, fft2_body, &c );
+	return( 1 );
+#else
+	return( 0 );
+#endif
+}
+
+/* work/v8s: the FFT input vectors of a large group, built by column ranges with idle helper threads.
+   seq_vec_5 / seq_vec_3 add to entry j, for each member i in ascending order, a term that depends only
+   on member i's letter in column j (the same statement here, so the same contraction).  Split by
+   columns, every entry receives the same additions in the same order, whichever thread makes them.
+   The rows of a group are aligned, all len long, so "up to the terminator" is "up to len".  On the
+   critical chain of real rRNA sets (a group of ~1,800 rows x 5,000-8,000 columns plus a few
+   sequences, step after step) this pass was ~20% of each step. */
+#define FVEC_MINWORK 1.0e6
+typedef struct { Fukusosuu **vec; char **seq; double *eff; int clus, nch, five; } fvecctx_t;
+static void fvec_cols( void *vctx, int lo, int hi )
+{
+	fvecctx_t *c = (fvecctx_t *)vctx;
+	int i, j, n;
+	for( i=0; i<c->clus; i++ )
+	{
+		const char *s = c->seq[i];
+		const double incr = c->eff[i];
+		if( c->five ) // = seq_vec_5( vec[0], polarity, volume, incr, s ), columns lo..hi-1
+		{
+			Fukusosuu *result = c->vec[0];
+			for( j=lo; j<hi; j++ )
+			{
+				n = amino_n[(int)s[j]];
+				if( n > 20 ) continue;
+				result[j].R += incr * polarity[n];
+				result[j].I += incr * volume[n];
+			}
+		}
+		else // = seq_vec_3( vec, incr, s ) with n20or4or2 = nch, columns lo..hi-1
+		{
+			Fukusosuu **result = c->vec;
+			const int nch = c->nch;
+			for( j=lo; j<hi; j++ )
+			{
+				n = amino_n[(int)s[j]];
+				if( n < nch && n >= 0 ) result[n][j].R += incr;
+			}
+		}
+	}
+}
+static void seq_vec_3( Fukusosuu **result, double incr, char *seq );
+static void seq_vec_5( Fukusosuu *result, double *score1, double *score2, double incr, char *seq );
+/* returns 0 (nothing done) when the caller should run the original loop */
+static int Falign_vectors_par( Fukusosuu **vec, char **seq, double *eff, int clus, int len, int nch, int five )
+{
+#ifdef enablemultithread
+	fvecctx_t c;
+	if( (double)clus * len < FVEC_MINWORK || dphelp_idle() <= 0 ) return( 0 );
+	c.vec = vec; c.seq = seq; c.eff = eff; c.clus = clus; c.nch = nch; c.five = five;
+	dphelp_for( len, MAX( 256, len / 64 ), (double)clus * len, FVEC_MINWORK, fvec_cols, &c );
+#ifdef PROGTIMING
+	if( v8check() ) // the original loop into fresh vectors, compared bitwise (entries 0..len-1; the rest stay 0.0 in both)
+	{
+		int k, i, nv = five ? 1 : nch;
+		Fukusosuu **ref = malloc( sizeof( Fukusosuu * ) * nv );
+		for( k=0; k<nv; k++ ) ref[k] = calloc( len + 1, sizeof( Fukusosuu ) );
+		for( i=0; i<clus; i++ )
+		{
+			if( five ) seq_vec_5( ref[0], polarity, volume, eff[i], seq[i] );
+			else seq_vec_3( ref, eff[i], seq[i] );
+		}
+		for( k=0; k<nv; k++ )
+		{
+			if( memcmp( ref[k], vec[k], sizeof( Fukusosuu ) * len ) ) { reporterr( "\nV8CHECK MISMATCH in the FFT vectors (channel %d, clus=%d, len=%d)\n", k, clus, len ); exit( 1 ); }
+			free( ref[k] );
+		}
+		free( ref );
+		v8check_count( 0 );
+	}
+#endif
+	return( 1 );
+#else
+	return( 0 );
+#endif
+}
+
+/* work/v8s: Falign's row copies (segment extraction, appending, the final copy back) for large groups,
+   row by row with idle helper threads.  Each row gets exactly the bytes the serial loop gives it (the
+   same strncpy / memcpy / strcpy call), only possibly on another thread; rows are independent. */
+#define RCPY_MINWORK 2.0e6
+typedef struct { char **dst, **src; int off, n, mode; } rcpyctx_t;
+static void rcpy_rows( void *vctx, int lo, int hi )
+{
+	rcpyctx_t *c = (rcpyctx_t *)vctx;
+	int j;
+	if( c->mode == 0 ) for( j=lo; j<hi; j++ ) { strncpy( c->dst[j], c->src[j]+c->off, c->n ); c->dst[j][c->n] = 0; }
+	else if( c->mode == 1 ) for( j=lo; j<hi; j++ ) memcpy( c->dst[j]+c->off, c->src[j], c->n+1 );
+	else for( j=lo; j<hi; j++ ) strcpy( c->dst[j], c->src[j] );
+}
+/* mode 0: dst[j] = src[j][off..off+n-1] + terminator; 1: src[j] (n chars + terminator) appended at dst[j]+off;
+   2: strcpy( dst[j], src[j] ) with rows of n chars.  Returns 0 (nothing done) when the caller should
+   run its own loop. */
+static int rows_copy_par( char **dst, char **src, int clus, int off, int n, int mode )
+{
+#ifdef enablemultithread
+	rcpyctx_t c;
+	if( (double)clus * n < RCPY_MINWORK || dphelp_idle() <= 0 ) return( 0 );
+	c.dst = dst; c.src = src; c.off = off; c.n = n; c.mode = mode;
+	dphelp_for( clus, MAX( 8, clus / 64 ), (double)clus * n, RCPY_MINWORK, rcpy_rows, &c );
+#ifdef PROGTIMING
+	if( v8check() )
+	{
+		int j;
+		for( j=0; j<clus; j++ )
+		{
+			int bad = 0;
+			if( mode == 0 ) bad = memcmp( dst[j], src[j]+off, n ) || dst[j][n] != 0;
+			else if( mode == 1 ) bad = memcmp( dst[j]+off, src[j], n+1 );
+			else bad = strcmp( dst[j], src[j] );
+			if( bad ) { reporterr( "\nV8CHECK MISMATCH in a row copy (mode %d, row %d)\n", mode, j ); exit( 1 ); }
+		}
+		v8check_count( 2 );
+	}
+#endif
+	return( 1 );
+#else
+	return( 0 );
+#endif
+}
+
 /* work/prog2: per-thread arena for Falign's per-call row buffers (result1/2 and tmpres1/2, clus x
    alloclen each, used to be calloc'ed row by row and freed on every call).  Every row is written
    with a terminator before it is read (tmpres by strncpy + explicit 0, result by result[j][0] = 0
@@ -785,10 +970,18 @@ static void Falign_rows( int clus1, int clus2, int alloclen, char ***r1, char **
 	char **p;
 	if( need > fa_cap )
 	{
-		free( fa_blk );
+#ifdef PROGTIMING
+		pt_acc[43] += 1.0; // work/v8s: arena reallocations
+#endif
+		/* work/v8s: realloc instead of free + malloc (the content does not matter): for a large
+		   (mmapped) block glibc moves the pages with mremap, so the pages already touched need not be
+		   faulted in again along the critical chain, where the arena grows every few steps */
 		fa_cap = need + need / 2;
-		fa_blk = malloc( fa_cap );
-		if( fa_blk == NULL ) ErrorExit( "Cannot allocate the work area in Falign.\n" );
+		{
+			char *nb = realloc( fa_blk, fa_cap );
+			if( nb == NULL ) ErrorExit( "Cannot allocate the work area in Falign.\n" );
+			fa_blk = nb;
+		}
 	}
 	if( n + 4 > fa_rowcap )
 	{
@@ -1012,6 +1205,7 @@ double Falign( int **whichmtx, double ***scoringmatrices, double **n_dynamicmtx,
 	int len1, len2;
 	int totallen;
 	int off1, off2; // work/prog: current length of the rows of result1 / result2
+	int inpl; // work/v8s: one segment, aligned in place
 	double totalscore;
 	double dumdb = 0.0;
 	int headgp, tailgp;
@@ -1096,11 +1290,8 @@ double Falign( int **whichmtx, double ***scoringmatrices, double **n_dynamicmtx,
 	   characters plus the terminator; alloclen is the longest alignment so far in the whole pass, so
 	   below the root the rows were mostly unused (and, with threads, several steps' arenas exist at
 	   once). */
-	{
-		int rowlen = len1 + len2 + 100;
-		if( rowlen > alloclen ) rowlen = alloclen;
-		Falign_rows( clus1, clus2, rowlen, &result1, &result2, &tmpres1, &tmpres2 ); // work/prog2: per-thread arena
-	}
+	/* work/v8s: the arena is set up only when the segment loop needs it (below; not for the in-place
+	   single segment), after the anchor search */
 	sgap1 = AllocateCharVec( clus1 );
 	egap1 = AllocateCharVec( clus1 );
 	sgap2 = AllocateCharVec( clus2 );
@@ -1333,9 +1524,14 @@ system( "less input_of_Falign < /dev/tty > /dev/tty" );
 	if( !kobetsubunkatsu )
 	{
 		if( fftkeika ) fprintf( stderr,  " FFT ... " );
+#ifdef PROGTIMING
+		double _v0 = pt_now();
+#endif
 
 		for( j=0; j<n20or4or2; j++ ) vec_init( seqVector1[j], nlen );
-		if( fftscore && scoremtx != -1 )
+		if( Falign_vectors_par( seqVector1, tmpseq1, eff1, clus1, len1, n20or4or2, fftscore && scoremtx != -1 ) ) // work/v8s
+			;
+		else if( fftscore && scoremtx != -1 )
 		{
 			for( i=0; i<clus1; i++ )
 			{
@@ -1378,7 +1574,9 @@ system( "less seqVec < /dev/tty > /dev/tty" );
 #endif
 
 		for( j=0; j<n20or4or2; j++ ) vec_init( seqVector2[j], nlen );
-		if( fftscore && scoremtx != -1 )
+		if( Falign_vectors_par( seqVector2, tmpseq2, eff2, clus2, len2, n20or4or2, fftscore && scoremtx != -1 ) ) // work/v8s
+			;
+		else if( fftscore && scoremtx != -1 )
 		{
 			for( i=0; i<clus2; i++ )
 			{
@@ -1420,8 +1618,12 @@ fclose( fftfp );
 system( "less seqVec2 < /dev/tty > /dev/tty" );
 #endif
 
+#ifdef PROGTIMING
+		pt_acc[39] += pt_now() - _v0; // work/v8s: FFT input vectors
+#endif
 		for( j=0; j<n20or4or2; j++ )
 		{
+			if( Falign_fft2_par( nlen, seqVector2[j], seqVector1[j] ) ) continue; // work/v8s: the two transforms at once
 			fft( nlen, seqVector2[j], 0 );
 			fft( nlen, seqVector1[j], 0 );
 		}
@@ -1530,7 +1732,22 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 
 	/* work/prog2: the column profiles for alignableReagion are built once for all candidate lags
 	   (alignableReagion_prep / alignableReagion_lag in fftFunctions.c) */
-	alignableReagion_prep( clus1, clus2, seq1, seq2, eff1, eff2 );
+#ifdef PROGTIMING
+	{ double _a0 = pt_now();
+#endif
+#ifdef enablemultithread
+#ifdef PROGTIMING
+	{ int _nc = alignableReagion_prep( clus1, clus2, seq1, seq2, eff1, eff2, dphelp_for, dphelp_idle, v8check() ); // work/v8s: parallel for large groups
+	  while( _nc-- > 0 ) v8check_count( 1 ); }
+#else
+	alignableReagion_prep( clus1, clus2, seq1, seq2, eff1, eff2, dphelp_for, dphelp_idle, 0 ); // work/v8s: parallel for large groups
+#endif
+#else
+	alignableReagion_prep( clus1, clus2, seq1, seq2, eff1, eff2, NULL, NULL, 0 );
+#endif
+#ifdef PROGTIMING
+	pt_acc[36] += pt_now() - _a0; } // work/v8s: anchors, profiles
+#endif
 	for( k=0; k<maxk; k++ ) 
 	{
 		lag = kouho[k];
@@ -1547,7 +1764,13 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 #endif
 
 //		fprintf( stderr, "lag = %d\n", lag );
+#ifdef PROGTIMING
+		{ double _a0 = pt_now();
+#endif
 		tmpint = alignableReagion_lag( lag > 0 ? 0 : -lag, lag > 0 ? lag : 0, segment+count ); // = alignableReagion( clus1, clus2, tmpptr1, tmpptr2, eff1, eff2, segment+count )
+#ifdef PROGTIMING
+		pt_acc[37] += pt_now() - _a0; pt_acc[38] += 1.0; } // work/v8s: anchors, per-lag scoring and scan
+#endif
 #ifdef PROGTIMING
 		if( getenv( "MAFFT_ARCHECK" ) ) // work/prog2: compare with the original, segment by segment, bitwise
 		{
@@ -1761,13 +1984,77 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 	pt_acc[28] += 1.0;
 #endif
 	PT_ADD(2);
+	inpl = ( count - 1 == 1 && cut1[0] == 0 && cut2[0] == 0 && cut1[1] == len1 && cut2[1] == len2
+	    && alg == 'A' && !scoringmatrices && !kobetsubunkatsu && !codonpos && !codonscore && !constraint && chudanpt == NULL
+	    && !( clus1 == 1 && clus2 == 1 ) && fa_inplace_on() ); // work/v8s: see below
+#ifdef PROGTIMING
+	if( !inpl || v8check() ) // (the in-place check aligns the loop's copies in tmpres)
+#else
+	if( !inpl )
+#endif
+	{
+		int rowlen = len1 + len2 + 100;
+		if( rowlen > alloclen ) rowlen = alloclen;
+#ifdef PROGTIMING
+		double _fr0 = pt_now();
+#endif
+		Falign_rows( clus1, clus2, rowlen, &result1, &result2, &tmpres1, &tmpres2 ); // work/prog2: per-thread arena
+#ifdef PROGTIMING
+		pt_acc[42] += pt_now() - _fr0; // work/v8s
+#endif
+		for( j=0; j<clus1; j++ ) result1[j][0] = 0;
+		for( j=0; j<clus2; j++ ) result2[j][0] = 0;
+	}
 	totallen = 0;
 	off1 = off2 = 0;
-	for( j=0; j<clus1; j++ ) result1[j][0] = 0;
-	for( j=0; j<clus2; j++ ) result2[j][0] = 0;
 	totalscore = 0.0;
 	*fftlog = -1;
 //	reporterr( "\nin Falign(), *fftlog = %d\n", *fftlog );
+	/* work/v8s: one segment covering both groups (no anchor kept: most Falign calls of the large
+	   groups on the critical chain of real rRNA sets) is aligned in place, in seq1/seq2.  The loop
+	   below would copy every row into tmpres (strncpy of the whole row), align tmpres in place,
+	   append it to the empty result rows and copy those back into seq1/seq2: the same bytes end up
+	   in seq1/seq2 either way, and A__align gets byte-identical rows and the same arguments (headgp
+	   = tailgp = outgap, boundary gap patterns all 'o' because the cut points are 0 and len).  The
+	   rows hold what the final strcpy would have written (<= alloclen + 1 bytes, the LENGTH OVER
+	   check is kept).  Not used with chudan (an aborted A__align must leave seq1/seq2 untouched).
+	   MAFFT_V8CHECK (timing builds) also aligns the copies the loop would make and compares;
+	   MAFFT_FAINPLACE=0 (timing builds) turns it off (A/B). */
+	if( inpl )
+	{
+#ifdef PROGTIMING
+		int chk = v8check();
+		if( chk ) // the loop's copies, aligned below for comparison
+		{
+			for( j=0; j<clus1; j++ ) { strncpy( tmpres1[j], seq1[j], len1 ); tmpres1[j][len1] = 0; }
+			for( j=0; j<clus2; j++ ) { strncpy( tmpres2[j], seq2[j], len2 ); tmpres2[j][len2] = 0; }
+		}
+#endif
+		*fftlog += 1;
+		for( j=0; j<clus1; j++ ) sgap1[j] = egap1[j] = 'o';
+		for( j=0; j<clus2; j++ ) sgap2[j] = egap2[j] = 'o';
+		PT_ADD(3);
+		totalscore += A__align( n_dynamicmtx, penalty, penalty_ex, seq1, seq2, eff1, eff2, clus1, clus2, alloclen, 0, &dumdb, sgap1, sgap2, egap1, egap2, chudanpt, chudanref, chudanres, outgap, outgap, -1, -1, NULL, NULL, NULL, 0.0, 0.0 );
+		PT_ADD(4);
+		nlen = strlen( seq1[0] );
+		if( nlen > alloclen )
+		{
+			fprintf( stderr, "totallen=%d +  nlen=%d > alloclen = %d\n", 0, nlen, alloclen );
+			ErrorExit( "LENGTH OVER in Falign\n " );
+		}
+#ifdef PROGTIMING
+		if( chk )
+		{
+			double ts = 0.0, dd = 0.0;
+			ts += A__align( n_dynamicmtx, penalty, penalty_ex, tmpres1, tmpres2, eff1, eff2, clus1, clus2, alloclen, 0, &dd, sgap1, sgap2, egap1, egap2, chudanpt, chudanref, chudanres, outgap, outgap, -1, -1, NULL, NULL, NULL, 0.0, 0.0 );
+			for( j=0; j<clus1; j++ ) if( strcmp( tmpres1[j], seq1[j] ) ) { reporterr( "\nV8CHECK MISMATCH in the in-place Falign segment, group 1 row %d\n", j ); exit( 1 ); }
+			for( j=0; j<clus2; j++ ) if( strcmp( tmpres2[j], seq2[j] ) ) { reporterr( "\nV8CHECK MISMATCH in the in-place Falign segment, group 2 row %d\n", j ); exit( 1 ); }
+			if( memcmp( &ts, &totalscore, sizeof( double ) ) ) { reporterr( "\nV8CHECK MISMATCH in the in-place Falign score\n" ); exit( 1 ); }
+			v8check_count( 3 );
+		}
+#endif
+		goto inplace_done;
+	}
 #ifdef enablemultithread
 	/* work/prog3: segments in parallel (Falign_psegs) when helpers are idle and there is enough work */
 	if( count - 1 >= 2 && pseg_on() && alg == 'A' && !scoringmatrices && !kobetsubunkatsu && !codonpos && !codonscore && chudanpt == NULL
@@ -1882,6 +2169,7 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 		//reporterr( "cut1[] = %d\n", cut1[i] );
 		//reporterr( "cut2[] = %d\n", cut2[i] );
 
+		if( !rows_copy_par( tmpres1, seq1, clus1, cut1[i], cut1[i+1]-cut1[i], 0 ) ) // work/v8s
 		for( j=0; j<clus1; j++ )
 		{
 			strncpy( tmpres1[j], seq1[j]+cut1[i], cut1[i+1]-cut1[i] );
@@ -1889,6 +2177,7 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 		}
 		if( kobetsubunkatsu && fftkeika ) commongappick( clus1, tmpres1 ); //dvtditr に呼ばれたとき fftkeika=1
 //		if( kobetsubunkatsu ) commongappick( clus1, tmpres1 );
+		if( !rows_copy_par( tmpres2, seq2, clus2, cut2[i], cut2[i+1]-cut2[i], 0 ) ) // work/v8s
 		for( j=0; j<clus2; j++ )
 		{
 			strncpy( tmpres2[j], seq2[j]+cut2[i], cut2[i+1]-cut2[i] );
@@ -2028,7 +2317,9 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 		   the same as with strcat(). */
 		{
 			int add1 = strlen( tmpres1[0] ), add2 = strlen( tmpres2[0] );
+			if( !rows_copy_par( result1, tmpres1, clus1, off1, add1, 1 ) ) // work/v8s
 			for( j=0; j<clus1; j++ ) memcpy( result1[j]+off1, tmpres1[j], add1+1 );
+			if( !rows_copy_par( result2, tmpres2, clus2, off2, add2, 1 ) )
 			for( j=0; j<clus2; j++ ) memcpy( result2[j]+off2, tmpres2[j], add2+1 );
 			off1 += add1;
 			off2 += add2;
@@ -2072,8 +2363,11 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 	pseg_done:
 #endif
 
+	if( !rows_copy_par( seq1, result1, clus1, 0, off1, 2 ) ) // work/v8s
 	for( j=0; j<clus1; j++ ) strcpy( seq1[j], result1[j] );
+	if( !rows_copy_par( seq2, result2, clus2, 0, off2, 2 ) )
 	for( j=0; j<clus2; j++ ) strcpy( seq2[j], result2[j] );
+	inplace_done: // work/v8s
 #if 0
 	for( j=0; j<clus1; j++ ) 
 	{

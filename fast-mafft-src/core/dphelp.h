@@ -22,6 +22,8 @@ typedef struct _dphelpjob
 	int slots;               // helpers that may still join (guarded by the pool mutex)
 	int refs;                // helpers currently inside run() (atomic)
 	struct _dphelpjob *next; // (guarded by the pool mutex)
+	int posted;              // work/v8s: dphelp_post put the job on the list (dphelp_finish must then take the mutex)
+	double prio;             // work/v8s: the posting step's priority (dphelp_myprio)
 } dphelpjob_t;
 
 typedef struct
@@ -31,6 +33,7 @@ typedef struct
 	int nidle;               // threads waiting on cond (guarded by mutex)
 	dphelpjob_t *jobs;       // posted jobs with free slots (guarded by mutex)
 	volatile int *pending;   // optional: > 0 while a guide-tree step is ready to run (read racily)
+	volatile double readyprio; // work/v8s: priority of the best ready guide-tree step, -1 if none (written under mutex, read racily)
 } dphelppool_t;
 
 extern dphelppool_t *dphelppool;
@@ -41,6 +44,16 @@ void dphelp_post( dphelpjob_t *job, int maxslots ); // offer up to maxslots help
 void dphelp_finish( dphelpjob_t *job );           // withdraw the job and wait until no helper is inside run()
 /* idle worker, called with pool->mutex held; returns 1 if it helped (mutex held again on return) */
 int dphelp_serve_locked( void );
+
+/* work/v8s: critical helping.  A step on the critical path (its priority above that of every ready
+   step) may post a large job even when no thread is idle; a thread that finishes a step serves such a
+   job before it takes a ready step of lower priority (dphelp_serve_crit_locked, from the scheduler
+   loop with the mutex held).  dphelp_myprio is the priority of the step the calling thread runs. */
+extern TLS double dphelp_myprio;
+int dphelp_crit_on( void );
+int dphelp_iscritical( void );                       // racy hint: this thread's step beats every ready step
+void dphelp_post_crit( dphelpjob_t *job, int maxslots ); // as dphelp_post, slots not limited to idle threads
+int dphelp_serve_crit_locked( double readyprio );   // serve a posted job with prio > readyprio; 1 if helped
 
 /* body( ctx, lo, hi ) for [0,n) in chunks, by the caller and any idle helpers; runs body( ctx, 0, n )
    directly when nobody is idle or work < minwork (work = n * cost per item, any unit).  The

@@ -1,7 +1,11 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE // work/v8s: glibc declares posix_memalign (used since work/prog2), nanosleep only with a feature macro under -std=c99; gcc >= 14 rejects implicit declarations
+#endif
 #include "mltaln.h"
 #include "progtiming.h"
 #include "dphelp.h"
 #include "lazygap.h"
+#include <time.h>
 #ifdef PROGTIMING
 int pt_nofastdp = -1; /* A/B switch for timing builds: MAFFT_NOFASTDP=1 disables the fast DP path */
 static int pt_fastdp_enabled( void ) { if( pt_nofastdp < 0 ) pt_nofastdp = ( getenv( "MAFFT_NOFASTDP" ) != NULL ); return( !pt_nofastdp ); }
@@ -936,6 +940,23 @@ static void createfgresult( double **gapfresult, int limk, double eff1, double e
 
 TLS a_lazy_t A_lz; // work/prog3: see lazygap.h
 static TLS int atr_len1 = -1, atr_len2 = -1; // work/prog3: lengths for Atracking when rows are not current
+/* work/v8s: band-major traceback of a tiled DP.  Band b (columns J[b] .. J[b+1]-1) keeps its codes in a
+   region of its own, rows of w[b] ints one after the other (row i, column j at base[b][i*w[b] + j-J[b]]),
+   instead of a slice of every row of the row-major matrix: a band then writes one contiguous stream,
+   not 48-200 ints into a different page every row.  On CARC (32 threads over two sockets) the strided
+   writes were ~2/3 of the tiled DPs' time (MAFFT_TILEIJPTEST, see notes/v8s-lever.md).  The same codes
+   at the same (i, j); Atracking reads them through ATR_IJP.  The regions are carved from the same
+   traceback block (rows 0 .. nrows+1 of every band: Atracking's corner may be row lgth1 = nrows+1). */
+#define IJT_MAXB 32
+typedef struct { int nb; int J[IJT_MAXB+1]; int *base[IJT_MAXB]; int w[IJT_MAXB]; } ijtile_t;
+static TLS ijtile_t atr_tile;
+static TLS int atr_tiled = 0; // set by Adp_tiled for the Atracking of the same A__align call
+static inline int *ijt_cell( const ijtile_t *t, int i, int j )
+{
+	int lo = 0, hi = t->nb - 1;
+	while( lo < hi ) { int mid = ( lo + hi + 1 ) / 2; if( t->J[mid] <= j ) lo = mid; else hi = mid - 1; }
+	return( t->base[lo] + (size_t)i * t->w[lo] + ( j - t->J[lo] ) );
+}
 
 static double Atracking( double *lasthorizontalw, double *lastverticalw, 
 						double fpenalty, double fpenalty_ex,
@@ -1008,7 +1029,7 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
 			{
 				wm = g;
 				iin = lgth1-1; jin = j;
-				ijp[lgth1][lgth2] = -( lgth2 - j );
+				*( atr_tiled ? ijt_cell( &atr_tile, lgth1, lgth2 ) : &ijp[lgth1][lgth2] ) = -( lgth2 - j );
 			}
 		}
 		for( i=lgth1-2; i>=0; i-- )
@@ -1017,14 +1038,14 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
 			{
 				wm = g;
 				iin = i; jin = lgth2-1;
-				ijp[lgth1][lgth2] = +( lgth1 - i );
+				*( atr_tiled ? ijt_cell( &atr_tile, lgth1, lgth2 ) : &ijp[lgth1][lgth2] ) = +( lgth1 - i );
 			}
 		}
 		if( lasthorizontalw[lgth2-1] > wm )  // score ga onaji baai erabarenai
 		{
 			wm = lasthorizontalw[lgth2-1];
 			iin = lgth1-1; jin = lgth2-1;
-			ijp[lgth1][lgth2] = 0;
+			*( atr_tiled ? ijt_cell( &atr_tile, lgth1, lgth2 ) : &ijp[lgth1][lgth2] ) = 0;
 		}
 #else
 		wm = lastverticalw[0];
@@ -1034,7 +1055,7 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
 			{
 				wm = lastverticalw[i];
 				iin = i; jin = lgth2-1;
-				ijp[lgth1][lgth2] = +( lgth1 - i );
+				*( atr_tiled ? ijt_cell( &atr_tile, lgth1, lgth2 ) : &ijp[lgth1][lgth2] ) = +( lgth1 - i );
 			}
 		}
 		for( j=0; j<lgth2; j++ )
@@ -1043,7 +1064,7 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
 			{
 				wm = lasthorizontalw[j];
 				iin = lgth1-1; jin = j;
-				ijp[lgth1][lgth2] = -( lgth2 - j );
+				*( atr_tiled ? ijt_cell( &atr_tile, lgth1, lgth2 ) : &ijp[lgth1][lgth2] ) = -( lgth2 - j );
 			}
 		}
 #endif
@@ -1052,7 +1073,7 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
 	/* work/prog3: row 0 and column 0 of ijp are no longer filled in (lgth1 + lgth2 scattered writes,
 	   one per row of a matrix that can have 10^4 rows); the walk below uses the values they would
 	   hold: ijp[0][j] = -( j + 1 ) (written last, so also ijp[0][0] = -1) and ijp[i][0] = i + 1. */
-#define ATR_IJP( ii, jj ) ( (ii) == 0 ? -( (jj) + 1 ) : (jj) == 0 ? (ii) + 1 : ijp[ii][jj] )
+#define ATR_IJP( ii, jj ) ( (ii) == 0 ? -( (jj) + 1 ) : (jj) == 0 ? (ii) + 1 : atr_tiled ? *ijt_cell( &atr_tile, ii, jj ) : ijp[ii][jj] ) // work/v8s: atr_tiled
 
 	gaptable1 = gt1bk + lgth1+lgth2;
 	*gaptable1 = 0;
@@ -1685,6 +1706,79 @@ static void Adp_blockmasks( unsigned int *bm, const double * const *cu, int nu, 
 	}
 }
 
+#ifdef PROGTIMING
+/* work/v8s: MAFFT_V8STAT=1 (timing builds) -- which row kernel the A__align DP rows take, how many
+   letters they carry, and why a DP was not tiled; printed at exit.  Counters only, no effect on
+   the computation. */
+static int v8s_stat_v = -1;
+static int v8s_stat_on( void ) { if( v8s_stat_v < 0 ) v8s_stat_v = ( getenv( "MAFFT_V8STAT" ) != NULL ); return( v8s_stat_v ); }
+static double v8s_cells[2][3][DENSE_MAXU+1]; // [serial/tiled][rowfused 0/1/2][letters]: cells
+static double v8s_eff4[2], v8s_eff16[2];       // gen rows: letter*cells of the 4- and 16-column block chains
+static double v8s_notile[8], v8s_notilen[8];   // cells / DPs not tiled, by reason
+static double v8s_tiled[2];                    // tiled DPs: count, cells
+static double v8s_gentime[2], v8s_f4time;      // serial gen rows: time, cells; serial fused4 rows: time
+static double v8s_tile[16];                    // tiled DPs: elapsed, participation, row time, claims, threads, band changes, bands, elapsed*bands; [8..13] the same for DPs >= 2e7 cells
+static void v8s_add( double *p, double v ) // atomic add on a double (CAS loop)
+{
+	long long *q = (long long *)p, oi, ni;
+	double o, n;
+	oi = __atomic_load_n( q, __ATOMIC_RELAXED );
+	do { memcpy( &o, &oi, sizeof o ); n = o + v; memcpy( &ni, &n, sizeof ni ); }
+	while( !__atomic_compare_exchange_n( q, &oi, ni, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED ) );
+}
+static void v8s_stat_row( int tiled, int kind, int nl, int lgth2, unsigned int rowmask, const unsigned int *bm )
+{
+	if( nl > DENSE_MAXU ) nl = DENSE_MAXU;
+	v8s_add( &v8s_cells[tiled][kind][nl], (double)lgth2 );
+	if( kind == 2 && bm )
+	{
+		int b, nb = ( lgth2 + 3 ) / 4;
+		double e4 = 0.0, e16 = 0.0;
+		for( b=0; b<nb; b++ ) e4 += 4.0 * __builtin_popcount( rowmask & bm[b] );
+		for( b=0; b<nb; b+=4 ) e16 += 16.0 * __builtin_popcount( rowmask & ( bm[b] | ( b+1 < nb ? bm[b+1] : 0 ) | ( b+2 < nb ? bm[b+2] : 0 ) | ( b+3 < nb ? bm[b+3] : 0 ) ) );
+		v8s_add( &v8s_eff4[tiled], e4 );
+		v8s_add( &v8s_eff16[tiled], e16 );
+	}
+}
+static void v8s_stat_report( void ) __attribute__(( destructor ));
+static void v8s_stat_report( void )
+{
+	int s, k, n;
+	static const char *why[8] = { "nrows<2|cells<min|dense_nu<0", "no idle helper", "lgth2<2*minw", "nb<2", "NOGENERAL", "alloc", "", "" };
+	if( v8s_stat_v <= 0 ) return;
+	for( s=0; s<2; s++ )
+	{
+		double tot = 0.0;
+		for( k=0; k<3; k++ ) for( n=0; n<=DENSE_MAXU; n++ ) tot += v8s_cells[s][k][n];
+		reporterr( "\nV8STAT %s rows: %.3g cells\n", s ? "tiled" : "serial", tot );
+		for( k=0; k<3; k++ )
+		{
+			double t = 0.0;
+			for( n=0; n<=DENSE_MAXU; n++ ) t += v8s_cells[s][k][n];
+			if( t == 0.0 ) continue;
+			reporterr( "V8STAT   kernel %s: %.3g cells (%.1f%%); by letters:", k == 0 ? "two-pass" : k == 1 ? "fused4" : "general", t, 100.0 * t / tot );
+			for( n=0; n<=DENSE_MAXU; n++ ) if( v8s_cells[s][k][n] > 0.0 ) reporterr( " %d:%.1f%%", n, 100.0 * v8s_cells[s][k][n] / t );
+			reporterr( "\n" );
+			if( k == 2 ) reporterr( "V8STAT   general rows: letters per cell, 4-col chains %.2f, 16-col chains %.2f\n", v8s_eff4[s] / t, v8s_eff16[s] / t );
+		}
+	}
+	reporterr( "V8STAT tiled DPs: %.0f, %.3g cells\n", v8s_tiled[0], v8s_tiled[1] );
+	for( k=0; k<8; k++ ) if( v8s_notilen[k] > 0.0 ) reporterr( "V8STAT not tiled (%s): %.0f DPs, %.3g cells\n", why[k], v8s_notilen[k], v8s_notile[k] );
+	if( v8s_tile[0] > 0.0 )
+	{
+		reporterr( "V8STAT tiled DPs: elapsed %.3f s, thread participation %.3f s, row work %.3f s (%.0f%% of participation), %.2f threads and %.1f bands per DP, %.0f claims (%.0f band changes)\n",
+			v8s_tile[0], v8s_tile[1], v8s_tile[2], 100.0 * v8s_tile[2] / v8s_tile[1], v8s_tile[4] / v8s_tiled[0], v8s_tile[6] / v8s_tiled[0], v8s_tile[3], v8s_tile[5] );
+		if( v8s_tile[14] > 0.0 ) reporterr( "V8STAT critical tilings: %.0f DPs, %.2f participants per DP\n", v8s_tile[14], v8s_tile[15] / v8s_tile[14] );
+		if( v8s_tile[11] > 0.0 ) reporterr( "V8STAT tiled DPs >= 2e7 cells: %.0f DPs, elapsed %.3f s, participation %.3f s, row work %.3f s (%.0f%%), %.2f threads, %.1f bands per DP\n",
+			v8s_tile[11], v8s_tile[8], v8s_tile[10], v8s_tile[9], 100.0 * v8s_tile[9] / v8s_tile[10], v8s_tile[12] / v8s_tile[11], v8s_tile[13] / v8s_tile[11] );
+	}
+	reporterr( "V8STAT serial general rows: %.3f s for %.3g cells (%.2f ns/cell); serial fused4 rows %.3f s\n", v8s_gentime[0], v8s_gentime[1], v8s_gentime[1] > 0.0 ? 1e9 * v8s_gentime[0] / v8s_gentime[1] : 0.0, v8s_f4time );
+}
+#define V8S_NOTILE( r, c ) do { if( v8s_stat_on() ) { v8s_add( &v8s_notile[r], (c) ); v8s_add( &v8s_notilen[r], 1.0 ); } } while( 0 )
+#else
+#define V8S_NOTILE( r, c )
+#endif
+
 static void Adp_row_denseK( int i, int lgth2, unsigned int rowmask, const double *su, const double * const *cu, const unsigned int *bm,
 	double * restrict mloc, int * restrict mploc, double * restrict curw, int * restrict ijpi,
 	const double * restrict prew, const double * restrict gf2, const double * restrict fg2, const double * restrict og2,
@@ -1828,12 +1922,68 @@ int dphelp_idle( void )
 	return( pool ? pool->nidle : 0 );
 }
 
+TLS double dphelp_myprio = 0.0; // work/v8s (dphelp.h)
+static int dphelp_crit_v = -1;
+int dphelp_crit_on( void )
+{
+	if( dphelp_crit_v < 0 )
+	{
+#ifdef PROGTIMING
+		char *e = getenv( "MAFFT_CRITHELP" ); // off by default (no gain measured, see notes/v8s-lever.md); =1 turns it on
+		dphelp_crit_v = ( e && atoi( e ) != 0 );
+#else
+		dphelp_crit_v = 0;
+#endif
+	}
+	return( dphelp_crit_v );
+}
+int dphelp_iscritical( void )
+{
+	dphelppool_t *pool = dphelppool;
+	return( pool && dphelp_crit_on() && dphelp_myprio > pool->readyprio );
+}
+void dphelp_post_crit( dphelpjob_t *job, int maxslots )
+{
+	dphelppool_t *pool = dphelppool;
+	job->slots = 0;
+	job->refs = 0;
+	job->next = NULL;
+	job->posted = 0;
+	job->prio = dphelp_myprio;
+	if( pool == NULL || maxslots <= 0 ) return;
+	pthread_mutex_lock( pool->mutex );
+	job->slots = maxslots;
+	job->next = pool->jobs;
+	pool->jobs = job;
+	job->posted = 1;
+	if( pool->nidle > 0 ) pthread_cond_broadcast( pool->cond );
+	pthread_mutex_unlock( pool->mutex );
+}
+int dphelp_serve_crit_locked( double readyprio )
+{
+	dphelppool_t *pool = dphelppool;
+	dphelpjob_t *job, **pp;
+	if( pool == NULL ) return( 0 );
+	for( pp=&pool->jobs; ( job = *pp ) != NULL; pp=&job->next )
+		if( job->prio > readyprio && job->slots > 0 ) break;
+	if( job == NULL ) return( 0 );
+	if( --job->slots <= 0 ) *pp = job->next;
+	__atomic_add_fetch( &job->refs, 1, __ATOMIC_ACQ_REL );
+	pthread_mutex_unlock( pool->mutex );
+	job->run( job->arg );
+	__atomic_sub_fetch( &job->refs, 1, __ATOMIC_RELEASE ); // the poster may free the job after this
+	pthread_mutex_lock( pool->mutex );
+	return( 1 );
+}
+
 void dphelp_post( dphelpjob_t *job, int maxslots )
 {
 	dphelppool_t *pool = dphelppool;
 	job->slots = 0;
 	job->refs = 0;
 	job->next = NULL;
+	job->posted = 0;
+	job->prio = dphelp_myprio;
 	if( pool == NULL || maxslots <= 0 || pool->nidle <= 0 ) return;
 	pthread_mutex_lock( pool->mutex );
 	job->slots = MIN( maxslots, pool->nidle );
@@ -1841,6 +1991,7 @@ void dphelp_post( dphelpjob_t *job, int maxslots )
 	{
 		job->next = pool->jobs;
 		pool->jobs = job;
+		job->posted = 1;
 		pthread_cond_broadcast( pool->cond );
 	}
 	pthread_mutex_unlock( pool->mutex );
@@ -1851,7 +2002,16 @@ void dphelp_finish( dphelpjob_t *job )
 	dphelppool_t *pool = dphelppool;
 	int spins = 0;
 	if( pool == NULL ) return;
-	if( job->slots > 0 || __atomic_load_n( &job->refs, __ATOMIC_ACQUIRE ) > 0 )
+	/* work/v8s: RACE FIX.  This used to take the mutex only when it saw job->slots > 0 or refs > 0,
+	   reading slots without the mutex.  A helper in dphelp_serve_locked decrements slots (to 0, taking
+	   the job off the list) and only then increments refs, both under the mutex; a poster reading in
+	   between saw slots == 0 and refs == 0, returned, and its stack frame (the job, and dphelp_for's
+	   loop state) died while the helper went on to call job->run from it.  Observed as a SIGBUS (a call
+	   into a heap address from dphelp_serve_locked) once in ~100 local rnasim1k runs after work/v8s
+	   added more dphelp_for calls; latent in every earlier version with helpers.  Now a posted job is
+	   always withdrawn under the mutex: whatever a helper did with it happened before its unlock, so
+	   refs is seen here. */
+	if( job->posted )
 	{
 		dphelpjob_t **pp;
 		pthread_mutex_lock( pool->mutex );
@@ -1860,7 +2020,10 @@ void dphelp_finish( dphelpjob_t *job )
 		pthread_mutex_unlock( pool->mutex );
 	}
 	while( __atomic_load_n( &job->refs, __ATOMIC_ACQUIRE ) > 0 )
-		if( ++spins > 64 ) sched_yield();
+	{
+		if( ++spins <= 4096 ) sched_yield();
+		else { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 100000; nanosleep( &ts, NULL ); } // work/v8s: never spin for long
+	}
 }
 
 int dphelp_serve_locked( void )
@@ -1941,13 +2104,41 @@ void dphelp_for( int n, int chunk, double work, double minwork, void (*body)( vo
    compare-and-swap and released with a release store), so its column state moves between
    threads safely. */
 #define ADPB_MAXB 32
+#ifdef PROGTIMING
+static int adpb_ijptest = 0; // work/v8s: diagnosis switch MAFFT_TILEIJPTEST, see adpb_row
+#endif
+#if defined( __x86_64__ ) || defined( __i386__ )
+#define ADPB_RELAX() __builtin_ia32_pause()
+#elif defined( __aarch64__ )
+#define ADPB_RELAX() __asm__ __volatile__( "yield" )
+#else
+#define ADPB_RELAX() do { } while( 0 )
+#endif
+/* work/v8s: every wait of the tiled DP (a band for its predecessor, band 0 for its rows' selections, a
+   thread for a band) spins briefly, then yields, then sleeps, so that waiting threads never keep a
+   descheduled thread that they wait for off the cores.  Pure spinning (with a yield every few
+   thousand polls) once made a 16S.T run take 658 s instead of ~10 s on this Mac with other load. */
+static void adpb_wait( int *spins )
+{
+	int s = ++*spins;
+	if( s <= 256 ) { int k; for( k=0; k<4; k++ ) ADPB_RELAX(); }
+	else if( s <= 1024 ) sched_yield();
+	else
+	{
+		struct timespec ts;
+		ts.tv_sec = 0;
+		ts.tv_nsec = ( s <= 1200 ) ? 50000 : 200000;
+		nanosleep( &ts, NULL );
+	}
+}
 typedef struct { int nu, n1; int u[DENSE_MAXU]; int k1[0x100]; } adpb_letters_t; // the poster's dense_u / dense1_k (TLS)
 typedef struct
 {
 	int done;   // rows 1..done of this band are finished (atomic)
 	int busy;   // a thread is working on this band (atomic)
-	char pad[56];
-} adpb_band_t;
+	double wmlast; // work/v8s: the last band's wm after each row (see adpb_t)
+	char pad[48];
+} __attribute__(( aligned( 64 ) )) adpb_band_t; // work/v8s: one cache line per band (the array was not line-aligned)
 
 typedef struct
 {
@@ -1970,15 +2161,32 @@ typedef struct
 	adpb_letters_t letters;
 	double fpenalty_ex;
 	double *bw, *bmi; int *bmpi;    // [b*(nrows+1)+i]: values handed from band b-1 to band b
-	double wmlast;
+	/* work/v8s: wmlast used to be here, written after every row by the last band, in the cache line
+	   holding bw, bmi, bmpi and fpenalty_ex, which every band reads for every row: on CARC that line
+	   moved between cores (often sockets) once per row and band.  It now lives in the last band's
+	   own line (adpb_band_t), and setup_next (written during the selections) in a line of its own. */
+	int setup_next __attribute__(( aligned( 64 ) )); // work/v8s: next row offset whose letter selection is unclaimed (atomic)
+	char pad_setup[60];
+	int sch;                        // work/v8s: rows per selection chunk
+	int *ready;                     // work/v8s: per selection chunk, 1 when its rows are set up (atomic)
+	int sticky;                     // work/v8s: band ownership policy (see adpb_run)
+	int batch;                      // work/v8s: a band starts when its predecessor is this many rows ahead (or done)
+	int localsetup;                 // work/v8s: every band makes its rows' letter selections itself (adpb_row)
+	int claimcap;                   // work/v8s: rows a thread processes on a band before it picks again (adpb_run)
+	int bandmajor;                  // work/v8s: traceback codes in band-major regions (ijt_cell)
+	int *ijb[ADPB_MAXB]; int ijw[ADPB_MAXB];
 	adpb_band_t band[ADPB_MAXB];
+#ifdef PROGTIMING
+	double st_busy, st_part, st_claims, st_nthr, st_migr; // work/v8s (MAFFT_V8STAT): row time, participation time, claims, threads, band changes
+#endif
 } adpb_t;
 
 /* work/prog3: the per-row letter selection of the tiled DP (see Adp_tiled); returns the count */
-static int adpb_rowsetup( double **n_dynamicmtx, double **cpmx1, double **cpmx2, int i, int ks,
-	double *rs, const double **rc, int *rn, double *rsu, unsigned int *rmask, const adpb_letters_t *L )
+/* work/v8s: the selection of row i into rs4[0..3], rc4[0..3], *rnp, scu[0..nu-1], *maskp (adpb_rowsetup's
+   body, with the outputs of one row passed directly) */
+static int adpb_rowsetup_to( double **n_dynamicmtx, double **cpmx1, double **cpmx2, int i,
+	double *rs4, const double **rc4, int *rnp, double *scu, unsigned int *maskp, const adpb_letters_t *L )
 {
-	double *scu = rsu + ks*i;
 	unsigned int mask = 0;
 	int u, t, nsel = 0, n;
 	for( u=0; u<L->nu; u++ ) // = dense_scores1(), with the letter lists passed explicitly (this may run on a helper thread)
@@ -1997,46 +2205,99 @@ static int adpb_rowsetup( double **n_dynamicmtx, double **cpmx1, double **cpmx2,
 		if( scu[u] == 0.0 ) continue;
 		if( nsel < 4 )
 		{
-			rs[4*i+nsel] = scu[u];
-			rc[4*i+nsel] = cpmx2[L->u[u]];
+			rs4[nsel] = scu[u];
+			rc4[nsel] = cpmx2[L->u[u]];
 		}
 		mask |= 1u << u;
 		nsel++;
 	}
-	rn[i] = n = nsel;
-	rmask[i] = mask;
+	*rnp = n = nsel;
+	*maskp = mask;
 	for( ; nsel<4; nsel++ )
 	{
-		rs[4*i+nsel] = 0.0;
-		rc[4*i+nsel] = cpmx2[0];
+		rs4[nsel] = 0.0;
+		rc4[nsel] = cpmx2[0];
 	}
 	return( n );
 }
 
+static int adpb_rowsetup( double **n_dynamicmtx, double **cpmx1, double **cpmx2, int i, int ks,
+	double *rs, const double **rc, int *rn, double *rsu, unsigned int *rmask, const adpb_letters_t *L )
+{
+	return( adpb_rowsetup_to( n_dynamicmtx, cpmx1, cpmx2, i, rs + 4*i, rc + 4*i, rn + i, rsu + ks*i, rmask + i, L ) );
+}
+
 static void adpb_row( adpb_t *p, int b, int i )
 {
-	if( b == 0 && p->lazyrows ) // work/prog3: band 0 sees every row first (the others wait for it)
-		adpb_rowsetup( p->dynmtx, p->cpmx1, p->cpmx2, i, p->ks, (double *)p->rs, (const double **)p->rc, (int *)p->rn, (double *)p->rsu, (unsigned int *)p->rmask, &p->letters );
+	/* work/v8s: with localsetup every band makes row i's letter selection itself, into thread-local
+	   scratch (the same function on the same inputs, so the same values): no band reads another
+	   core's selection arrays (rs, rc, rn, rsu, rmask: 4-5 cache lines per row) */
+	static TLS double l_rs[4], l_rsu[DENSE_MAXU];
+	static TLS const double *l_rc[4];
+	static TLS int l_rn;
+	static TLS unsigned int l_mask;
+	const double *rsp, *rsup;
+	const double * const *rcp;
+	unsigned int rmaskv;
+	int nselv;
+	if( p->localsetup )
+	{
+		adpb_rowsetup_to( p->dynmtx, p->cpmx1, p->cpmx2, i, l_rs, l_rc, &l_rn, l_rsu, &l_mask, &p->letters );
+		rsp = l_rs; rcp = l_rc; rsup = l_rsu; rmaskv = l_mask; nselv = l_rn;
+	}
+	else
+	{
+		if( b == 0 && p->lazyrows ) // work/prog3: band 0 sees every row first (the others wait for it)
+		{
+		/* work/v8s: the selections are made by every participant in chunks before it takes a band
+		   (adpb_run); band 0 waits until row i's chunk is published.  It used to make them itself, one
+		   row at a time, which made band 0 the slowest stage of the pipeline (~300 ns of letter
+		   scores per row against ~400 ns for a 128-column band row). */
+		const int k = ( i - 1 ) / p->sch;
+		int sp = 0;
+		while( !__atomic_load_n( p->ready + k, __ATOMIC_ACQUIRE ) )
+			adpb_wait( &sp );
+		}
+		rsp = p->rs + 4*i; rcp = p->rc + 4*i; rsup = p->rsu + p->ks*i; rmaskv = p->rmask[i]; nselv = p->rn[i];
+	}
+#ifdef PROGTIMING
+	if( b == 0 && v8s_stat_on() ) v8s_stat_row( 1, nselv > 4 ? 2 : 1, nselv, p->lgth2, rmaskv, p->bm );
+#endif
 	{
 	const int lgth2 = p->lgth2, j0 = p->J[b], j1 = p->J[b+1], jm = MIN( j1, lgth2 );
 	double * restrict prew = p->wb[(i-1)&1];
 	double * restrict curw = p->wb[i&1];
 	double * restrict mloc = p->m;
 	int * restrict mploc = p->mp;
-	int * restrict ijpi = p->ijp[i];
+#ifdef PROGTIMING
+	/* work/v8s: MAFFT_TILEIJPTEST=1 (timing builds, DIAGNOSIS ONLY, the output is then wrong): every band
+	   writes its traceback codes into a private scratch row instead of the shared matrix, to measure
+	   what the shared matrix's cache lines and pages cost the tiled DP */
+	static TLS int *ijptest_row = NULL; static TLS int ijptest_cap = 0;
+	int * restrict ijpi;
+	if( adpb_ijptest )
+	{
+		if( ijptest_cap < p->lgth2 + 2 ) { free( ijptest_row ); ijptest_cap = p->lgth2 + 2 + p->lgth2 / 2; ijptest_row = malloc( sizeof( int ) * ijptest_cap ); }
+		ijpi = ijptest_row;
+	}
+	else
+		ijpi = p->bandmajor ? p->ijb[b] + (size_t)i * p->ijw[b] - j0 : p->ijp[i];
+#else
+	int * restrict ijpi = p->bandmajor ? p->ijb[b] + (size_t)i * p->ijw[b] - j0 : p->ijp[i]; // work/v8s: band-major (ijt_cell)
+#endif
 	const double * restrict gf2 = p->gf2;
 	const double * restrict fg2 = p->fgcp2;
 	const double * restrict og2 = p->ogcp2;
-	const int ks = p->ks, nsel = p->rn[i], gen = ( nsel > 4 ); // work/prog3: gen: match scores formed in curw first
-	const double * restrict c0 = p->rc[4*i], * restrict c1 = p->rc[4*i+1], * restrict c2 = p->rc[4*i+2], * restrict c3 = p->rc[4*i+3];
-	const double s0 = p->rs[4*i], s1 = p->rs[4*i+1], s2 = p->rs[4*i+2], s3 = p->rs[4*i+3];
+	const int nsel = nselv, gen = ( nsel > 4 ); // work/prog3: gen: match scores formed in curw first
+	const double * restrict c0 = rcp[0], * restrict c1 = rcp[1], * restrict c2 = rcp[2], * restrict c3 = rcp[3];
+	const double s0 = rsp[0], s1 = rsp[1], s2 = rsp[2], s3 = rsp[3];
 	const double fgcp1va = p->fgcp1[i-1], ogcp1va = p->ogcp1[i], gf1va = p->gf1[i], gf1vapre = p->gf1[i-1];
 	const double fpenalty_ex = p->fpenalty_ex;
 	double mil, wmv = 0.0;
 	int mpil, ijv, j;
 
 	if( gen && jm > j0 ) // work/prog3: the match scores of the band's columns (< lgth2) first
-		Adp_mrow( j0, jm, p->rmask[i], p->rsu + ks*i, p->cu, p->bm, curw );
+		Adp_mrow( j0, jm, rmaskv, rsup, p->cu, p->bm, curw );
 	if( b == 0 )
 	{
 		prew[0] = p->initverticalw[i-1];                       // previousw[0] = initverticalw[i-1];
@@ -2075,51 +2336,143 @@ static void adpb_row( adpb_t *p, int b, int i )
 		p->bmpi[(b+1)*nr1+i] = mpil;
 	}
 	else
-		p->wmlast = wmv;
+		p->band[b].wmlast = wmv; // work/v8s (was p->wmlast)
 	if( j0 <= lgth2-1 && lgth2-1 < j1 ) p->lastverticalw[i] = curw[lgth2-1]; // lastverticalw[i] = currentw[lgth2-1];
 }
 }
 
-static void adpb_run( void *arg )
+/* work/v8s: the participants first make the per-row letter selections of the tiled DP in chunks
+   (lazy rows), then work on bands.  Band policy (sticky, default): a thread keeps the band it took
+   and processes every row its predecessor has finished, re-reading the predecessor's progress only
+   when it has caught up; only then does it look for another band that has rows ready and no owner
+   (earliest anti-diagonal first), and if there is none it waits on its own band.  The earlier policy
+   gave the band up after at most R rows or whatever the predecessor had done (often a few rows) and
+   re-picked the earliest anti-diagonal: on CARC (EPYC 7513, 32 threads, 16S.T) 53% of ~3.5 million
+   claims changed band, a claim covered ~900 cells, and every change pulled the band's columns
+   (m, mp, the two row buffers) from another core's cache: the tiled DPs ran at 18.5 ns per cell and
+   thread against 2.8 ns serial.  Which thread computes a row of a band, and when, never changes a
+   value: each cell is the same ADP_CELL code on the same operands, ordered by the done counters as
+   before.  MAFFT_TILEOLD=1 (timing builds) restores the old policy (A/B). */
+static int adpb_pick( adpb_t *p, int R )
 {
-	adpb_t *p = (adpb_t *)arg;
-	const int nb = p->nb, nrows = p->nrows, R = p->R;
-	int spins = 0;
-	while( 1 )
+	const int nb = p->nb, nrows = p->nrows;
+	int b, best = -1, bestkey = 0, alldone = 1;
+	for( b=0; b<nb; b++ )
 	{
-		int b, best = -1, bestkey = 0, alldone = 1;
-		for( b=0; b<nb; b++ )
+		int d = __atomic_load_n( &p->band[b].done, __ATOMIC_ACQUIRE ), avail, key;
+		if( d >= nrows ) continue;
+		alldone = 0;
+		if( __atomic_load_n( &p->band[b].busy, __ATOMIC_RELAXED ) ) continue;
+		avail = b ? __atomic_load_n( &p->band[b-1].done, __ATOMIC_ACQUIRE ) : nrows;
+		if( avail <= d || ( avail - d < p->batch && avail < nrows ) ) continue; // work/v8s: a batch of rows, or the rest
+		key = d / R + b; // wavefront order: earliest anti-diagonal first
+		if( best < 0 || key < bestkey ) { best = b; bestkey = key; }
+	}
+	return( alldone ? -2 : best );
+}
+
+/* every unfinished band has an owner (racy; a helper that leaves on a wrong answer only costs time) */
+static int adpb_allowned( adpb_t *p )
+{
+	int b;
+	for( b=0; b<p->nb; b++ )
+		if( __atomic_load_n( &p->band[b].done, __ATOMIC_ACQUIRE ) < p->nrows && !__atomic_load_n( &p->band[b].busy, __ATOMIC_RELAXED ) ) return( 0 );
+	return( 1 );
+}
+static void adpb_run_core( adpb_t *p, int helper );
+static void adpb_run( void *arg ) { adpb_run_core( (adpb_t *)arg, 1 ); } // a helper (dphelp job)
+static void adpb_run_core( adpb_t *p, int helper )
+{
+	const int nrows = p->nrows, R = p->R;
+	int spins = 0, cur = -1;
+#ifdef PROGTIMING
+	const int stat = v8s_stat_on();
+	double st_t0 = stat ? pt_now() : 0.0, st_busy = 0.0, st_claims = 0.0, st_migr = 0.0;
+	int st_last = -1;
+#endif
+	if( p->lazyrows && !p->localsetup ) // the letter selections, chunk by chunk (any thread, any order; published per chunk)
+	{
+		int k;
+		while( ( k = __atomic_fetch_add( &p->setup_next, p->sch, __ATOMIC_RELAXED ) ) < nrows )
 		{
-			int d = __atomic_load_n( &p->band[b].done, __ATOMIC_ACQUIRE ), avail, key;
-			if( d >= nrows ) continue;
-			alldone = 0;
-			if( __atomic_load_n( &p->band[b].busy, __ATOMIC_RELAXED ) ) continue;
-			avail = b ? __atomic_load_n( &p->band[b-1].done, __ATOMIC_ACQUIRE ) : nrows;
-			if( avail <= d ) continue;
-			key = d / R + b; // wavefront order: earliest anti-diagonal first
-			if( best < 0 || key < bestkey ) { best = b; bestkey = key; }
-		}
-		if( alldone ) break;
-		if( best < 0 )
-		{
-			if( ++spins > 256 ) sched_yield();
-			continue;
-		}
-		{
-			int zero = 0, d, avail, end, i;
-			if( !__atomic_compare_exchange_n( &p->band[best].busy, &zero, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED ) ) continue;
-			spins = 0;
-			d = __atomic_load_n( &p->band[best].done, __ATOMIC_ACQUIRE );
-			avail = best ? __atomic_load_n( &p->band[best-1].done, __ATOMIC_ACQUIRE ) : nrows;
-			end = MIN( avail, d + R );
-			for( i=d+1; i<=end; i++ )
-			{
-				adpb_row( p, best, i );
-				__atomic_store_n( &p->band[best].done, i, __ATOMIC_RELEASE );
-			}
-			__atomic_store_n( &p->band[best].busy, 0, __ATOMIC_RELEASE );
+			int i, hi = MIN( k + p->sch, nrows );
+			for( i=k+1; i<=hi; i++ )
+				adpb_rowsetup( p->dynmtx, p->cpmx1, p->cpmx2, i, p->ks, (double *)p->rs, (const double **)p->rc, (int *)p->rn, (double *)p->rsu, (unsigned int *)p->rmask, &p->letters );
+			__atomic_store_n( p->ready + k / p->sch, 1, __ATOMIC_RELEASE );
 		}
 	}
+	while( 1 )
+	{
+		int d, avail, end, i;
+		if( cur < 0 )
+		{
+			int best = adpb_pick( p, R ), zero = 0;
+			if( best == -2 ) break;
+			if( best < 0 )
+			{
+				/* work/v8s: a helper with nothing to take while every unfinished band has an owner goes
+				   back to the pool (the poster stays until all bands are done) */
+				if( helper && adpb_allowned( p ) ) break;
+				adpb_wait( &spins );
+				continue;
+			}
+			if( !__atomic_compare_exchange_n( &p->band[best].busy, &zero, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED ) ) continue;
+			spins = 0;
+			cur = best;
+		}
+		d = __atomic_load_n( &p->band[cur].done, __ATOMIC_ACQUIRE );
+		if( d >= nrows ) // finished: give the band up
+		{
+			__atomic_store_n( &p->band[cur].busy, 0, __ATOMIC_RELEASE );
+			cur = -1;
+			continue;
+		}
+		avail = cur ? __atomic_load_n( &p->band[cur-1].done, __ATOMIC_ACQUIRE ) : nrows;
+		if( avail > d && ( avail - d >= p->batch || avail >= nrows ) ) // work/v8s: wait for a batch of rows (fewer hand-offs across cores)
+		{
+			end = p->sticky ? MIN( avail, d + p->claimcap ) : MIN( avail, d + R ); // work/v8s: at most claimcap rows per claim
+#ifdef PROGTIMING
+			{ double _r0 = stat ? pt_now() : 0.0;
+#endif
+			for( i=d+1; i<=end; i++ )
+			{
+				adpb_row( p, cur, i );
+				__atomic_store_n( &p->band[cur].done, i, __ATOMIC_RELEASE );
+			}
+#ifdef PROGTIMING
+			if( stat ) { st_busy += pt_now() - _r0; st_claims += 1.0; if( cur != st_last ) st_migr += 1.0; st_last = cur; } }
+#endif
+			spins = 0;
+			/* work/v8s: after claimcap rows the band is put back and the thread picks again (earliest
+			   anti-diagonal first): a thread that runs slowly (another process on its core, an
+			   efficiency core) holds a band, and every band behind it, for at most claimcap rows */
+			if( p->sticky && end < d + p->claimcap ) continue;
+			__atomic_store_n( &p->band[cur].busy, 0, __ATOMIC_RELEASE ); // old policy: one claim, then re-pick
+			cur = -1;
+			continue;
+		}
+		/* caught up with the predecessor: another band with rows ready and no owner, if any (work/v8s:
+		   looked for on every 16th check only; scanning reads every band's line) */
+		if( ( spins & 15 ) == 0 )
+		{
+			int best = adpb_pick( p, R ), zero = 0;
+			if( best >= 0 && __atomic_compare_exchange_n( &p->band[best].busy, &zero, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED ) )
+			{
+				__atomic_store_n( &p->band[cur].busy, 0, __ATOMIC_RELEASE );
+				cur = best;
+				spins = 0;
+				continue;
+			}
+		}
+		adpb_wait( &spins ); // work/v8s
+	}
+#ifdef PROGTIMING
+	if( stat )
+	{
+		v8s_add( &p->st_busy, st_busy ); v8s_add( &p->st_part, pt_now() - st_t0 ); v8s_add( &p->st_claims, st_claims );
+		v8s_add( &p->st_nthr, 1.0 ); v8s_add( &p->st_migr, st_migr );
+	}
+#endif
 }
 
 /* Returns 1 if the DP of rows 1..lasti-1 was done here (tiled, possibly with helpers), 0 if the
@@ -2135,6 +2488,15 @@ static TLS double *adpb_bw = NULL, *adpb_bmi = NULL;
 static TLS int *adpb_bmpi = NULL;
 static TLS int adpb_rowcap = 0, adpb_bcap = 0;
 static int adpb_minwidth = -1, adpb_mincells = -1, adpb_force = 0, adpb_widthset = 0;
+static int adpb_sticky = 1, adpb_nbfac = 1; // work/v8s: band policy (adpb_run) and bands per expected participant
+static int adpb_align = 1, adpb_batch = 8;  // work/v8s: 16-column band boundaries; rows a follower waits for (adpb_run)
+static int adpb_claimcap = 256;             // work/v8s: rows per claim of a band (adpb_run)
+static int adpb_critnb = 8, adpb_critmincells = 4000000; // work/v8s: critical tiling (bands, minimum cells)
+static int adpb_localsetup = 0; // work/v8s: see adpb_row
+static int adpb_bandmajor = 1;  // work/v8s: band-major traceback (ijt_cell); MAFFT_TILEBANDMAJOR=0 (timing builds) turns it off
+static size_t A_ijp_capacity( void ); // (after A_ijp_get)
+static TLS int *adpb_ready = NULL;          // work/v8s: per selection chunk (adpb_t.ready)
+static TLS int adpb_readycap = 0;
 
 static void adpb_free( void )
 {
@@ -2147,6 +2509,7 @@ static void adpb_free( void )
 	free( adpb_bw ); adpb_bw = NULL;
 	free( adpb_bmi ); adpb_bmi = NULL;
 	free( adpb_bmpi ); adpb_bmpi = NULL;
+	free( adpb_ready ); adpb_ready = NULL; adpb_readycap = 0;
 	adpb_rowcap = adpb_bcap = 0;
 }
 
@@ -2157,7 +2520,7 @@ static int Adp_tiled( int lgth1, int lgth2, int lasti, double **n_dynamicmtx, do
 {
 	adpb_t *p;
 	dphelpjob_t job;
-	int nrows = lasti - 1, nb, b, i, idle, maxb, ks, minw;
+	int nrows = lasti - 1, nb, b, i, idle, maxb, ks, minw, crit;
 	adpb_letters_t letters;
 	double cells = (double)nrows * lgth2;
 
@@ -2170,24 +2533,44 @@ static int Adp_tiled( int lgth1, int lgth2, int lasti, double **n_dynamicmtx, do
 		adpb_mincells = ( e = getenv( "MAFFT_TILEMINCELLS" ) ) ? atoi( e ) : 2000000;
 		adpb_force = getenv( "MAFFT_TILEFORCE" ) != NULL; // testing: tile even without helpers
 		if( getenv( "MAFFT_NOTILE" ) ) adpb_minwidth = 1 << 30;
+		if( getenv( "MAFFT_TILEOLD" ) ) { adpb_sticky = 0; adpb_nbfac = 3; } // work/v8s: the old band policy (A/B)
+		if( ( e = getenv( "MAFFT_TILENBFAC" ) ) ) adpb_nbfac = atoi( e );
+		if( ( e = getenv( "MAFFT_TILEALIGN" ) ) ) adpb_align = atoi( e );
+		if( ( e = getenv( "MAFFT_TILEBATCH" ) ) ) adpb_batch = atoi( e );
+		if( ( e = getenv( "MAFFT_TILECLAIM" ) ) ) adpb_claimcap = atoi( e );
+		if( ( e = getenv( "MAFFT_CRITNB" ) ) ) adpb_critnb = atoi( e );
+		adpb_ijptest = ( getenv( "MAFFT_TILEIJPTEST" ) != NULL );
+		if( ( e = getenv( "MAFFT_TILELOCALSETUP" ) ) ) adpb_localsetup = atoi( e );
+		if( ( e = getenv( "MAFFT_TILEBANDMAJOR" ) ) ) adpb_bandmajor = atoi( e );
+		if( ( e = getenv( "MAFFT_CRITMINCELLS" ) ) ) adpb_critmincells = atoi( e );
 #else
 		adpb_minwidth = 384;
 		adpb_mincells = 2000000;
 		adpb_force = 0;
 #endif
 	}
-	if( nrows < 2 || cells < adpb_mincells || dense_nu < 0 ) return( 0 );
+	if( nrows < 2 || cells < adpb_mincells || dense_nu < 0 ) { V8S_NOTILE( 0, cells ); return( 0 ); }
 	idle = dphelp_idle();
-	if( idle <= 0 && !adpb_force ) return( 0 );
+	/* work/v8s: critical tiling.  A large DP of a step on the critical path is tiled even when (almost)
+	   no thread is idle; its bands are posted for threads that finish their steps (they serve it
+	   before ready steps of lower priority, dphelp.h).  Without joiners the poster runs the bands one
+	   after the other: the same cells, a little more per-row overhead. */
+	crit = ( idle < adpb_critnb - 1 && cells >= adpb_critmincells && dphelp_iscritical() );
+	if( idle <= 0 && !adpb_force && !crit ) { V8S_NOTILE( 1, cells ); return( 0 ); }
 	/* work/prog3: narrower bands when many threads are idle (the merges at the top of the tree, which
 	   often have only ~1500 columns on the band side: 384-column bands allowed only 4 participants) */
 	minw = adpb_minwidth;
-	if( !adpb_widthset ) { if( idle >= 12 ) minw = 128; else if( idle >= 4 ) minw = 192; }
-	if( lgth2 < 2 * minw ) return( 0 );
+	/* work/v8s: narrower bands (48 / 96 / 192 columns; prog3 had 128 / 192 / 384).  On CARC (32 threads,
+	   EPYC 7513, the job's cores spread over both sockets) a band row costs ~3x the serial cell rate
+	   whatever the band width, so more bands, i.e. more threads, shorten the tiled DPs: the tiled DPs
+	   of 16S.T took 2.3-2.5 s in all with 48-column bands, 3.1-3.3 s with 64-96, 4.0-4.5 s with 128 */
+	if( !adpb_widthset ) { if( idle >= 12 ) minw = 48; else if( idle >= 4 || crit ) minw = 96; else minw = 192; }
+	if( lgth2 < 2 * minw ) { V8S_NOTILE( 2, cells ); return( 0 ); }
 
 	maxb = MIN( ADPB_MAXB, lgth2 / minw );
-	nb = MIN( maxb, 3 * ( 1 + MAX( idle, 1 ) ) );
-	if( nb < 2 ) return( 0 );
+	nb = MIN( maxb, adpb_nbfac * ( 1 + MAX( idle, 1 ) ) ); // work/v8s: one band per expected participant (was 3, see adpb_run)
+	if( crit ) nb = MAX( nb, MIN( maxb, adpb_critnb ) );
+	if( nb < 2 ) { V8S_NOTILE( 3, cells ); return( 0 ); }
 
 	ks = MAX( 1, dense_nu );
 	if( nrows + 1 > adpb_rowcap )
@@ -2211,7 +2594,7 @@ static int Adp_tiled( int lgth1, int lgth2, int lasti, double **n_dynamicmtx, do
 		int u;
 		if( !adp_general_on() )
 			for( i=1; i<=nrows; i++ )
-				if( adpb_rowsetup( n_dynamicmtx, cpmx1, cpmx2, i, ks, adpb_rs, adpb_rc, adpb_rn, adpb_rsu, adpb_rmask, &letters ) > 4 ) return( 0 );
+				if( adpb_rowsetup( n_dynamicmtx, cpmx1, cpmx2, i, ks, adpb_rs, adpb_rc, adpb_rn, adpb_rsu, adpb_rmask, &letters ) > 4 ) { V8S_NOTILE( 4, cells ); return( 0 ); }
 		if( dense_nu > 4 ) // some row may take the general kernel
 		{
 			for( u=0; u<dense_nu; u++ ) adpb_cu[u] = cpmx2[dense_u[u]];
@@ -2228,10 +2611,23 @@ static int Adp_tiled( int lgth1, int lgth2, int lasti, double **n_dynamicmtx, do
 		adpb_bmpi = malloc( sizeof( int ) * adpb_bcap );
 	}
 
-	if( posix_memalign( (void **)&p, 64, sizeof( adpb_t ) ) ) return( 0 );
+	if( posix_memalign( (void **)&p, 64, sizeof( adpb_t ) ) ) { V8S_NOTILE( 5, cells ); return( 0 ); }
+#ifdef PROGTIMING
+	if( v8s_stat_on() ) { v8s_add( &v8s_tiled[0], 1.0 ); v8s_add( &v8s_tiled[1], cells ); }
+#endif
 	memset( p, 0, sizeof( adpb_t ) );
 	p->nrows = nrows; p->lgth2 = lgth2; p->nb = nb;
 	for( b=0; b<=nb; b++ ) p->J[b] = 1 + (int)( (long long)lgth2 * b / nb );
+	if( adpb_align ) // work/v8s: inner boundaries on multiples of 16 columns (no shared cache lines, see adp_avec)
+	{
+		for( b=1; b<nb; b++ )
+		{
+			int jb = ( p->J[b] + 8 ) & ~15;
+			if( jb <= p->J[b-1] ) jb = p->J[b-1] + 16;
+			p->J[b] = jb;
+		}
+		for( b=1; b<nb; b++ ) if( p->J[b] >= p->J[b+1] ) { for( b=0; b<=nb; b++ ) p->J[b] = 1 + (int)( (long long)lgth2 * b / nb ); break; } // (cannot happen with bands >= 64 columns)
+	}
 	p->R = MAX( 8, 24576 / ( lgth2 / nb ) );
 	p->wb[0] = w0; p->wb[1] = w1;
 	p->m = m; p->mp = mp; p->ijp = ijp;
@@ -2243,15 +2639,64 @@ static int Adp_tiled( int lgth1, int lgth2, int lasti, double **n_dynamicmtx, do
 	p->letters = letters;
 	p->fpenalty_ex = fpenalty_ex;
 	p->bw = adpb_bw; p->bmi = adpb_bmi; p->bmpi = adpb_bmpi;
+	p->sticky = adpb_sticky; // work/v8s
+	p->batch = adpb_sticky ? MAX( 1, adpb_batch ) : 1;
+	p->claimcap = MAX( p->batch, adpb_claimcap );
+	p->localsetup = ( adpb_localsetup && p->lazyrows );
+	/* work/v8s: band-major traceback regions (see ijt_cell), carved from the traceback block that
+	   A_ijp_get made for this DP: rows 0 .. nrows+1 of every band, each region starting on a 64-byte
+	   line; falls back to the row-major matrix if the block were too small (cannot happen: the block
+	   holds ( lgth1 + 2 ) rows of >= lgth2 + 2 ints) */
+	p->bandmajor = 0;
+	if( adpb_bandmajor )
+	{
+		size_t off = 0, cap = A_ijp_capacity();
+		int *blk = ijp[0];
+		for( b=0; b<nb; b++ )
+		{
+			p->ijw[b] = p->J[b+1] - p->J[b];
+			p->ijb[b] = blk + off;
+			off += (size_t)( nrows + 2 ) * p->ijw[b];
+			off = ( off + 15 ) & ~(size_t)15;
+		}
+		p->bandmajor = ( off <= cap && ( (size_t)blk & 63 ) == 0 );
+	}
+	p->sch = 64; // rows per selection chunk
+	p->setup_next = 0;
+	if( nrows / p->sch + 2 > adpb_readycap ) { free( adpb_ready ); adpb_readycap = nrows / p->sch + 2 + nrows / p->sch / 2; adpb_ready = malloc( sizeof( int ) * adpb_readycap ); }
+	memset( adpb_ready, 0, sizeof( int ) * ( nrows / p->sch + 2 ) );
+	p->ready = adpb_ready;
 	for( b=1; b<nb; b++ ) p->bw[b*(nrows+1)+0] = w0[p->J[b]-1]; // row 0, last column of band b-1
-	p->wmlast = *wmp;
+	p->band[nb-1].wmlast = *wmp;
 
 	job.run = adpb_run;
 	job.arg = p;
-	dphelp_post( &job, nb - 1 );
-	adpb_run( p );
+#ifdef PROGTIMING
+	{ double _e0 = pt_now();
+#endif
+	if( crit ) dphelp_post_crit( &job, nb - 1 ); else dphelp_post( &job, nb - 1 );
+	adpb_run_core( p, 0 ); // the poster stays until every band is done
 	dphelp_finish( &job );
-	*wmp = p->wmlast;
+	if( p->bandmajor ) // work/v8s: Atracking of this A__align call reads the band-major regions
+	{
+		atr_tile.nb = nb;
+		for( b=0; b<=nb; b++ ) atr_tile.J[b] = p->J[b];
+		for( b=0; b<nb; b++ ) { atr_tile.base[b] = p->ijb[b]; atr_tile.w[b] = p->ijw[b]; }
+		atr_tiled = 1;
+	}
+#ifdef PROGTIMING
+	if( adpb_ijptest ) { for( i=1; i<=nrows; i++ ) memset( ijp[i], 0, sizeof( int ) * ( lgth2 + 1 ) ); atr_tiled = 0; } // (diagnosis: a harmless traceback)
+	if( v8s_stat_on() && crit ) { v8s_add( &v8s_tile[14], 1.0 ); v8s_add( &v8s_tile[15], p->st_nthr ); }
+	if( v8s_stat_on() )
+	{
+		double el = pt_now() - _e0;
+		v8s_add( &v8s_tile[0], el ); v8s_add( &v8s_tile[1], p->st_part ); v8s_add( &v8s_tile[2], p->st_busy );
+		v8s_add( &v8s_tile[3], p->st_claims ); v8s_add( &v8s_tile[4], p->st_nthr ); v8s_add( &v8s_tile[5], p->st_migr );
+		v8s_add( &v8s_tile[6], (double)nb ); v8s_add( &v8s_tile[7], el * nb );
+		if( cells >= 2.0e7 ) { v8s_add( &v8s_tile[8], el ); v8s_add( &v8s_tile[9], p->st_busy ); v8s_add( &v8s_tile[10], p->st_part ); v8s_add( &v8s_tile[11], 1.0 ); v8s_add( &v8s_tile[12], p->st_nthr ); v8s_add( &v8s_tile[13], (double)nb ); }
+	} }
+#endif
+	*wmp = p->band[nb-1].wmlast;
 	free( p );
 	return( 1 );
 }
@@ -2300,6 +2745,8 @@ static void tilechk_save_result( int lgth2, int lasti, double *m, int *mp, int *
 	tc_rmp = realloc( tc_rmp, n * sizeof( int ) ); memcpy( tc_rmp, mp, n * sizeof( int ) );
 	tc_rlv = realloc( tc_rlv, (size_t)lasti * sizeof( double ) ); memcpy( tc_rlv, lastverticalw, (size_t)lasti * sizeof( double ) );
 	tc_rijp = realloc( tc_rijp, (size_t)lasti * lgth2 * sizeof( int ) );
+	if( atr_tiled ) { int j; for( i=1; i<lasti; i++ ) for( j=1; j<=lgth2; j++ ) tc_rijp[(size_t)i * lgth2 + j-1] = *ijt_cell( &atr_tile, i, j ); } // work/v8s: band-major
+	else
 	for( i=1; i<lasti; i++ ) memcpy( tc_rijp + (size_t)i * lgth2, ijp[i] + 1, lgth2 * sizeof( int ) );
 	tc_rwm = wm;
 	tilechk_pending = 1;
@@ -2395,7 +2842,7 @@ static void profile_fused( char **seq, int clus, double *eff, int len, double **
 	if( sgappat == NULL ) ogcp[len] = 0.0; // st_OpeningGapCount
 	if( len <= 0 ) return;
 #ifdef enablemultithread
-	dphelp_for( len, MAX( 512, len / 16 ), (double)clus * len, 4.0e6, profile_fused_cols, &c );
+	dphelp_for( len, MAX( 256, len / 64 ), (double)clus * len, 4.0e6, profile_fused_cols, &c ); // work/v8s: was MAX( 512, len / 16 ): up to 64 claims (32 threads)
 #else
 	profile_fused_cols( &c, 0, len );
 #endif
@@ -2548,9 +2995,22 @@ static void A_ijp_poolfree( void )
 #endif
 }
 
+/* work/v8s: the arrays the tiled DP's bands write row after row (the two row buffers, m, mp and the
+   traceback rows) start on a 64-byte boundary and the band boundaries are multiples of 16 columns
+   (Adp_tiled), so two bands never write the same cache line: on CARC every band boundary otherwise
+   moved 3-4 lines between cores (often across sockets) per row.  Layout only: the same values at
+   the same indices. */
+static void *adp_avec( size_t n, size_t size )
+{
+	void *p = NULL;
+	if( posix_memalign( &p, 64, n * size + 64 ) ) ErrorExit( "Cannot allocate a DP vector in A__align.\n" );
+	memset( p, 0, n * size + 64 );
+	return( p );
+}
+
 static int **A_ijp_get( int lgth1, int lgth2, int alloclen )
 {
-	size_t stride = (size_t)lgth2 + 2, need = ( (size_t)lgth1 + 2 ) * stride;
+	size_t stride = ( (size_t)lgth2 + 2 + 15 ) & ~(size_t)15, need = ( (size_t)lgth1 + 2 ) * stride; // work/v8s: rows of 16-int multiples (64 bytes, see adp_avec)
 	int i;
 #ifdef enablemultithread
 	if( need > aijp_cap && need >= AIJP_POOLMIN / 4 && aijp_pooln > 0 )
@@ -2583,7 +3043,8 @@ static int **A_ijp_get( int lgth1, int lgth2, int alloclen )
 		size_t cap = half * half;
 		if( cap < need + need / 4 ) cap = need + need / 4;
 		free( aijp_blk );
-		aijp_blk = malloc( cap * sizeof( int ) );
+		aijp_blk = NULL;
+		if( posix_memalign( (void **)&aijp_blk, 64, cap * sizeof( int ) ) ) aijp_blk = NULL; // work/v8s: 64-byte aligned rows (adp_avec)
 		if( aijp_blk == NULL ) ErrorExit( "Cannot allocate the traceback matrix in A__align.\n" );
 		aijp_cap = cap;
 	}
@@ -2597,6 +3058,8 @@ static int **A_ijp_get( int lgth1, int lgth2, int alloclen )
 	for( i=0; i<lgth1+2; i++ ) aijp_rows[i] = aijp_blk + (size_t)i * stride;
 	return( aijp_rows );
 }
+
+static size_t A_ijp_capacity( void ) { return( aijp_cap ); } // work/v8s: ints in this thread's traceback block
 
 static char **A_mseq_get( int nrow, int rowlen )
 {
@@ -2634,6 +3097,11 @@ static void A_arenas_free( void )
 	free( amseq_rows ); amseq_rows = NULL; amseq_rowcap = 0;
 }
 
+#if FASTMATCHCALC // work/v8s: match_calc's sparse tables, allocated at their first use in A__align
+#define AW_ENSURE() do { if( doublework == NULL ) { doublework = AllocateFloatMtx( aw_rows, nalphabets ); intwork = AllocateIntMtx( aw_rows, nalphabets+1 ); } } while( 0 )
+#else
+#define AW_ENSURE() do { if( doublework == NULL ) { doublework = AllocateFloatMtx( nalphabets, aw_rows ); intwork = AllocateIntMtx( nalphabets, aw_rows ); } } while( 0 )
+#endif
 double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **seq1, char **seq2, double *eff1, double *eff2, int icyc, int jcyc, int alloclen, int constraint, double *impmatch, char *sgap1, char *sgap2, char *egap1, char *egap2, int *chudanpt, int chudanref, int *chudanres, int headgp, int tailgp, int firstmem, int calledbyfulltreebase, double ***cpmxchild0, double ***cpmxchild1, double ***cpmxresult, double orieff1, double orieff2 )
 /* score no keisan no sai motokaraaru gap no atukai ni mondai ga aru */
 {
@@ -2684,6 +3152,7 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 	double ***cpmx2pt = NULL;
 	static TLS int **intwork;
 	static TLS double **doublework;
+	static TLS int aw_rows = 0; // work/v8s: rows of doublework / intwork when they are allocated (AW_ENSURE)
 	static TLS int orlgth1 = 0, orlgth2 = 0;
 	static TLS double *gapfreq1;
 	double *gapfreq1pt;
@@ -2773,8 +3242,9 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 			FreeFloatVec( gapfreq1 );
 			FreeFloatVec( gapfreq2 );
 
-			FreeFloatMtx( doublework );
-			FreeIntMtx( intwork );
+			if( doublework ) FreeFloatMtx( doublework ); // work/v8s (AW_ENSURE)
+			if( intwork ) FreeIntMtx( intwork );
+			doublework = NULL; intwork = NULL;
 		}
 		else
 		{
@@ -2924,8 +3394,8 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 			FreeFloatVec( gapfreq1 );
 			FreeFloatVec( gapfreq2 );
 
-			FreeFloatMtx( doublework );
-			FreeIntMtx( intwork );
+			if( doublework ) FreeFloatMtx( doublework ); // work/v8s: may never have been allocated (AW_ENSURE)
+			if( intwork ) FreeIntMtx( intwork );
 		}
 
 		ll1 = MAX( (int)(1.3*lgth1), orlgth1 ) + 100;
@@ -2935,15 +3405,15 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 		fprintf( stderr, "\ntrying to allocate (%d+%d)xn matrices ... ", ll1, ll2 );
 #endif
 
-		w1 = AllocateFloatVec( ll2+2 );
-		w2 = AllocateFloatVec( ll2+2 );
+		w1 = adp_avec( ll2+2, sizeof( double ) ); // work/v8s: 64-byte aligned (zeroed, as calloc; freed with free)
+		w2 = adp_avec( ll2+2, sizeof( double ) );
 		match = AllocateFloatVec( ll2+2 );
 
 		initverticalw = AllocateFloatVec( ll1+2 );
 		lastverticalw = AllocateFloatVec( ll1+2 );
 
-		m = AllocateFloatVec( ll2+2 );
-		mp = AllocateIntVec( ll2+2 );
+		m = adp_avec( ll2+2, sizeof( double ) ); // work/v8s: see w1
+		mp = adp_avec( ll2+2, sizeof( int ) );
 
 
 		ogcp1 = AllocateFloatVec( ll1+2 );
@@ -2963,13 +3433,13 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 		gapfreq1 = AllocateFloatVec( ll1+2 );
 		gapfreq2 = AllocateFloatVec( ll2+2 );
 
-#if FASTMATCHCALC
-		doublework = AllocateFloatMtx( MAX( ll1, ll2 )+2, nalphabets ); 
-		intwork = AllocateIntMtx( MAX( ll1, ll2 )+2, nalphabets+1 ); 
-#else
-		doublework = AllocateFloatMtx( nalphabets, MAX( ll1, ll2 )+2 ); 
-		intwork = AllocateIntMtx( nalphabets, MAX( ll1, ll2 )+2 ); 
-#endif
+		/* work/v8s: match_calc's sparse tables (~2 x MAX( ll1, ll2 ) small rows, ~50,000 callocs for the
+		   steps near the root, 5-8 ms whenever a large step lands on a thread whose arrays are smaller)
+		   are only needed off the dense path; they are allocated at their first use (AW_ENSURE), with
+		   the same size and the same (zeroed) content as here before */
+		aw_rows = MAX( ll1, ll2 )+2;
+		doublework = NULL;
+		intwork = NULL;
 
 #if DEBUG
 		fprintf( stderr, "succeeded\n" );
@@ -3311,6 +3781,7 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 		if( getenv( "MAFFT_PROFCHECK" ) ) // compare with the original sparse computation, bitwise
 		{
 			double *a1 = malloc( sizeof( double ) * ( lgth1 + 1 ) ), *a2 = malloc( sizeof( double ) * ( lgth2 + 1 ) );
+			AW_ENSURE();
 			match_calc( n_dynamicmtx, a1, *cpmx2pt, *cpmx1pt, 0, lgth1, doublework, intwork, 1 );
 			match_calc( n_dynamicmtx, a2, *cpmx1pt, *cpmx2pt, 0, lgth2, doublework, intwork, 1 );
 			sparse2_ready = 1;
@@ -3325,6 +3796,7 @@ double A__align( double **n_dynamicmtx, int penalty_l, int penalty_ex_l, char **
 	}
 	else
 	{
+	AW_ENSURE();
 	match_calc( n_dynamicmtx, initverticalw, *cpmx2pt, *cpmx1pt, 0, lgth1, doublework, intwork, 1 );
 	if( constraint )
 		imp_match_out_vead_tate( initverticalw, 0, lgth1 ); // 060306
@@ -3461,6 +3933,10 @@ for( i=0; i<lgth2; i++ )
 	usefused = ( FASTDP_ON && !trywarp && !constraint && dense_nu >= 0 && fpenalty_ex == 0.0 && lgth2 >= 1 );
 
 	PT_ADD(7);
+#ifdef PROGTIMING
+	pt_acc[34] += 1.0; // work/v8s: A__align DPs of this step; cells: 32 fused not tiled, 33 tiled, 35 not fused
+	if( usefused && chudanpt == NULL && lasti > 2 ) pt_acc[32] += (double)( lasti - 1 ) * lgth2; else pt_acc[35] += (double)( lasti - 1 ) * lgth2;
+#endif
 #ifdef enablemultithread
 	/* work/prog2: large fused DPs are split into tiles that idle helper threads share (Adp_tiled);
 	   the loop below is skipped when that path ran.  MAFFT_TILECHECK=1 (timing builds) reruns the
@@ -3477,9 +3953,11 @@ for( i=0; i<lgth2; i++ )
 			if( ( lasti - 1 ) & 1 ) { wtmp = currentw; currentw = previousw; previousw = wtmp; }
 #ifdef PROGTIMING
 			pt_acc[29] += 1.0; pt_acc[30] += (double)( lasti - 1 ) * lgth2;
+			pt_acc[32] -= (double)( lasti - 1 ) * lgth2; pt_acc[33] += (double)( lasti - 1 ) * lgth2;
 			if( pt_tilecheck() )
 			{
 				tilechk_save_result( lgth2, lasti, m, mp, ijp, lastverticalw, wm );
+				atr_tiled = 0; // work/v8s: the original loop writes the row-major matrix
 				tilechk_restore_init( lgth2, m, mp, &wm ); // the initial state again, then the original loop
 				currentw = tilechk_cur0; previousw = tilechk_prev0;
 				goto adp_rowloop;
@@ -3559,6 +4037,7 @@ for( i=0; i<lgth2; i++ )
 		}
 
 #ifdef PROGTIMING
+		if( v8s_stat_on() ) v8s_stat_row( 0, rowfused, rowfused ? fsel_n : 0, lgth2, fsel_mask, rowfused == 2 ? gen_bm : NULL );
 		if( !rowfused || pt_dpcheck() ) { double _mc0 = pt_now();
 #else
 		if( !rowfused ) {
@@ -3569,7 +4048,7 @@ for( i=0; i<lgth2; i++ )
 			double t0 = pt_now(), t1, t2;
 			match_calc_dense( n_dynamicmtx, chk_match, *cpmx1pt, *cpmx2pt, i, lgth2 );
 			t1 = pt_now();
-			if( !sparse2_ready ) { match_calc_sparse_init( *cpmx2pt, lgth2, doublework, intwork ); sparse2_ready = 1; }
+			if( !sparse2_ready ) { AW_ENSURE(); match_calc_sparse_init( *cpmx2pt, lgth2, doublework, intwork ); sparse2_ready = 1; }
 			match_calc( n_dynamicmtx, currentw, *cpmx1pt, *cpmx2pt, i, lgth2, doublework, intwork, 0 );
 			t2 = pt_now();
 			pt_acc[16] += t1 - t0; pt_acc[17] += t2 - t1;
@@ -3585,7 +4064,7 @@ for( i=0; i<lgth2; i++ )
 			match_calc_dense( n_dynamicmtx, currentw, *cpmx1pt, *cpmx2pt, i, lgth2 );
 		else
 		{
-			if( !sparse2_ready ) { match_calc_sparse_init( *cpmx2pt, lgth2, doublework, intwork ); sparse2_ready = 1; }
+			if( !sparse2_ready ) { AW_ENSURE(); match_calc_sparse_init( *cpmx2pt, lgth2, doublework, intwork ); sparse2_ready = 1; }
 			match_calc( n_dynamicmtx, currentw, *cpmx1pt, *cpmx2pt, i, lgth2, doublework, intwork, 0 );
 		}
 #ifdef PROGTIMING
@@ -3696,7 +4175,8 @@ fprintf( stderr, "\n" );
 				fsel_c[0], fsel_c[1], fsel_c[2], fsel_c[3], fsel_s,
 				fgcp1va, ogcp1va, gf1va, gf1vapre, fpenalty_ex, &mi, &mpi, &wm );
 #ifdef PROGTIMING
-			pt_acc[23] += pt_now() - _f0; }
+			{ double _f1 = pt_now(); pt_acc[23] += _f1 - _f0;
+			if( v8s_stat_on() ) { if( rowfused == 2 ) { v8s_add( &v8s_gentime[0], _f1 - _f0 ); v8s_add( &v8s_gentime[1], (double)lgth2 ); } else v8s_add( &v8s_f4time, _f1 - _f0 ); } } }
 #endif
 			lastverticalw[i] = currentw[lgth2-1];
 			continue;
@@ -3910,6 +4390,7 @@ fprintf( stderr, "\n" );
 
 	if( constraint )
 	{
+		if( atr_tiled ) ErrorExit( "work/v8s: band-major traceback with a constraint.\n" ); // (tiling excludes constraints)
 		Atracking_localhom( impmatch, currentw, lastverticalw, seq1, seq2, mseq1, mseq2, ijp, icyc, jcyc, warpis, warpjs, warpbase, &ngap1, &ngap2, reuseprofiles, &gt1, &gt2 );
 	}
 	else
@@ -3922,6 +4403,7 @@ fprintf( stderr, "\n" );
 		if( lz.on ) { atr_len1 = lgth1; atr_len2 = lgth2; }
 		wmo = Atracking( currentw, lastverticalw, fpenalty, fpenalty_ex, seq1, seq2, NULL, NULL, ijp, icyc, jcyc, tailgp, warpis, warpjs, warpbase, &ngap1, &ngap2, reuseprofiles, &gt1, &gt2 );
 		atr_len1 = atr_len2 = -1;
+		atr_tiled = 0; // work/v8s
 		if( !tailgp ) wm = wmo;
 		inplace = 1;
 		{
