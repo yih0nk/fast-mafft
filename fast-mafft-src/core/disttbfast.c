@@ -1427,6 +1427,8 @@ typedef struct _msadistfast
 	int W;        // 64-bit words per row mask; even, and W*64 > L so the last carry has room
 	int penal;
 	int check;    // 1: also run naivepairscorefast() and compare bitwise
+	int timing;   // work/v9p, MAFFT_MSADIST=time: thread-seconds of the row passes and the pair loops
+	double tcol, tgap, tpair;
 	int xorpath;  // 1: bit-plane path, 0: generic path
 	int kern;     // kernel: 0 portable C, 1 NEON (arm64) or POPCNT (x86-64), 2 AVX2 (x86-64)
 	char **seq;   // the aligned rows (generic path and exceptions read residues from them)
@@ -1469,6 +1471,13 @@ typedef struct _msadistfast
 	   (msadist_gaprow_avx2); the gap masks are stored transposed in groups of 4 rows */
 	int ne4;          // 1: g4 is built and the gap runs come from msadist_rowprep()
 	uint64_t *g4;     // ( ( row >> 2 ) * W + w ) * 4 + ( row & 3 ): gap word w of row
+	/* work/v9p: a gap-mask word that is all gaps in both rows adds nothing to the gap runs and
+	   passes both carries on unchanged (a = b = ~0: a & ~b = 0, s = a + carry), so the gap-run
+	   loops visit only the words where either row (any of the 4 rows of a group) has a residue */
+	int nmw;          // 64-bit words of an activity mask: ( W + 63 ) / 64
+	uint64_t *ract;   // per row, nmw words: bit w = gap word w of the row is not all gaps
+	uint64_t *gact;   // ne4: per group of 4 rows, the OR of their masks
+	int noskip;       // MAFFT_MSADIST=noskip: visit every word
 	int skip1;        // bit-plane path: Td[1] == Td[3] (DNA), so n1 is not needed
 	/* preparation */
 	int nthreads;
@@ -1504,6 +1513,7 @@ static void msadistfast_free( msadistfast_t *f )
 	free( f->T );
 	free( f->centry ); free( f->coff ); free( f->rpos ); free( f->roff ); free( f->tcnt );
 	free( f->g4 );
+	free( f->ract ); free( f->gact ); // work/v9p
 	free( f->dcol ); free( f->dcode ); free( f->dtab );
 	free( f );
 }
@@ -1607,6 +1617,15 @@ static void *msadist_prepthread( void *arg )
 		else if( f->phase == 7 )
 		{
 			for( c=0; c<L; c++ ) if( f->dcol[c] >= 0 ) f->dcode[(size_t)f->dcol[c] * f->np32 + i] = f->kcode[s[c]];
+		}
+		else if( f->phase == 8 ) // work/v9p: activity masks of the gap words
+		{
+			uint64_t *ra = f->ract + (size_t)i * f->nmw;
+			for( w=0; w<W; w++ )
+			{
+				uint64_t g = f->xorpath ? f->planes[(size_t)i * 3 * W + ( w >> 1 ) * 6 + ( w & 1 )] : f->masks[(size_t)i * 2 * W + w];
+				if( ~g ) ra[w>>6] |= 1ULL << ( w & 63 );
+			}
 		}
 		else if( f->phase == 6 )
 		{
@@ -1809,6 +1828,7 @@ static msadistfast_t *msadistfast_prepare( int nseq, char **seq, int penal, int 
 	f->W = ( f->L / 64 + 2 ) & ~1;
 	f->penal = penal;
 	f->check = ( mode && strstr( mode, "check" ) );
+	f->timing = ( mode && strstr( mode, "time" ) );
 	f->nthreads = nthreads;
 
 	lv = fmsimd_level();
@@ -2015,7 +2035,40 @@ static msadistfast_t *msadistfast_prepare( int nseq, char **seq, int penal, int 
 		else f->g4 = NULL;
 	}
 #endif
+	// work/v9p: activity masks for skipping the words that are all gaps in both rows
+	f->noskip = ( mode && strstr( mode, "noskip" ) );
+	f->nmw = ( f->W + 63 ) / 64;
+	if( !f->noskip && ( f->ne4 || f->colpath ) )
+	{
+		f->ract = calloc( (size_t)nseq * f->nmw, sizeof( uint64_t ) );
+		if( f->ract ) msadist_prepphase( f, p, 8 );
+		if( f->ract && f->ne4 && ( f->gact = calloc( (size_t)( ( nseq + 3 ) / 4 ) * f->nmw, sizeof( uint64_t ) ) ) )
+		{
+			for( a=0; a<nseq; a++ ) for( c=0; c<f->nmw; c++ ) f->gact[(size_t)( a >> 2 ) * f->nmw + c] |= f->ract[(size_t)a * f->nmw + c];
+		}
+		if( f->ne4 && !f->gact ) { free( f->ract ); f->ract = NULL; } // without the group masks: no skipping
+		// skipping pays only when many words can be skipped (the bit loop costs a few operations per
+		// visited word): groups of 4 (AVX2) or single rows (a pair visits the union of two) below 3/4 / 1/2
+		if( f->ract && !( mode && strstr( mode, "forceskip" ) ) )
+		{
+			long long nr = 0, ng = 0;
+			if( f->gact ) for( a=0; a<(nseq+3)/4; a++ ) for( c=0; c<f->nmw; c++ ) ng += __builtin_popcountll( f->gact[(size_t)a*f->nmw+c] );
+			else for( a=0; a<nseq; a++ ) for( c=0; c<f->nmw; c++ ) nr += __builtin_popcountll( f->ract[(size_t)a*f->nmw+c] );
+			if( f->gact ? ng * 4 > 3LL * ( ( nseq + 3 ) / 4 ) * f->W : nr * 2 > (long long)nseq * f->W )
+			{
+				free( f->ract ); free( f->gact );
+				f->ract = f->gact = NULL;
+			}
+		}
+	}
 	if( !f->xorpath && stat ) reporterr( "msadist fast (%s path, %s%s): L=%d K=%d penal=%d; %d dense columns\n", f->colpath ? "column" : "generic", msadist_kname( f ), f->ne4 ? ", 4-lane gap runs" : "", f->L, K, penal, f->ndense );
+	if( stat && f->ract ) // work/v9p
+	{
+		long long nr = 0, ng = 0;
+		for( a=0; a<nseq; a++ ) for( c=0; c<f->nmw; c++ ) nr += __builtin_popcountll( f->ract[(size_t)a*f->nmw+c] );
+		if( f->gact ) for( a=0; a<(nseq+3)/4; a++ ) for( c=0; c<f->nmw; c++ ) ng += __builtin_popcountll( f->gact[(size_t)a*f->nmw+c] );
+		reporterr( "msadist fast: gap-run words with a residue: %.1f of %d per row%s%.1f per group of 4\n", (double)nr / nseq, f->W, f->gact ? ", " : "", f->gact ? (double)ng / ( ( nseq + 3 ) / 4 ) : 0.0 );
+	}
 	free( p );
 	return( f );
 }
@@ -2272,6 +2325,41 @@ static void msadist_gaprow_avx2( const msadistfast_t *f, int i, int *ne )
 	{
 		const uint64_t *gj = f->g4 + (size_t)g * W * 4;
 		__m256i ci = z, cj = z, sum = z;
+		if( f->gact ) // work/v9p: only the words where row i or a row of the group has a residue
+		{
+			const uint64_t *ai = f->ract + (size_t)i * f->nmw, *ag = f->gact + (size_t)g * f->nmw;
+			__m256i b8 = z; // byte counts, at most 8 per word
+			int m, nb = 0;
+			for( m=0; m<f->nmw; m++ )
+			{
+				uint64_t bits = ai[m] | ag[m];
+				while( bits )
+				{
+					w = m * 64 + __builtin_ctzll( bits );
+					bits &= bits - 1;
+					{
+						const __m256i a = _mm256_set1_epi64x( (long long)gi[4*w] );
+						const __m256i b = _mm256_load_si256( (const __m256i *)( gj + 4*w ) );
+						const __m256i xa = _mm256_andnot_si256( b, a ), xb = _mm256_andnot_si256( a, b );
+						const __m256i sa = _mm256_add_epi64( _mm256_add_epi64( a, xa ), ci );
+						const __m256i sb = _mm256_add_epi64( _mm256_add_epi64( b, xb ), cj );
+						ci = _mm256_srli_epi64( _mm256_or_si256( xa, _mm256_andnot_si256( sa, a ) ), 63 );
+						cj = _mm256_srli_epi64( _mm256_or_si256( xb, _mm256_andnot_si256( sb, b ) ), 63 );
+						b8 = _mm256_add_epi8( b8, MSADIST_POPB( _mm256_or_si256( _mm256_andnot_si256( a, sa ), _mm256_andnot_si256( b, sb ) ) ) );
+					}
+					if( ++nb == 31 )
+					{
+						sum = _mm256_add_epi64( sum, _mm256_sad_epu8( b8, z ) );
+						b8 = z;
+						nb = 0;
+					}
+				}
+			}
+			sum = _mm256_add_epi64( sum, _mm256_sad_epu8( b8, z ) );
+			_mm256_storeu_si256( (__m256i *)v, sum );
+			for( l=0; l<4; l++ ) if( 4*g + l > i && 4*g + l < n ) ne[4*g+l] = (int)v[l];
+			continue;
+		}
 		for( w0=0; w0<W; w0=w1 )
 		{
 			__m256i b8 = z; // byte counts, at most 8 per word
@@ -2440,6 +2528,39 @@ static inline __attribute__((always_inline)) long long msadist_gaprunsbody( cons
 {
 	const uint64_t *mi = f->masks + (size_t)i * 2 * f->W, *mj = f->masks + (size_t)j * 2 * f->W, *me = mi + f->W;
 	long long nE = 0;
+	if( f->ract ) // work/v9p: only the words where either row has a residue
+	{
+		const uint64_t *ai = f->ract + (size_t)i * f->nmw, *aj = f->ract + (size_t)j * f->nmw;
+		int m, w;
+#if FMSIMD_X86
+		unsigned char ci = 0, cj = 0;
+		unsigned long long sa, sb;
+#else
+		uint64_t ci = 0, cj = 0;
+#endif
+		uint64_t e;
+		for( m=0; m<f->nmw; m++ )
+		{
+			uint64_t bits = ai[m] | aj[m];
+			while( bits )
+			{
+				w = m * 64 + __builtin_ctzll( bits );
+				bits &= bits - 1;
+#if FMSIMD_X86
+				{
+					unsigned long long ga = mi[w], gb = mj[w];
+					ci = _addcarry_u64( ci, ga, ga & ~gb, &sa );
+					cj = _addcarry_u64( cj, gb, gb & ~ga, &sb );
+					e = ( sa & ~ga ) | ( sb & ~gb );
+				}
+#else
+				MSADIST_RUNWORD( mi[w], mj[w], ci, cj, e );
+#endif
+				nE += __builtin_popcountll( e );
+			}
+		}
+		return( nE );
+	}
 #if FMSIMD_X86
 	unsigned char ci = 0, cj = 0;
 	uint64_t e0, e1;
@@ -2569,6 +2690,7 @@ static void msadist_dump( const char *fn, int njob, double **iscore )
 	fclose( fp );
 }
 
+static double sextet_now( void ); // work/v9p (sextetfast block)
 #if 1
 static void *msadistmtxthread( void *arg ) // enablemultithread == 0 demo tsukau
 {
@@ -2588,6 +2710,10 @@ static void *msadistmtxthread( void *arg ) // enablemultithread == 0 demo tsukau
 	msadistfast_t *mf = (msadistfast_t *)targ->fast; // fast-mafft
 	int *acc = ( mf && mf->colpath ) ? calloc( njob + 64, sizeof( int ) ) : NULL; // column path: residue sums of row i with every later row (+64: dense-column blocks)
 	int *ne = ( mf && mf->ne4 ) ? calloc( njob, sizeof( int ) ) : NULL; // AVX2: gap runs of row i with every later row
+	double v9tcol = 0.0, v9tgap = 0.0, v9tpair = 0.0, v9tp0 = 0.0; // work/v9p: MAFFT_MSADIST=time
+#if FMSIMD_X86
+	int v9nt = mf && njob >= 4096 && !( getenv( "MAFFT_MSADIST" ) && strstr( getenv( "MAFFT_MSADIST" ), "nont" ) ); // work/v9p: non-temporal matrix stores (large N: the rows are not in any cache)
+#endif
 
 	while( 1 )
 	{
@@ -2599,6 +2725,7 @@ static void *msadistmtxthread( void *arg ) // enablemultithread == 0 demo tsukau
 
 			if( i == nlim )
 			{
+				if( mf && mf->timing ) { mf->tcol += v9tcol; mf->tgap += v9tgap; mf->tpair += v9tpair; } // under the mutex
 				pthread_mutex_unlock( targ->mutex );
 				free( acc ); free( ne );
 				return( NULL );
@@ -2611,12 +2738,24 @@ static void *msadistmtxthread( void *arg ) // enablemultithread == 0 demo tsukau
 #endif
 		{
 			i = (jobpospt->i)++;
-			if( i == nlim ) { free( acc ); free( ne ); return( NULL ); }
+			if( i == nlim ) { if( mf && mf->timing ) { mf->tcol += v9tcol; mf->tgap += v9tgap; mf->tpair += v9tpair; } free( acc ); free( ne ); return( NULL ); }
 			if( i % 100 == 0 ) fprintf( stderr, "\r% 5d / %d", i, njob );
 		}
 
 		ssi = selfscore[i];
+		if( mf && mf->timing ) // work/v9p
+		{
+			double t0_ = sextet_now(), t1_;
+			if( mf->colpath ) msadist_colrow( mf, i, acc );
+			t1_ = sextet_now(); v9tcol += t1_ - t0_;
+#if FMSIMD_X86
+			if( mf->ne4 ) msadist_gaprow_avx2( mf, i, ne );
+#endif
+			v9tgap += sextet_now() - t1_;
+		}
+		else
 		if( acc || ne ) msadist_rowprep( mf, i, acc, ne );
+		if( mf && mf->timing ) v9tp0 = sextet_now();
 		for( j=i+1; j<njob; j++ )
 		{
 			ssj = selfscore[j];
@@ -2636,10 +2775,23 @@ static void *msadistmtxthread( void *arg ) // enablemultithread == 0 demo tsukau
 				reporterr( "WARNING: negative distance, iscoretmp = %f\n", iscoretmp );
 				iscoretmp = 0.0;
 			}
+#if FMSIMD_X86
+			if( v9nt ) // work/v9p: the same 8 bytes, written around the caches (no read of the old line)
+			{
+				long long b_;
+				memcpy( &b_, &iscoretmp, sizeof( double ) );
+				_mm_stream_si64( (long long *)( iscore[i] + ( j - i ) ), b_ );
+			}
+			else
+#endif
 			iscore[i][j-i] = iscoretmp;
 //			printf( "i,j=%d,%d, iscoretmp=%f\n", i, j, iscoretmp );
 
 		}
+#if FMSIMD_X86
+		if( v9nt ) _mm_sfence();
+#endif
+		if( mf && mf->timing ) v9tpair += sextet_now() - v9tp0;
 		if( acc ) memset( acc + i + 1, 0, ( njob - i - 1 ) * sizeof( int ) );
 	}
 }
@@ -2834,7 +2986,7 @@ static void *distancematrixthread( void *arg )
 typedef struct _sextetfast
 {
 	int n, npad;
-	int kind;        // 1: dense DNA tables, 2: tuple lists, 3: inverted index of the tuple lists
+	int kind;        // 1: dense DNA tables, 2: tuple lists, 3: inverted index of the tuple lists, 4: dense element masks + index of the rest (work/v9p)
 	int check, scalar, timing;
 	int simd;        // fmsimd level (scalar, MAFFT_SIMD and the CPU)
 	long nsimd, nslow; // dense path, with timing: 4x4 blocks by the SIMD kernel / by the plain loop
@@ -2862,6 +3014,15 @@ typedef struct _sextetfast
 	uint32_t *ppos;  // per list entry (same layout as lp/lc): index of the row's own entry in post
 	int cb;          // count bits
 	double listwork, invwork; // estimated operations of the two pair loops
+	/* kind 4 (work/v9p) */
+	int dk, dw;      // dense elements, 64-bit words per row mask
+	uint64_t *dmask; // npad rows of dw words
+	size_t *rstart;  // per row: its entries of the index of the rest, rstart[i] .. rstart[i+1]
+	uint32_t *rpp;   // per such entry: its position in post (whose count is c - kd)
+	uint16_t *rtup;  // and its tuple (post[poff[p] .. poff[p+1]) are p's rows)
+	size_t nres;
+	int popcnt;      // x86: the POPCNT version of the pair loop
+	double densework;
 	/* jobs */
 	int phase;       // 0: build tables/lists, 1: pairs
 	int jobpos;
@@ -3349,6 +3510,206 @@ static void sextet_checkrow( sextetfast_t *s, int i )
 	free( table1 );
 }
 
+/* fast-mafft work/v9p, kind 4 (protein): the count of a pair is the size of the intersection of
+   the two rows' sets of "elements" (p,k), k = 1..c(p) (min( c_i(p), c_j(p) ) of them per tuple p).
+   The SEXTET_DMAX at most most frequent elements (each a bit of a dense mask per row, AND +
+   popcount per pair) are chosen by an operation-count estimate; per tuple they are a prefix
+   k <= kd(p) of its elements (an element's frequency does not grow with k; ties: smaller k first),
+   so what is left of a tuple is  min( c_i - kd, c_j - kd )  for the rows with c > kd(p), added
+   from an inverted index of those rows (as kind 3).  On homfam_rvp 128 elements leave 0.09 index
+   steps per pair (kind 3: 67, the list loop: 88).  Exact integers throughout. */
+#define SEXTET_KD 8      // occurrences per tuple that can be dense elements (k < SEXTET_KD)
+#define SEXTET_DMAX 1024 // largest number of dense elements
+
+static int sextet_u64cmp( const void *a, const void *b )
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+	return( x < y ? -1 : x > y ? 1 : 0 );
+}
+
+// Chooses the dense elements and builds the masks and the index of the rest.  Returns 1 to use
+// kind 4 (force: whenever there is something to make dense).
+static int sextet_builddense( sextetfast_t *s, int force )
+{
+	int n = s->n, tw = s->tw, i, k, p, c, e, m, K, bestK, rb, dw;
+	int *f = NULL, *kd = NULL, *bitof = NULL;
+	uint64_t *el = NULL;
+	size_t q, nres, *cur = NULL;
+	double pairs = (double)n * ( n - 1 ) / 2, sp, sp0, best, cost, list = 0.0;
+	uint32_t maxc = 0;
+
+	f = calloc( (size_t)tw * SEXTET_KD, sizeof( int ) );
+	kd = calloc( tw, sizeof( int ) );
+	if( !f || !kd ) goto fail;
+	for( i=0; i<n; i++ )
+	{
+		const uint16_t *lp = s->lp + s->off[i], *lc = s->lc + s->off[i];
+		for( k=0; k<s->ln[i]; k++ )
+		{
+			c = lc[k] < SEXTET_KD ? lc[k] : SEXTET_KD;
+			for( e=0; e<c; e++ ) f[lp[k]*SEXTET_KD+e]++;
+		}
+		list += (double)s->ln[i] * ( i + 1 );
+	}
+	for( m=0, q=0; q<(size_t)tw*SEXTET_KD; q++ ) if( q % SEXTET_KD < SEXTET_KD - 1 && f[q] >= 2 ) m++;
+	el = malloc( ( m + 1 ) * sizeof( uint64_t ) );
+	if( !el ) goto fail;
+	for( m=0, q=0; q<(size_t)tw*SEXTET_KD; q++ ) if( q % SEXTET_KD < SEXTET_KD - 1 && f[q] >= 2 ) el[m++] = ( (uint64_t)( 0x7fffffff - f[q] ) << 32 ) | q; // frequency descending, then (p,k) ascending
+	qsort( el, m, sizeof( uint64_t ), sextet_u64cmp );
+	// operation counts: a mask word per pair per 64 elements; two per index step (as kind 3)
+	for( sp=0.0, p=0; p<tw; p++ ) sp += (double)f[p*SEXTET_KD] * f[p*SEXTET_KD] / 2;
+	sp0 = sp;
+	best = 2.0 * sp;
+	bestK = 0;
+	for( K=1; K<=m && K<=SEXTET_DMAX; K++ )
+	{
+		q = el[K-1] & 0xffffffff;
+		p = (int)( q / SEXTET_KD ); e = (int)( q % SEXTET_KD ); // e == kd[p]
+		sp += ( (double)f[q+1] * f[q+1] - (double)f[q] * f[q] ) / 2;
+		kd[p]++;
+		if( K % 64 == 0 && ( cost = pairs * ( K / 64 ) + 2.0 * sp ) < best )
+		{
+			best = cost;
+			bestK = K;
+		}
+	}
+	s->listwork = list;
+	s->invwork = sp0;
+	s->densework = best;
+	if( bestK == 0 || ( !force && best >= 0.8 * MIN( list, 2.0 * sp0 ) ) ) goto fail;
+
+	// the dense elements: bit b = their rank
+	s->dk = bestK;
+	s->dw = dw = bestK / 64;
+	bitof = malloc( (size_t)tw * SEXTET_KD * sizeof( int ) );
+	if( !bitof ) goto fail;
+	memset( kd, 0, tw * sizeof( int ) );
+	for( K=0; K<bestK; K++ )
+	{
+		q = el[K] & 0xffffffff;
+		p = (int)( q / SEXTET_KD );
+		bitof[q] = K;
+		kd[p]++;
+	}
+	if( posix_memalign( (void **)&s->dmask, 64, (size_t)s->npad * dw * sizeof( uint64_t ) ) ) { s->dmask = NULL; goto fail; }
+	memset( s->dmask, 0, (size_t)s->npad * dw * sizeof( uint64_t ) );
+	// the rest: per tuple the rows with c > kd(p), count c - kd(p)
+	s->poff = calloc( tw + 1, sizeof( size_t ) );
+	s->rstart = calloc( n + 1, sizeof( size_t ) );
+	if( !s->poff || !s->rstart ) goto fail;
+	for( nres=0, i=0; i<n; i++ )
+	{
+		const uint16_t *lp = s->lp + s->off[i], *lc = s->lc + s->off[i];
+		uint64_t *mk = s->dmask + (size_t)i * dw;
+		for( k=0; k<s->ln[i]; k++ )
+		{
+			p = lp[k];
+			c = lc[k];
+			for( e=0; e<c && e<kd[p]; e++ ) mk[bitof[p*SEXTET_KD+e]>>6] |= 1ULL << ( bitof[p*SEXTET_KD+e] & 63 );
+			if( c > kd[p] )
+			{
+				s->poff[p+1]++;
+				if( (uint32_t)( c - kd[p] ) > maxc ) maxc = c - kd[p];
+				nres++;
+			}
+		}
+		s->rstart[i+1] = nres;
+	}
+	for( rb=1; ( 1L << rb ) < n; rb++ ) ;
+	s->cb = 32 - rb;
+	if( s->cb < 2 || nres >= 0xffffffffUL || (double)maxc >= (double)( 1u << s->cb ) ) goto fail;
+	for( p=0; p<tw; p++ ) s->poff[p+1] += s->poff[p];
+	s->post = malloc( ( nres + 1 ) * sizeof( uint32_t ) );
+	s->rpp = malloc( ( nres + 1 ) * sizeof( uint32_t ) );
+	s->rtup = malloc( ( nres + 1 ) * sizeof( uint16_t ) );
+	cur = malloc( tw * sizeof( size_t ) );
+	if( !s->post || !s->rpp || !s->rtup || !cur ) goto fail;
+	memcpy( cur, s->poff, tw * sizeof( size_t ) );
+	for( nres=0, i=0; i<n; i++ ) // ascending rows, so every posting list is in row order
+	{
+		const uint16_t *lp = s->lp + s->off[i], *lc = s->lc + s->off[i];
+		for( k=0; k<s->ln[i]; k++ )
+		{
+			p = lp[k];
+			c = lc[k];
+			if( c > kd[p] )
+			{
+				q = cur[p]++;
+				s->post[q] = ( (uint32_t)i << s->cb ) | (uint32_t)( c - kd[p] );
+				s->rpp[nres] = (uint32_t)q;
+				s->rtup[nres] = (uint16_t)p;
+				nres++;
+			}
+		}
+	}
+	s->nres = nres;
+	free( cur ); free( f ); free( kd ); free( bitof ); free( el );
+	return( 1 );
+fail:
+	free( cur ); free( f ); free( kd ); free( bitof ); free( el );
+	free( s->dmask ); s->dmask = NULL;
+	free( s->poff ); s->poff = NULL;
+	free( s->rstart ); s->rstart = NULL;
+	free( s->post ); s->post = NULL;
+	free( s->rpp ); s->rpp = NULL;
+	free( s->rtup ); s->rtup = NULL;
+	s->dk = s->dw = 0;
+	return( 0 );
+}
+
+// kind 4, row i: the rest from the index into acc[], then every pair's count and distance
+static inline __attribute__((always_inline)) void sextet_denserowbody( sextetfast_t *s, int i, int *acc )
+{
+	int n = s->n, j, w, dw = s->dw, cb = s->cb, c;
+	const uint32_t mask = ( 1u << cb ) - 1;
+	const uint64_t *bi = s->dmask + (size_t)i * dw, *bj;
+	size_t k;
+	for( k=s->rstart[i]; k<s->rstart[i+1]; k++ )
+	{
+		const uint32_t *e = s->post + s->rpp[k], *end = s->post + s->poff[s->rtup[k]+1];
+		const uint32_t ci = *e & mask;
+		for( e++; e<end; e++ )
+		{
+			uint32_t cj = *e & mask;
+			acc[*e >> cb] += ( ci < cj ) ? ci : cj;
+		}
+	}
+	sextet_store( s, i, i, (int)s->self[i] ); // the number of tuples, as commonsextet_p( table_i, pointt[i] )
+	bj = bi + dw;
+	if( dw == 2 )
+	{
+		const uint64_t b0 = bi[0], b1 = bi[1];
+		for( j=i+1; j<n; j++, bj+=2 )
+		{
+			c = acc[j] + __builtin_popcountll( b0 & bj[0] ) + __builtin_popcountll( b1 & bj[1] );
+			acc[j] = 0;
+			sextet_store( s, i, j, c );
+		}
+		return;
+	}
+	for( j=i+1; j<n; j++, bj+=dw )
+	{
+		c = acc[j];
+		acc[j] = 0;
+		for( w=0; w<dw; w++ ) c += __builtin_popcountll( bi[w] & bj[w] );
+		sextet_store( s, i, j, c );
+	}
+}
+
+static void sextet_denserow( sextetfast_t *s, int i, int *acc )
+{
+	sextet_denserowbody( s, i, acc );
+}
+
+#if FMSIMD_X86
+__attribute__((target("popcnt")))
+static void sextet_denserow_popcnt( sextetfast_t *s, int i, int *acc )
+{
+	sextet_denserowbody( s, i, acc );
+}
+#endif
+
+
 static void *sextet_thread( void *arg )
 {
 	sextetfast_t *s = (sextetfast_t *)arg;
@@ -3375,7 +3736,7 @@ static void *sextet_thread( void *arg )
 		tab = (uint16_t *)calloc( s->tw, sizeof( uint16_t ) );
 		if( !tab ) ErrorExit( "Cannot allocate tab\n" );
 	}
-	if( s->kind == 3 )
+	if( s->kind == 3 || s->kind == 4 )
 	{
 		acc = (int *)calloc( s->n, sizeof( int ) );
 		if( !acc ) ErrorExit( "Cannot allocate acc\n" );
@@ -3386,6 +3747,10 @@ static void *sextet_thread( void *arg )
 		if( i0 % 100 == 0 || i0 / 100 != ( i1 - 1 ) / 100 ) reporterr( "\r% 5d / %d", i1, s->n );
 		if( s->kind == 1 ) sextet_densejob( s, i0 );
 		else if( s->kind == 3 ) for( i=i0; i<i1; i++ ) sextet_invrow( s, i, acc );
+#if FMSIMD_X86
+		else if( s->kind == 4 && s->popcnt ) for( i=i0; i<i1; i++ ) sextet_denserow_popcnt( s, i, acc );
+#endif
+		else if( s->kind == 4 ) for( i=i0; i<i1; i++ ) sextet_denserow( s, i, acc );
 		else for( i=i0; i<i1; i++ ) sextet_listrow( s, i, tab );
 		if( s->check ) for( i=i0; i<i1; i++ ) sextet_checkrow( s, i );
 	}
@@ -3394,6 +3759,7 @@ static void *sextet_thread( void *arg )
 	free( acc );
 	return( NULL );
 }
+
 
 static void sextetfast_free( sextetfast_t *s )
 {
@@ -3406,6 +3772,7 @@ static void sextetfast_free( sextetfast_t *s )
 	free( s->tab ); free( s->tot ); free( s->mc ); free( s->ovn ); free( s->ovp ); free( s->ovc );
 	free( s->ln ); free( s->off ); free( s->lp ); free( s->lc );
 	free( s->post ); free( s->poff ); free( s->ppos );
+	free( s->dmask ); free( s->rstart ); free( s->rpp ); free( s->rtup ); // work/v9p
 	free( s->self );
 	free( s->lftab );
 }
@@ -3532,6 +3899,14 @@ static int sextetfast_run( int njob, int **pointt, double **mtx, int *nogaplen )
 		if( s.phase == 0 )
 		{
 			if( s.bad ) break;
+			if( s.kind == 2 && tsize == 46656 && !( mode && ( strstr( mode, "nodense" ) || strstr( mode, "noinv" ) ) ) && sextet_builddense( &s, mode && strstr( mode, "dense" ) && !strstr( mode, "nodense" ) ) ) // work/v9p
+			{
+				int pc = 0;
+				s.kind = 4;
+				fmsimd_cpu( &pc, NULL );
+				s.popcnt = pc && s.simd >= FMSIMD_BASE;
+			}
+			else
 			if( s.kind == 2 && !( mode && strstr( mode, "noinv" ) ) && sextet_buildinv( &s, mode && strstr( mode, "inv" ) && !strstr( mode, "noinv" ) ) ) s.kind = 3;
 			t1 = sextet_now();
 		}
@@ -3546,7 +3921,7 @@ static int sextetfast_run( int njob, int **pointt, double **mtx, int *nogaplen )
 #endif
 	sextetfast_free( &s );
 	if( s.bad ) return( 0 ); // a list count did not fit; mtx was not written
-	if( s.timing ) reporterr( "\nsextetfast: kind %d, simd level %d, %d threads, tables %.3f s, pairs %.3f s; dense 4x4 blocks: %ld simd, %ld plain; list work %.3g, inverted work %.3g\n", s.kind, s.simd, nthr, t1 - t0, t2 - t1, s.nsimd, s.nslow, s.listwork, s.invwork );
+	if( s.timing ) reporterr( "\nsextetfast: kind %d, simd level %d, %d threads, tables %.3f s, pairs %.3f s; dense 4x4 blocks: %ld simd, %ld plain; list work %.3g, inverted work %.3g, dense+rest work %.3g (%d dense elements, %zu rest entries)\n", s.kind, s.simd, nthr, t1 - t0, t2 - t1, s.nsimd, s.nslow, s.listwork, s.invwork, s.densework, s.dk, s.nres );
 	if( s.check ) reporterr( "\nsextetfast check passed: kind %d, simd level %d, %d rows, every pair's %s bitwise identical\n", s.kind, s.simd, njob, s.convert ? "distance" : "count" );
 	return( s.convert ? 2 : 1 );
 }
@@ -3560,6 +3935,145 @@ static void sextet_dump( const char *fn, int n, double **mtx )
 	fclose( fp );
 }
 /* END sextetfast kernel */
+
+/* BEGIN v9p halfmtx */
+/*
+ * fast-mafft work/v9p: the half distance matrix in one anonymous mapping, rows pointing into it
+ * (the original allocates every row with calloc, serially, which on glibc above the dynamic mmap
+ * threshold means zeroing all of it in one thread: 1.8 s on homfam_sdr, 3.7 s on homfam_rvp, and
+ * 4 KB pages, one TLB miss per strided read in the guide-tree step).  The mapping is zero-filled
+ * by the kernel on first touch (by the threads that write the distances), with transparent huge
+ * pages requested.  Only for the default guide-tree path (fixed_musclesupg_..._v9/_mt know the
+ * slab and do not free its rows one by one); everything else uses AllocateFloatHalfMtx.
+ *   MAFFT_V9SLAB=0   original allocation;  =1  never MADV_HUGEPAGE;  =2  always MADV_HUGEPAGE
+ */
+#include <sys/mman.h>
+extern char *v9_slab_lo, *v9_slab_hi;
+static double **v9_slab_mtx = NULL;
+static size_t v9_slab_len = 0;
+
+static double **v9_halfmtx_alloc( int n )
+{
+	const char *e = getenv( "MAFFT_V9SLAB" );
+	size_t tot, off;
+	double **m;
+	char *base;
+	int i;
+	if( ( e && *e == '0' ) || v9_slab_mtx || n < 1 ) return( AllocateFloatHalfMtx( n ) );
+	tot = (size_t)n * ( (size_t)n + 1 ) / 2 * sizeof( double );
+	base = (char *)mmap( NULL, tot, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0 );
+	if( base == MAP_FAILED ) return( AllocateFloatHalfMtx( n ) );
+#ifdef MADV_HUGEPAGE
+	// transparent huge pages: with the system mode "always" they come without asking (and without
+	// the synchronous compaction that MADV_HUGEPAGE requests under the usual defrag=madvise); with
+	// "madvise" they must be asked for
+	if( !( e && *e == '1' ) )
+	{
+		char thp[128] = "";
+		FILE *fp = fopen( "/sys/kernel/mm/transparent_hugepage/enabled", "r" );
+		if( fp )
+		{
+			if( !fgets( thp, sizeof( thp ), fp ) ) thp[0] = 0;
+			fclose( fp );
+		}
+		if( strstr( thp, "[madvise]" ) || ( e && *e == '2' ) ) madvise( base, tot, MADV_HUGEPAGE );
+	}
+#endif
+	m = (double **)calloc( (size_t)n + 1, sizeof( double * ) );
+	if( m == NULL )
+	{
+		munmap( base, tot );
+		return( AllocateFloatHalfMtx( n ) );
+	}
+	for( off=0, i=0; i<n; i++ )
+	{
+		m[i] = (double *)( base + off );
+		off += (size_t)( n - i ) * sizeof( double );
+	}
+	m[n] = NULL;
+	v9_slab_lo = base;
+	v9_slab_hi = base + tot;
+	v9_slab_len = tot;
+	v9_slab_mtx = m;
+	return( m );
+}
+
+static void v9_halfmtx_free( double **m, int n )
+{
+	int i;
+	if( m == NULL ) return;
+	if( m != v9_slab_mtx )
+	{
+		FreeFloatHalfMtx( m, n );
+		return;
+	}
+	for( i=0; i<n; i++ ) if( m[i] && !( (char *)m[i] >= v9_slab_lo && (char *)m[i] < v9_slab_hi ) ) free( m[i] );
+	free( m );
+	munmap( v9_slab_lo, v9_slab_len );
+	v9_slab_lo = v9_slab_hi = NULL;
+	v9_slab_len = 0;
+	v9_slab_mtx = NULL;
+}
+
+/* The guide tree from the half matrix: fixed_musclesupg_..._v9 (mltaln9.c, the same tree as the
+   _mt version and the original), or with MAFFT_UPG=old the _mt version.  MAFFT_UPG=check also
+   builds the tree with the _mt version from a copy of the matrix and exits on any difference
+   in topol, len, dep or the matrix left behind (needs memory for a second matrix). */
+static void v9_upgma( int n, double **mtx, int ***topol, double **len, Treedep *dep, int progressout, int efffree, int nthread )
+{
+	const char *mode = getenv( "MAFFT_UPG" );
+	double **cp;
+	int ***topol2;
+	double **len2;
+	Treedep *dep2;
+	int i, k, x, bad = 0;
+	if( mode && strstr( mode, "old" ) )
+	{
+		fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_mt( n, mtx, topol, len, dep, progressout, efffree, nthread );
+		return;
+	}
+	if( !( mode && strstr( mode, "check" ) ) || n < 2 )
+	{
+		fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_v9( n, mtx, topol, len, dep, progressout, efffree, nthread );
+		return;
+	}
+	cp = (double **)calloc( n + 1, sizeof( double * ) );
+	for( i=0; i<n; i++ )
+	{
+		cp[i] = (double *)malloc( ( n - i ) * sizeof( double ) );
+		if( cp[i] == NULL ) ErrorExit( "MAFFT_UPG=check: no memory for a copy of the matrix\n" );
+		memcpy( cp[i], mtx[i], ( n - i ) * sizeof( double ) );
+	}
+	topol2 = AllocateIntCub( n, 2, 0 );
+	len2 = AllocateFloatMtx( n, 2 );
+	dep2 = (Treedep *)calloc( n, sizeof( Treedep ) );
+	fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_mt( n, cp, topol2, len2, dep ? dep2 : NULL, 0, efffree, nthread );
+	fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_v9( n, mtx, topol, len, dep, progressout, efffree, nthread );
+	for( k=0; k<n-1 && !bad; k++ )
+	{
+		for( x=0; x<2; x++ )
+		{
+			if( topol[k][x][0] != topol2[k][x][0] || topol[k][x][1] != topol2[k][x][1] ) bad = 1;
+			if( memcmp( &len[k][x], &len2[k][x], sizeof( double ) ) ) bad = 2;
+		}
+		if( dep && ( dep[k].child0 != dep2[k].child0 || dep[k].child1 != dep2[k].child1 || memcmp( &dep[k].distfromtip, &dep2[k].distfromtip, sizeof( double ) ) ) ) bad = 3;
+		if( bad ) reporterr( "\nUPGMA check FAILED at step %d (%s): v9 %d,%d len %.17g,%.17g; _mt %d,%d len %.17g,%.17g\n", k, bad == 1 ? "topol" : bad == 2 ? "len" : "dep", topol[k][0][0], topol[k][1][0], len[k][0], len[k][1], topol2[k][0][0], topol2[k][1][0], len2[k][0], len2[k][1] );
+	}
+	for( i=0; i<n && !bad; i++ )
+	{
+		if( ( mtx[i] == NULL ) != ( cp[i] == NULL ) ) bad = 4;
+		else if( mtx[i] && memcmp( mtx[i], cp[i], ( n - i ) * sizeof( double ) ) ) bad = 5;
+		if( bad ) reporterr( "\nUPGMA check FAILED: matrix row %d differs (%d)\n", i, bad );
+	}
+	if( bad ) exit( 1 );
+	reporterr( "\nUPGMA check passed: n=%d efffree=%d, %d merges, topol/len/dep and the matrix identical to the _mt version\n", n, efffree, n - 1 );
+	for( i=0; i<n; i++ ) if( cp[i] ) free( cp[i] );
+	free( cp );
+	FreeIntCub( topol2 );
+	FreeFloatMtx( len2 );
+	free( dep2 );
+}
+/* END v9p halfmtx */
 
 static void recountpositions( ExtAnch *pairanch, int n1, int n2, char **seq1, char **seq2 ) // loop no junban kentou
 {
@@ -6664,10 +7178,13 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 		reporterr(       "\n\nMaking a distance matrix ..\n" );
 		if( callback && callback( 0, 0, "Distance matrix" ) ) goto chudan;
 
+		double v9pt0 = getenv( "MAFFT_V9PTIME" ) ? sextet_now() : 0.0; // fast-mafft work/v9p: stage timers
 		tmpseq = AllocateCharVec( nlenmax+1 );
 		grpseq = AllocateIntVec( nlenmax+1 );
 		pointt = AllocateIntMtx( njob, nlenmax+1 );
-		if( !compacttree ) mtx = AllocateFloatHalfMtx( njob ); 
+		if( v9pt0 > 0.0 ) reporterr( "\nv9p time: pointt %.3f s\n", sextet_now() - v9pt0 );
+		if( !compacttree ) mtx = ( !subalignment && !treeout ) ? v9_halfmtx_alloc( njob ) : AllocateFloatHalfMtx( njob ); // fast-mafft work/v9p: one mapping for the default guide-tree path
+		if( v9pt0 > 0.0 ) reporterr( "\nv9p time: + halfmtx %.3f s\n", sextet_now() - v9pt0 );
 		if( dorp == 'd' ) tsize = (int)pow( 4, tuplesize );
 		else              tsize = (int)pow( 6, 6 );
 
@@ -6727,6 +7244,7 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			}
 		}
 		if( nunknown ) reporterr(       "\nThere are %d ambiguous characters.\n", nunknown );
+		if( v9pt0 > 0.0 ) reporterr( "\nv9p time: + prep %.3f s\n", sextet_now() - v9pt0 );
 
 
 		if( compacttree )
@@ -6932,6 +7450,17 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 				}
 			}
 			} // fast-mafft (work/sextet)
+			if( v9pt0 > 0.0 )
+			{
+				FILE *smf = fopen( "/proc/self/smaps_rollup", "r" ); // Linux: transparent huge pages in use
+				char sml[256];
+				reporterr( "\nv9p time: + pairs %.3f s\n", sextet_now() - v9pt0 );
+				if( smf )
+				{
+					while( fgets( sml, sizeof( sml ), smf ) ) if( !strncmp( sml, "Rss:", 4 ) || !strncmp( sml, "AnonHugePages:", 14 ) ) reporterr( "v9p mem: %s", sml );
+					fclose( smf );
+				}
+			}
 			reporterr(       "\ndone.\n\n" );
 			ien = njob-1;
 
@@ -7143,13 +7672,13 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			{
 				reporterr(       "Constructing a UPGMA tree (efffree=%d) ... ", !calcpairdists );
 #ifdef enablemultithread
-				fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_mt( njob, mtx, topol, len, dep, 1, !calcpairdists, nthreadpair ); // fast-mafft: same tree, faster (mltaln9.c)
+				v9_upgma( njob, mtx, topol, len, dep, 1, !calcpairdists, nthreadpair ); // fast-mafft: same tree, faster (mltaln9.c; work/v9p)
 #else
-				fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_mt( njob, mtx, topol, len, dep, 1, !calcpairdists, 1 ); // fast-mafft: same tree, faster (mltaln9.c)
+				v9_upgma( njob, mtx, topol, len, dep, 1, !calcpairdists, 1 ); // fast-mafft: same tree, faster (mltaln9.c; work/v9p)
 #endif
 				if( !calcpairdists )
 				{
-					FreeFloatHalfMtx( mtx, njob ); mtx = NULL;
+					v9_halfmtx_free( mtx, njob ); mtx = NULL;
 				}
 			}
 		}
@@ -8008,6 +8537,7 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 #endif
 		{
 			reporterr( "Making a distance matrix from msa.. \n" );
+			double v9pm0 = getenv( "MAFFT_V9PTIME" ) ? sextet_now() : 0.0; // fast-mafft work/v9p: stage timers
 			if( getenv( "MAFFT_MSADIST_SAVEMSA" ) ) msadist_savemsa( getenv( "MAFFT_MSADIST_SAVEMSA" ), njob, bseq, selfscore );
 #ifdef enablemultithread
 			msadistfast_t *msadistfast = msadistfast_prepare( njob, bseq, penalty_dist, nthreadpair ); // fast-mafft; NULL -> original scorer
@@ -8016,6 +8546,7 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 #endif
 			skiptable = AllocateIntMtx( njob, 0 );
 			if( msadistfast == NULL || msadistfast->check ) makeskiptable( njob, skiptable, bseq ); // allocate suru. (only the original scorer uses it)
+			if( v9pm0 > 0.0 ) reporterr( "\nv9p time: msadist prepare %.3f s\n", sextet_now() - v9pm0 );
 #ifdef enablemultithread
 			if( nthreadpair > 0 )
 			{
@@ -8085,6 +8616,8 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 				free( targ );
 #endif
 			}
+			if( v9pm0 > 0.0 ) reporterr( "\nv9p time: msadist + pairs %.3f s\n", sextet_now() - v9pm0 );
+			if( msadistfast && msadistfast->timing ) reporterr( "\nmsadist time (thread-s): residue rows %.3f, gap-run rows %.3f, pair loops %.3f\n", msadistfast->tcol, msadistfast->tgap, msadistfast->tpair );
 			msadistfast_free( msadistfast ); msadistfast = NULL;
 			if( getenv( "MAFFT_MSADIST_DUMP" ) ) msadist_dump( getenv( "MAFFT_MSADIST_DUMP" ), njob, mtx );
 			if( skiptable) FreeIntMtx( skiptable ); skiptable = NULL;
@@ -8416,7 +8949,7 @@ chudan:
 	if( tmpseq ) free( tmpseq ); tmpseq = NULL;
 	if( grpseq ) free( grpseq ); grpseq = NULL;
 	if( pointt ) FreeIntMtx( pointt ); pointt = NULL;
-	if( mtx ) FreeFloatHalfMtx( mtx, njob ); mtx = NULL;
+	if( mtx ) v9_halfmtx_free( mtx, njob ); mtx = NULL; // fast-mafft work/v9p
 	if( table1 ) free( table1 ); table1 = NULL;
 
 	if( bseq ) FreeCharMtx( bseq ); bseq = NULL;

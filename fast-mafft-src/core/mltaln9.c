@@ -8398,8 +8398,25 @@ static void upg_phase( upg_t *u, int kind, int nchunks )
 }
 #endif
 
+char *v9_slab_lo = NULL, *v9_slab_hi = NULL; /* fast-mafft work/v9p: half matrix in one mapping (disttbfast.c); its rows are not freed one by one */
+
+static void u9_freerow( double **eff, int i )
+{
+	if( !( (char *)eff[i] >= v9_slab_lo && (char *)eff[i] < v9_slab_hi ) ) free( (void *)eff[i] );
+	eff[i] = NULL;
+}
+#include <sys/time.h>
+static double upg_now( void ) // fast-mafft work/v9p: MAFFT_UPGSTAT timers
+{
+	struct timeval tv;
+	gettimeofday( &tv, NULL );
+	return( tv.tv_sec + 1e-6 * tv.tv_usec );
+}
 void fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_mt( int nseq, double **eff, int ***topol, double **len, Treedep *dep, int progressout, int efffree, int nthread )
 {
+	int upgstat = getenv( "MAFFT_UPGSTAT" ) != NULL; // fast-mafft work/v9p
+	double ust0 = upgstat ? upg_now() : 0.0, ust1 = 0.0, ustt = 0.0, ustmin = 0.0, ustupd = 0.0, ustunl = 0.0, ustrec = 0.0;
+	long long ustnact = 0, ustncand = 0, ustpar = 0;
 	int i, j, k, q, c, x, p;
 	int *intpt;
 	double *tmptmplen = NULL;
@@ -8498,6 +8515,7 @@ void fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_mt( int nseq, double *
 		hist[i] = -1;
 		nmemar[i] = 1;
 	}
+	if( upgstat ) ust1 = upg_now();
 
 	havemin = 0;
 	minscore = 999.9;
@@ -8515,6 +8533,7 @@ void fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_mt( int nseq, double *
 		}
 #endif
 
+		if( upgstat ) { ustt = upg_now(); ustnact += u.nact; ustpar += parallel; }
 		if( !havemin ) // otherwise im and minscore were combined from the recheck phase
 		{
 			minscore = 999.9;
@@ -8529,6 +8548,7 @@ void fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_mt( int nseq, double *
 			}
 		}
 		havemin = 0;
+		if( upgstat ) { double t_ = upg_now(); ustmin += t_ - ustt; ustt = t_; }
 		jm = nearest[im];
 		if( jm < im ) 
 		{
@@ -8628,15 +8648,17 @@ void fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_mt( int nseq, double *
 			}
 		}
 
+		if( upgstat ) { double t_ = upg_now(); ustupd += t_ - ustt; ustt = t_; ustncand += u.ncand; }
 		// unlink jm
 		p = upg_findpos( u.act, u.nact, jm );
 		memmove( u.act+p, u.act+p+1, ( u.nact-p-1 ) * sizeof( int ) );
 		u.nact--;
 		if( efffree )
 		{
-			free( (void *)eff[jm] ); eff[jm] = NULL;
+			u9_freerow( eff, jm ); // fast-mafft work/v9p: rows of the slab are not freed one by one
 		}
 
+		if( upgstat ) { double t_ = upg_now(); ustunl += t_ - ustt; ustt = t_; }
 		// recheck (muscle seems to miss this.)
 #ifdef enablemultithread
 		if( parallel && u.ncand > 0 )
@@ -8712,7 +8734,9 @@ void fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_mt( int nseq, double *
 			for( x=0; x<u.ncand; x++ )
 				upg_setnearest_arr( eff, u.act, u.nact, u.candlist[x], mindisfrom+u.candlist[x], nearest+u.candlist[x] );
 		}
+		if( upgstat ) ustrec += upg_now() - ustt;
     }
+	if( upgstat ) reporterr( "\nUPGSTAT n=%d threads=%d init %.3f s, loop %.3f s (min %.3f, update %.3f, unlink %.3f, recheck %.3f); sum nact %.3g, candidates %lld, parallel steps %lld\n", nseq, u.nth, ust1 - ust0, upg_now() - ust1, ustmin, ustupd, ustunl, ustrec, (double)ustnact, ustncand, ustpar );
 #ifdef enablemultithread
 	if( parallel )
 	{
@@ -8729,6 +8753,950 @@ void fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_mt( int nseq, double *
 	free( u.act ); free( u.cand ); free( u.candlist ); free( u.candpos ); free( u.iscand );
 	free( u.ccnt ); free( u.cv ); free( u.cj ); free( u.mv ); free( u.mi );
 	free( u.p1v ); free( u.p2v ); free( u.p1j ); free( u.p2j );
+}
+/* fast-mafft work/v9p: the same guide tree as
+   fixed_musclesupg_double_realloc_nobk_halfmtx_memsave() (and its _mt version above), bit for
+   bit, for large N.  At 50,000-94,000 sequences the _mt version spends its time on strided reads
+   of the half matrix (one cache line, and on 4 KB pages a TLB miss, per value): the initial
+   setnearest() of every node, the column part (i < im, jm) of the update loop, and the full
+   rescans of the recheck loop (about 7 per merge on homfam_rvp).  Here:
+   - setnearest( pos ) returns the lexicographic minimum of ( d(pos,j), rank_pos(j) ) over the
+     active j != pos, where rank_pos(j) = j for j > pos and j + nseq for j < pos: its running
+     minimum with strict < from 999.9/-1 visits j > pos ascending, then j < pos ascending, so the
+     first node at the minimum distance in that order wins (999.9/-1 if no distance is below 999.9).
+   - Init: the matrix is read twice, sequentially: in bands of columns (u9_band; each column's
+     part of setnearest(), rows ascending, and its U9_K+1 smallest entries) and by rows (u9_rows;
+     the row part, j > i ascending, and its U9_K+1 smallest).  The row part's running minimum is
+     replaced by the column part's only if that is strictly smaller, as in setnearest().
+   - Update loop: the original body, on all threads (chunks of the active array), with software
+     prefetch of the strided values.  Each chunk also returns the minimum of mindisfrom[] over
+     its nodes whose value is final for this step (all but im, jm, the recheck candidates and the
+     last active node), so the next im comes from a combination (the lowest index wins ties, as in
+     the running minimum over the list walk) instead of a serial scan.
+   - Recheck: every node keeps a list of up to U9_K nodes and a bound theta = ( value, rank ) such
+     that every active node not in the list is lexicographically above theta (the U9_K smallest of
+     its last full scan, theta the next one; a node whose distance to a merged cluster drops below
+     theta is added in the update loop, and im, whose distances all changed, gets a new list from
+     the update loop).  A rescan reads only the listed distances: if their lexicographic minimum is
+     below theta, it is the minimum over all active nodes, i.e. exactly what setnearest() returns.
+     Otherwise the full scan runs, on all threads, and rebuilds the list.
+   Every distance is still produced by the same cluster function call on the same two values, and
+   every choice is the original's (strict < running minima and their tie order), so mindisfrom[],
+   nearest[], the merge order, topol, len, dep and the matrix are the original's.  Debug:
+   MAFFT_UPG=old uses the _mt version; MAFFT_UPG=check (disttbfast.c) also runs the _mt version on a
+   copy of the matrix and exits on any difference; MAFFT_UPGSTAT prints timers and counts. */
+
+#ifndef U9_K
+#define U9_K 16
+#endif
+#ifndef U9_PARMIN
+#define U9_PARMIN 2048 /* active nodes at or above this: parallel phases */
+#endif
+#ifndef U9_PD
+#define U9_PD 12       /* prefetch distance (active nodes) */
+#endif
+#ifndef U9_CHUNKMIN
+#define U9_CHUNKMIN 256  /* smallest chunk of a parallel update/rescan phase */
+#endif
+#ifndef U9_SYNCF
+#define U9_SYNCF 50.0    /* active nodes per unit of synchronization cost (see u9_setchunks) */
+#endif
+#define U9_KIND_BAND 0
+#define U9_KIND_ROWS 1
+#define U9_KIND_UPDATE 2
+#define U9_KIND_RESCAN 3
+#define U9_KIND_QUIT 4
+#define U9_WORD( gen, kind, nch, idx ) ( ( (unsigned long long)( (gen) & 0xfffff ) << 44 ) | ( (unsigned long long)(kind) << 40 ) | ( (unsigned long long)(nch) << 20 ) | (unsigned long long)(idx) )
+#define U9_KINDOF( w ) ( (int)( ( (w) >> 40 ) & 0xf ) )
+#define U9_NCH( w ) ( (int)( ( (w) >> 20 ) & 0xfffff ) )
+#define U9_IDX( w ) ( (int)( (w) & 0xfffff ) )
+
+/* a list entry: distance v to the node of scan rank r (relative to the list's owner) */
+typedef struct { double v; int r; } u9e_t;
+#define U9_LESS( v1, r1, v2, r2 ) ( (v1) < (v2) || ( (v1) == (v2) && (r1) < (r2) ) )
+#define U9_RANK( pos, j, n ) ( (j) > (pos) ? (j) : (j) + (n) )
+#define U9_NODE( r, n ) ( (r) < (n) ? (r) : (r) - (n) )
+
+typedef struct
+{
+	int nseq;
+	double **eff;
+	double (*cf)( double, double );
+	int *act, nact;          /* ascending; may hold dead nodes (alive[] == 0) until compacted */
+	int nalive, ndead, lastq; /* lastq: position of the last alive node in act[] */
+	char *alive;
+	double *mindisfrom;
+	int *nearest;
+	int im, jm, last;
+	/* lists: ranks lst[i*U9_K ..], lcnt[i] entries (-1: no valid list), bound ( thv[i], thr[i] ) */
+	int *lst, *lcnt, *thr;
+	double *thv;
+	/* chunks of the current phase */
+	int chunksize, nchunks, maxchunks;
+	int *cand, *ccnt;        /* update: candidates of chunk c, stored from cand[c*chunksize] */
+	double *cv; int *cj;     /* update: running minimum of the new distances (mindisfrom[im]) */
+	double *mv; int *mi;     /* update: minimum of the final mindisfrom[] values (next im) */
+	u9e_t *tk; int *tkn;     /* update: the U9_K+1 smallest new distances (im's new list) */
+	long long *cadd, *cinv;  /* update: list additions and overflows (stats) */
+	/* full rescans */
+	int nfull, *full, *fullpos, fcap;
+	double *p1v, *p2v; int *p1j, *p2j;  /* [x*nchunks+c] */
+	u9e_t *ftk; int *ftkn;              /* [(x*nchunks+c)*(U9_K+1)] */
+	/* init */
+	int nband, *bandlo, *rowlo;
+	double *colv; int *colj;  /* column part of setnearest() per node */
+	u9e_t *ctop; int *ctn, *ctw; double *cthv; /* the U9_K+1 smallest entries of each column */
+	/* stats */
+	long long nlisthit, nfullscan, nlistadd, nlistinval, nfail[3], nstrided;
+	int stat;                /* MAFFT_UPGSTAT: thread-time of the update chunks (ns, atomic adds) */
+	long long busyupd;
+	/* pool: the claim word and the done counter on cache lines of their own (idle threads spin
+	   on next; the fields above are written between phases) */
+	int nth, gen;
+	int npart;               /* threads (the caller included) taking part in the current phase */
+#ifdef enablemultithread
+	pthread_t *handle;
+	struct u9w *wargs; /* u9w_t */
+#endif
+	char pad0[64];
+	unsigned long long next;
+	char pad1[64];
+	int done;
+	char pad2[64];
+} u9_t;
+
+static int u9_findpos( const int *act, int nact, int pos )
+{
+	int lo = 0, hi = nact - 1, mid;
+	while( lo <= hi )
+	{
+		mid = ( lo + hi ) / 2;
+		if( act[mid] == pos ) return( mid );
+		if( act[mid] < pos ) lo = mid + 1;
+		else hi = mid - 1;
+	}
+	reporterr( "u9_findpos: %d is not active\n", pos );
+	exit( 1 );
+	return( -1 );
+}
+
+/* keep the U9_K+1 lexicographically smallest ( v, r ) of a stream in e[0..*np), *wp = the largest */
+static inline void u9_topk( u9e_t *e, int *np, int *wp, double v, int r )
+{
+	int n = *np, k, w;
+	if( n < U9_K + 1 )
+	{
+		e[n].v = v; e[n].r = r; n++;
+		*np = n;
+		if( n == U9_K + 1 )
+		{
+			for( w=0, k=1; k<n; k++ ) if( U9_LESS( e[w].v, e[w].r, e[k].v, e[k].r ) ) w = k;
+			*wp = w;
+		}
+		return;
+	}
+	w = *wp;
+	if( U9_LESS( v, r, e[w].v, e[w].r ) )
+	{
+		e[w].v = v; e[w].r = r;
+		for( w=0, k=1; k<n; k++ ) if( U9_LESS( e[w].v, e[w].r, e[k].v, e[k].r ) ) w = k;
+		*wp = w;
+	}
+}
+
+/* node i's list from e[0..n): every active node outside e is above all of e.  With n == U9_K+1
+   the largest becomes the bound and the others the list; with n <= U9_K all are listed (no bound). */
+static void u9_setlist( u9_t *u, int i, u9e_t *e, int n )
+{
+	int k, w;
+	int *l = u->lst + (size_t)i * U9_K;
+	if( n <= U9_K )
+	{
+		for( k=0; k<n; k++ ) l[k] = e[k].r;
+		u->lcnt[i] = n;
+		u->thv[i] = HUGE_VAL;
+		u->thr[i] = INT_MAX;
+		return;
+	}
+	for( w=0, k=1; k<n; k++ ) if( U9_LESS( e[w].v, e[w].r, e[k].v, e[k].r ) ) w = k;
+	u->thv[i] = e[w].v;
+	u->thr[i] = e[w].r;
+	for( k=0; k<n; k++ ) if( k != w ) *l++ = e[k].r;
+	u->lcnt[i] = U9_K;
+}
+
+/* the U9_K+1 smallest of nch per-chunk sets (in[c*(U9_K+1)..], inn[c] entries) */
+static int u9_mergetk( u9e_t *out, const u9e_t *in, const int *inn, int nch )
+{
+	int c, k, n = 0, w = 0;
+	for( c=0; c<nch; c++ ) for( k=0; k<inn[c]; k++ ) u9_topk( out, &n, &w, in[(size_t)c*(U9_K+1)+k].v, in[(size_t)c*(U9_K+1)+k].r );
+	return( n );
+}
+
+/* node i's distance to im (merged at this step) is now below i's bound: list im.
+   Returns 1 if added, 2 if the list overflowed (it is then dropped), 0 if im was listed. */
+static int u9_listadd( u9_t *u, int i, int im, int jm )
+{
+	int k, n = u->lcnt[i], m, r = U9_RANK( i, im, u->nseq ), x;
+	int *l = u->lst + (size_t)i * U9_K;
+	for( k=0; k<n; k++ ) if( l[k] == r ) return( 0 );
+	if( n == U9_K ) // drop the entries of nodes that are gone
+	{
+		for( m=0, k=0; k<n; k++ )
+		{
+			x = U9_NODE( l[k], u->nseq );
+			if( u->alive[x] && x != jm ) l[m++] = l[k];
+		}
+		n = m;
+	}
+	if( n < U9_K )
+	{
+		l[n] = r;
+		u->lcnt[i] = n + 1;
+		return( 1 );
+	}
+	u->lcnt[i] = -1;
+	return( 2 );
+}
+
+/* setnearest( pos ) from the list, if the list decides it: returns 1 with *mp, *np */
+static int u9_listscan( u9_t *u, int pos, double *mp, int *np )
+{
+	double **eff = u->eff;
+	int n = u->lcnt[pos], k, j, r, br = INT_MAX, nsq = u->nseq;
+	double m = HUGE_VAL, t;
+	const int *l = u->lst + (size_t)pos * U9_K;
+	if( n < 0 ) { u->nfail[0]++; return( 0 ); }
+	for( k=0; k<n; k++ )
+	{
+		r = l[k];
+		j = U9_NODE( r, nsq );
+		if( !u->alive[j] ) continue;
+		t = ( j > pos ) ? eff[pos][j-pos] : eff[j][pos-j];
+		if( U9_LESS( t, r, m, br ) )
+		{
+			m = t;
+			br = r;
+		}
+	}
+	if( br == INT_MAX || !U9_LESS( m, br, u->thv[pos], u->thr[pos] ) || !( m < 999.9 ) )
+	{
+		u->nfail[( br == INT_MAX ) ? 1 : 2]++;
+		return( 0 );
+	}
+	*mp = m;
+	*np = U9_NODE( br, nsq );
+	return( 1 );
+}
+
+/* init, band b (columns [lo,hi)): the column part of setnearest() of each column node j (rows
+   i < j ascending, strict <) and the U9_K+1 smallest entries of the column (rank i + nseq) */
+static void u9_band( u9_t *u, int b )
+{
+	int lo = u->bandlo[b], hi = u->bandlo[b+1], i, j, j0, nsq = u->nseq;
+	double **eff = u->eff;
+	double *cv = u->colv, *ct = u->cthv, t;
+	int *cj = u->colj;
+	const double *r;
+	for( j=lo; j<hi; j++ ) { cv[j] = 999.9; cj[j] = -1; ct[j] = HUGE_VAL; u->ctn[j] = 0; u->ctw[j] = 0; }
+	for( i=0; i<hi-1; i++ )
+	{
+		j0 = MAX( lo, i+1 );
+		r = eff[i];
+		for( j=j0; j<hi; j++ )
+		{
+			t = r[j-i];
+			if( t < cv[j] ) { cv[j] = t; cj[j] = i; }
+			if( t < ct[j] ) // ranks i + nseq ascend with i, so an equal value never displaces
+			{
+				u9e_t *e = u->ctop + (size_t)j * ( U9_K + 1 );
+				u9_topk( e, u->ctn + j, u->ctw + j, t, i + nsq );
+				if( u->ctn[j] == U9_K + 1 ) ct[j] = e[u->ctw[j]].v;
+			}
+		}
+	}
+}
+
+/* init, rows [rowlo[c],rowlo[c+1]): setnearest() of each node (the row part, j > i ascending,
+   then the column part from the bands, which replaces it only if strictly smaller) and its first
+   list (the U9_K+1 smallest entries of its row and of its column) */
+static void u9_rows( u9_t *u, int c )
+{
+	int a = u->rowlo[c], b2 = u->rowlo[c+1], i, j, k, n, mj, tkn, tkw, nn, w;
+	double m, t;
+	const double *r;
+	u9e_t tk[U9_K+1], all[U9_K+1], *e;
+	for( i=a; i<b2; i++ )
+	{
+		r = u->eff[i];
+		n = u->nseq - i;
+		m = 999.9; mj = -1; tkn = 0; tkw = 0;
+		for( j=1; j<n; j++ ) // node i + j, rank i + j: ascending, so an equal value never displaces
+		{
+			t = r[j];
+			if( t < m ) { m = t; mj = i + j; }
+			if( tkn < U9_K + 1 || t < tk[tkw].v ) u9_topk( tk, &tkn, &tkw, t, i + j );
+		}
+		if( u->colv[i] < m )
+		{
+			m = u->colv[i];
+			mj = u->colj[i];
+		}
+		u->mindisfrom[i] = m;
+		u->nearest[i] = mj;
+		nn = 0; w = 0;
+		for( k=0; k<tkn; k++ ) u9_topk( all, &nn, &w, tk[k].v, tk[k].r );
+		e = u->ctop + (size_t)i * ( U9_K + 1 );
+		for( k=0; k<u->ctn[i]; k++ ) u9_topk( all, &nn, &w, e[k].v, e[k].r );
+		u9_setlist( u, i, all, nn );
+	}
+}
+
+/* the original update loop body over act[a..b) */
+static void u9_updatechunk( u9_t *u, int c )
+{
+	double **eff = u->eff;
+	double *mindisfrom = u->mindisfrom;
+	int *nearest = u->nearest;
+	const int *act = u->act;
+	int im = u->im, jm = u->jm, last = u->last, nsq = u->nseq;
+	int a = c * u->chunksize, b = MIN( u->nact, a + u->chunksize );
+	int q, i, i2, miniim, maxiim, minijm, maxijm, n = 0, lj = -1, mi = -1, tkn = 0, tkw = 0, x;
+	double eff0, eff1, tmpdouble, lv = 999.9, mv = 999.9;
+	int *cand = u->cand + a;
+	u9e_t *tk = u->tk + (size_t)c * ( U9_K + 1 );
+	long long nadd = 0, ninv = 0;
+
+	for( q=a; q<b; q++ )
+	{
+		if( q + U9_PD < b )
+		{
+			i2 = act[q+U9_PD];
+			if( i2 < jm && u->alive[i2] )
+			{
+				__builtin_prefetch( eff[i2] + ( jm - i2 ) );
+				if( i2 < im ) __builtin_prefetch( eff[i2] + ( im - i2 ) );
+			}
+		}
+		i = act[q];
+		if( i != im && i != jm && u->alive[i] )
+		{
+			if( i < im )
+			{
+				 miniim = i;
+				 maxiim = im;
+				 minijm = i;
+				 maxijm = jm;
+			}
+			else if( i < jm )
+			{
+				 miniim = im;
+				 maxiim = i;
+				 minijm = i;
+				 maxijm = jm;
+			}
+			else
+			{
+				 miniim = im;
+				 maxiim = i;
+				 minijm = jm;
+				 maxijm = i;
+			}
+			eff0 = eff[miniim][maxiim-miniim];
+			eff1 = eff[minijm][maxijm-minijm];
+			tmpdouble = eff[miniim][maxiim-miniim] =
+			(u->cf)( eff0, eff1 );
+			if( tmpdouble < mindisfrom[i]  )
+			{
+				mindisfrom[i] = tmpdouble;
+				nearest[i] = im;
+			}
+			if( tmpdouble < lv  ) // mindisfrom[im] in the original
+			{
+				lv = tmpdouble;
+				lj = i;
+			}
+			if( nearest[i] == jm )
+			{
+				nearest[i] = im;
+			}
+			// the condition of the original recheck loop, on i's final values
+			if( nearest[i] == im && tmpdouble > mindisfrom[i] ) cand[n++] = i;
+			else if( i != last && mindisfrom[i] < mv ) // final for this step: for the next im
+			{
+				mv = mindisfrom[i];
+				mi = i;
+			}
+			// i's list: im is now at tmpdouble
+			if( u->lcnt[i] >= 0 && U9_LESS( tmpdouble, U9_RANK( i, im, nsq ), u->thv[i], u->thr[i] ) )
+			{
+				x = u9_listadd( u, i, im, jm );
+				nadd += ( x == 1 );
+				ninv += ( x == 2 );
+			}
+			// im's new list
+			if( tkn < U9_K + 1 || U9_LESS( tmpdouble, U9_RANK( im, i, nsq ), tk[tkw].v, tk[tkw].r ) ) u9_topk( tk, &tkn, &tkw, tmpdouble, U9_RANK( im, i, nsq ) );
+		}
+	}
+	u->ccnt[c] = n;
+	u->cv[c] = lv; u->cj[c] = lj;
+	u->mv[c] = mv; u->mi[c] = mi;
+	u->tkn[c] = tkn;
+	u->cadd[c] = nadd; u->cinv[c] = ninv;
+}
+
+/* full setnearest() of the candidates u->full[], over act[a..b): partial running minima of its
+   two loops, and the U9_K+1 smallest entries for the new lists */
+static void u9_rescanchunk( u9_t *u, int c )
+{
+	double **eff = u->eff;
+	const int *act = u->act;
+	int nch = u->nchunks, nsq = u->nseq;
+	int a = c * u->chunksize, b = MIN( u->nact, a + u->chunksize );
+	int x, q, j, j2, pos, p, n, e, tkn, tkw;
+	double m, t, *rowpos;
+	u9e_t *tk;
+
+	for( x=0; x<u->nfull; x++ )
+	{
+		pos = u->full[x];
+		p = u->fullpos[x];
+		rowpos = eff[pos];
+		tk = u->ftk + (size_t)( x * nch + c ) * ( U9_K + 1 );
+		tkn = 0; tkw = 0;
+		m = 999.9; n = -1;
+		for( q=MAX( a, p+1 ); q<b; q++ ) // part of the first loop of setnearest()
+		{
+			j = act[q];
+			if( !u->alive[j] ) continue;
+			t = rowpos[j-pos];
+			if( t < m )
+			{
+				m = t;
+				n = j;
+			}
+			if( tkn < U9_K + 1 || t < tk[tkw].v ) u9_topk( tk, &tkn, &tkw, t, j ); // ranks ascend
+		}
+		u->p1v[x*nch+c] = m; u->p1j[x*nch+c] = n;
+		m = 999.9; n = -1;
+		e = MIN( b, p );
+		for( q=a; q<e; q++ ) // part of the second loop of setnearest()
+		{
+			if( q + U9_PD < e )
+			{
+				j2 = act[q+U9_PD];
+				if( u->alive[j2] ) __builtin_prefetch( eff[j2] + ( pos - j2 ) );
+			}
+			j = act[q];
+			if( !u->alive[j] ) continue;
+			t = eff[j][pos-j];
+			if( t < m )
+			{
+				m = t;
+				n = j;
+			}
+			if( tkn < U9_K + 1 || t < tk[tkw].v ) u9_topk( tk, &tkn, &tkw, t, j + nsq ); // ranks ascend, above the first loop's
+		}
+		u->p2v[x*nch+c] = m; u->p2j[x*nch+c] = n;
+		u->ftkn[x*nch+c] = tkn;
+	}
+}
+
+static void u9_runchunk( u9_t *u, int kind, int c )
+{
+	if( kind == U9_KIND_BAND ) u9_band( u, c );
+	else if( kind == U9_KIND_ROWS ) u9_rows( u, c );
+	else if( kind == U9_KIND_UPDATE )
+	{
+		double t0 = u->stat ? upg_now() : 0.0;
+		u9_updatechunk( u, c );
+		if( u->stat ) __atomic_fetch_add( &u->busyupd, (long long)( ( upg_now() - t0 ) * 1e9 ), __ATOMIC_RELAXED );
+	}
+	else u9_rescanchunk( u, c );
+}
+
+#ifdef enablemultithread
+/* Claims chunks with fetch-and-add (no retries) until none is left and reports how many it ran
+   with one add to done (the next phase is published only when done reaches its chunk count, so a
+   claim loop never spans two phases). */
+static void u9_claim( u9_t *u )
+{
+	unsigned long long w;
+	int kind, c, ran = 0;
+	for( ;; )
+	{
+		w = __atomic_fetch_add( &u->next, 1ULL, __ATOMIC_ACQ_REL );
+		kind = U9_KINDOF( w );
+		c = U9_IDX( w );
+		if( kind == U9_KIND_QUIT || c >= U9_NCH( w ) ) break;
+		u9_runchunk( u, kind, c );
+		ran++;
+	}
+	if( ran ) __atomic_fetch_add( &u->done, ran, __ATOMIC_RELEASE );
+}
+
+typedef struct u9w { u9_t *u; int id; } u9w_t;
+
+/* worker id (1..nth-1) takes part in a phase only if id < npart (set before the phase is published;
+   a stale value only changes how many threads help, never which chunks run) */
+static void *u9_worker( void *arg )
+{
+	u9_t *u = ( (u9w_t *)arg )->u;
+	int id = ( (u9w_t *)arg )->id;
+	unsigned long long w;
+	int spins = 0;
+	for( ;; )
+	{
+		w = __atomic_load_n( &u->next, __ATOMIC_ACQUIRE );
+		if( U9_KINDOF( w ) == U9_KIND_QUIT ) break;
+		if( U9_IDX( w ) < U9_NCH( w ) && id < __atomic_load_n( &u->npart, __ATOMIC_RELAXED ) )
+		{
+			u9_claim( u );
+			spins = 0;
+			continue;
+		}
+		if( ++spins < 20000 ) upg_relax();
+		else sched_yield();
+	}
+	return( NULL );
+}
+#endif
+
+/* one phase: chunks 0..nch-1 of kind, on all threads (par) or here */
+static void u9_phase( u9_t *u, int kind, int nch, int par )
+{
+	int c;
+#ifdef enablemultithread
+	int spins = 0;
+	if( par && u->nth > 1 )
+	{
+		u->gen++;
+		__atomic_store_n( &u->done, 0, __ATOMIC_RELAXED );
+		__atomic_store_n( &u->next, U9_WORD( u->gen, kind, nch, 0 ), __ATOMIC_RELEASE );
+		u9_claim( u );
+		while( __atomic_load_n( &u->done, __ATOMIC_ACQUIRE ) < nch )
+		{
+			if( ++spins < 20000 ) upg_relax();
+			else sched_yield();
+		}
+		return;
+	}
+#endif
+	for( c=0; c<nch; c++ ) u9_runchunk( u, kind, c );
+}
+
+/* A step's update (or rescan) work grows with the active nodes, its synchronization with the threads
+   taking part (cache lines crossing cores and sockets, about a microsecond each on CARC): with
+   nitems / U9_SYNCF the work in such units, sqrt( nitems / U9_SYNCF ) threads minimize the sum
+   (homfam_rvp: all 32 for most of the tree; rnasim10k: 14 down to 6). */
+static void u9_setchunks( u9_t *u, int nitems, int par )
+{
+	if( par && u->nth > 1 )
+	{
+		int p = (int)sqrt( (double)nitems / U9_SYNCF );
+		if( p < 2 ) p = 2;
+		if( p > u->nth ) p = u->nth;
+		u->npart = p;
+		u->nchunks = MIN( 2 * p, ( nitems + U9_CHUNKMIN - 1 ) / U9_CHUNKMIN );
+		if( u->nchunks < 1 ) u->nchunks = 1;
+		u->chunksize = ( nitems + u->nchunks - 1 ) / u->nchunks;
+		u->nchunks = ( nitems + u->chunksize - 1 ) / u->chunksize;
+	}
+	else
+	{
+		u->chunksize = MAX( nitems, 1 );
+		u->nchunks = 1;
+	}
+}
+
+void fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_v9( int nseq, double **eff, int ***topol, double **len, Treedep *dep, int progressout, int efffree, int nthread )
+{
+	int i, j, k, q, c, x, p, b;
+	int *intpt;
+	double *tmptmplen = NULL;
+	int *hist = NULL;
+	int im = -1, jm = -1;
+	int prevnode;
+	int *pt1, *pt2, *pt11;
+	int *nmemar;
+	int nmemim, nmemjm;
+	double minscore, bv, m;
+	int bi, nn, ncand, *candlist;
+	int *nearest = NULL;
+	double *mindisfrom = NULL;
+	double (*clusterfuncpt[1])(double,double);
+	int parallel;
+	u9_t u;
+	u9e_t tkall[U9_K+1];
+	int upgstat = getenv( "MAFFT_UPGSTAT" ) != NULL;
+	double ust0 = upgstat ? upg_now() : 0.0, ust1 = 0.0, ustb = 0.0, ustt = 0.0, ustupd = 0.0, ustres = 0.0, ustcomb = 0.0, ustscan = 0.0, usttop = 0.0, ustk = 0.0;
+
+	if( nseq < 2 || (long long)nseq * 2 >= INT_MAX ) // ranks run to 2*nseq
+	{
+		fixed_musclesupg_double_realloc_nobk_halfmtx_memsave_mt( nseq, eff, topol, len, dep, progressout, efffree, nthread );
+		return;
+	}
+	sueff1 = 1 - (double)sueff_global;
+	sueff05 = (double)sueff_global * 0.5;
+	if ( treemethod == 'X' )
+		clusterfuncpt[0] = cluster_mix_double;
+	else if ( treemethod == 'E' )
+		clusterfuncpt[0] = cluster_average_double;
+	else if ( treemethod == 'q' )
+		clusterfuncpt[0] = cluster_minimum_double;
+	else
+	{
+		reporterr(       "Unknown treemethod, %c\n", treemethod );
+		exit( 1 );
+	}
+
+	hist = AllocateIntVec( njob );
+	tmptmplen = AllocateFloatVec( njob );
+	nmemar = AllocateIntVec( njob );
+	mindisfrom = AllocateFloatVec( njob );
+	nearest = AllocateIntVec( njob );
+
+	memset( &u, 0, sizeof( u9_t ) );
+	u.stat = upgstat;
+	u.nseq = nseq;
+	u.eff = eff;
+	u.cf = clusterfuncpt[0];
+	u.mindisfrom = mindisfrom;
+	u.nearest = nearest;
+	u.act = AllocateIntVec( nseq );
+	u.alive = AllocateCharVec( nseq );
+	for( i=0; i<nseq; i++ ) { u.act[i] = i; u.alive[i] = 1; }
+	u.nact = u.nalive = nseq;
+	u.ndead = 0;
+	u.lastq = nseq - 1;
+	u.lst = AllocateIntVec( nseq * U9_K );
+	u.lcnt = AllocateIntVec( nseq );
+	u.thv = AllocateFloatVec( nseq );
+	u.thr = AllocateIntVec( nseq );
+	for( i=0; i<nseq; i++ ) u.lcnt[i] = -1;
+	candlist = AllocateIntVec( nseq );
+
+#ifdef enablemultithread
+	u.nth = ( nthread > 1 ) ? nthread : 1;
+#if !defined(mingw) && !defined(_MSC_VER)
+	{
+		long ncpu = sysconf( _SC_NPROCESSORS_ONLN );
+		if( ncpu > 0 && u.nth > ncpu ) u.nth = (int)ncpu;
+	}
+#endif
+	if( getenv( "MAFFT_UPGTHREADS" ) && atoi( getenv( "MAFFT_UPGTHREADS" ) ) > 0 && atoi( getenv( "MAFFT_UPGTHREADS" ) ) < u.nth ) u.nth = atoi( getenv( "MAFFT_UPGTHREADS" ) ); // the tree does not depend on it
+#else
+	u.nth = 1;
+#endif
+	parallel = ( u.nth > 1 && nseq >= U9_PARMIN );
+	u.maxchunks = 2 * u.nth + 2; // u9_setchunks makes at most 2*nth chunks
+	u.cand = AllocateIntVec( nseq );
+	u.ccnt = AllocateIntVec( u.maxchunks );
+	u.cv = AllocateFloatVec( u.maxchunks ); u.cj = AllocateIntVec( u.maxchunks );
+	u.mv = AllocateFloatVec( u.maxchunks ); u.mi = AllocateIntVec( u.maxchunks );
+	u.tk = (u9e_t *)calloc( (size_t)u.maxchunks * ( U9_K + 1 ), sizeof( u9e_t ) );
+	u.tkn = AllocateIntVec( u.maxchunks );
+	u.cadd = (long long *)calloc( u.maxchunks, sizeof( long long ) );
+	u.cinv = (long long *)calloc( u.maxchunks, sizeof( long long ) );
+	u.full = AllocateIntVec( nseq );
+	u.fullpos = AllocateIntVec( nseq );
+
+#ifdef enablemultithread
+	if( parallel )
+	{
+		u.next = U9_WORD( 0, U9_KIND_BAND, 0, 0 ); // nothing to claim yet
+		u.handle = calloc( u.nth, sizeof( pthread_t ) );
+		u.wargs = calloc( u.nth, sizeof( u9w_t ) );
+		for( i=1; i<u.nth; i++ )
+		{
+			u.wargs[i].u = &u;
+			u.wargs[i].id = i;
+			pthread_create( u.handle+i, NULL, u9_worker, (void *)( u.wargs + i ) );
+		}
+	}
+#endif
+
+	// init: setnearest() of every node and its first list, from two sequential passes
+	u.nband = parallel ? 4 * u.nth : 1;
+	if( u.nband > nseq / 4 ) u.nband = 1;
+	u.bandlo = AllocateIntVec( u.nband + 1 );
+	u.rowlo = AllocateIntVec( u.nband + 1 );
+	for( b=0; b<=u.nband; b++ )
+	{
+		u.bandlo[b] = (int)( (double)nseq * sqrt( (double)b / u.nband ) ); // equal work: column j holds j values
+		u.rowlo[b] = (int)( (double)nseq * ( 1.0 - sqrt( 1.0 - (double)b / u.nband ) ) ); // row i holds nseq-1-i
+	}
+	u.bandlo[0] = u.rowlo[0] = 0; u.bandlo[u.nband] = u.rowlo[u.nband] = nseq;
+	u.colv = AllocateFloatVec( nseq );
+	u.colj = AllocateIntVec( nseq );
+	u.cthv = AllocateFloatVec( nseq );
+	u.ctn = AllocateIntVec( nseq );
+	u.ctw = AllocateIntVec( nseq );
+	u.ctop = (u9e_t *)malloc( (size_t)nseq * ( U9_K + 1 ) * sizeof( u9e_t ) );
+	if( u.ctop == NULL ) ErrorExit( "Cannot allocate ctop\n" );
+	u.npart = u.nth;
+	u9_phase( &u, U9_KIND_BAND, u.nband, parallel );
+	if( upgstat ) ustb = upg_now();
+	u9_phase( &u, U9_KIND_ROWS, u.nband, parallel );
+	free( u.colv ); free( u.colj ); free( u.cthv ); free( u.ctn ); free( u.ctw ); free( u.ctop ); free( u.bandlo ); free( u.rowlo );
+	u.colv = NULL; u.colj = NULL; u.cthv = NULL; u.ctn = NULL; u.ctw = NULL; u.ctop = NULL; u.bandlo = NULL; u.rowlo = NULL;
+
+	for( i=0; i<nseq; i++ ) tmptmplen[i] = 0.0;
+	for( i=0; i<nseq; i++ )
+	{
+		hist[i] = -1;
+		nmemar[i] = 1;
+	}
+	if( upgstat ) ust1 = upg_now();
+
+	// the first im: the running minimum of the original list walk (all nodes but the last one)
+	minscore = 999.9;
+	for( q=0; q<u.nact-1; q++ )
+	{
+		i = u.act[q];
+		if( mindisfrom[i] < minscore ) // muscle
+		{
+			im = i;
+			minscore = mindisfrom[i];
+		}
+	}
+
+	if( progressout ) reporterr(       "\n" );
+	for( k=0; k<nseq-1; k++ )
+	{
+		if( upgstat ) ustk = upg_now();
+		if( progressout && k % ( nseq < 4000 ? 10 : nseq < 40000 ? 100 : 1000 ) == 0 ) reporterr(       "\r% 5d / %d", k, nseq ); // work/v9p: every 10 steps took ~1 s per tree at 94,000 sequences when stderr is a pipe
+
+#ifdef enablemultithread
+		if( parallel && u.nalive < U9_PARMIN ) // the rest is too small for threads
+		{
+			__atomic_store_n( &u.next, U9_WORD( u.gen+1, U9_KIND_QUIT, 0, 0 ), __ATOMIC_RELEASE );
+			for( i=1; i<u.nth; i++ ) pthread_join( u.handle[i], NULL );
+			parallel = 0;
+		}
+#endif
+
+		jm = nearest[im];
+		if( jm < im )
+		{
+			j=jm; jm=im; im=j;
+		}
+
+		prevnode = hist[im];
+		if( dep ) dep[k].child0 = prevnode;
+		nmemim = nmemar[im];
+		intpt = topol[k][0] = (int *)realloc( topol[k][0], ( 2 ) * sizeof( int ) ); // memsave
+		if( prevnode == -1 )
+		{
+			*intpt++ = im;
+			*intpt = -1;
+		}
+		else
+		{
+			pt1 = topol[prevnode][0];
+			pt2 = topol[prevnode][1];
+			if( *pt1 > *pt2 )
+				pt11 = pt2;
+			else
+				pt11 = pt1;
+			*intpt++ = *pt11;
+			*intpt = -1;
+		}
+
+		prevnode = hist[jm];
+		if( dep ) dep[k].child1 = prevnode;
+		nmemjm = nmemar[jm];
+		intpt = topol[k][1] = (int *)realloc( topol[k][1], ( 2 ) * sizeof( int ) );
+		if( !intpt )
+		{
+			reporterr(       "Cannot reallocate topol\n" );
+			exit( 1 );
+		}
+		if( prevnode == -1 )
+		{
+			*intpt++ = jm;
+			*intpt = -1;
+		}
+		else
+		{
+			pt1 = topol[prevnode][0];
+			pt2 = topol[prevnode][1];
+			if( *pt1 > *pt2 )
+				pt11 = pt2;
+			else
+				pt11 = pt1;
+			*intpt++ = *pt11;
+			*intpt = -1;
+		}
+
+		minscore *= 0.5;
+
+		len[k][0] = ( minscore - tmptmplen[im] );
+		len[k][1] = ( minscore - tmptmplen[jm] );
+
+		if( dep ) dep[k].distfromtip = minscore;
+
+		tmptmplen[im] = minscore;
+
+		hist[im] = k;
+		nmemar[im] = nmemim + nmemjm;
+
+		// update loop
+		u.im = im;
+		u.jm = jm;
+		for( q=u.lastq; !u.alive[u.act[q]] || u.act[q] == jm; q-- ) ; // the last active node once jm is gone
+		u.last = u.act[q];
+		if( upgstat ) u.nstrided += 2 * (long long)u9_findpos( u.act, u.nact, im ) + ( u9_findpos( u.act, u.nact, jm ) - u9_findpos( u.act, u.nact, im ) );
+		mindisfrom[im] = 999.9;
+		if( upgstat ) { ustt = upg_now(); usttop += ustt - ustk; }
+		u9_setchunks( &u, u.nact, parallel );
+		u9_phase( &u, U9_KIND_UPDATE, u.nchunks, parallel );
+		if( upgstat ) { double t_ = upg_now(); ustupd += t_ - ustt; ustt = t_; }
+		ncand = 0;
+		for( c=0; c<u.nchunks; c++ )
+		{
+			if( u.cv[c] < mindisfrom[im] ) // chunk order = list order
+			{
+				mindisfrom[im] = u.cv[c];
+				nearest[im] = u.cj[c];
+			}
+			memcpy( candlist + ncand, u.cand + c * u.chunksize, u.ccnt[c] * sizeof( int ) );
+			ncand += u.ccnt[c];
+			u.nlistadd += u.cadd[c];
+			u.nlistinval += u.cinv[c];
+		}
+		// im's distances are all new: its list comes from them
+		nn = u9_mergetk( tkall, u.tk, u.tkn, u.nchunks );
+		u9_setlist( &u, im, tkall, nn );
+		// the next im, first from the nodes whose mindisfrom[] is final, in chunk order
+		bv = 999.9; bi = -1;
+		for( c=0; c<u.nchunks; c++ )
+		{
+			if( u.mv[c] < bv ) // chunk c covers larger indices than chunk c-1
+			{
+				bv = u.mv[c];
+				bi = u.mi[c];
+			}
+		}
+
+		// unlink jm
+		u.alive[jm] = 0; // its act[] entry stays until the next compaction
+		u.nalive--;
+		while( !u.alive[u.act[u.lastq]] ) u.lastq--;
+		if( ++u.ndead > u.nact / 8 + 64 )
+		{
+			for( p=0, q=0; q<u.nact; q++ ) if( u.alive[u.act[q]] ) u.act[p++] = u.act[q];
+			u.nact = p;
+			u.ndead = 0;
+			u.lastq = p - 1;
+		}
+		if( efffree ) u9_freerow( eff, jm );
+
+		if( upgstat ) { double t_ = upg_now(); ustcomb += t_ - ustt; ustt = t_; }
+		// recheck (muscle seems to miss this.): setnearest() of the candidates, from their
+		// lists when these decide it, else by a full scan
+		u.nfull = 0;
+		for( x=0; x<ncand; x++ )
+		{
+			i = candlist[x];
+			if( u9_listscan( &u, i, &m, &j ) )
+			{
+				mindisfrom[i] = m;
+				nearest[i] = j;
+				u.nlisthit++;
+			}
+			else
+			{
+				u.full[u.nfull] = i;
+				u.fullpos[u.nfull] = u9_findpos( u.act, u.nact, i );
+				u.nfull++;
+			}
+		}
+		if( upgstat ) { double t_ = upg_now(); ustscan += t_ - ustt; ustt = t_; }
+		if( u.nfull )
+		{
+			int par = parallel && (long long)u.nfull * u.nact >= 4 * U9_PARMIN;
+			u.nfullscan += u.nfull;
+			u9_setchunks( &u, u.nact, par );
+			if( u.nfull * u.nchunks > u.fcap )
+			{
+				u.fcap = u.nfull * u.nchunks * 2;
+				free( u.p1v ); free( u.p2v ); free( u.p1j ); free( u.p2j ); free( u.ftk ); free( u.ftkn );
+				u.p1v = AllocateFloatVec( u.fcap );
+				u.p2v = AllocateFloatVec( u.fcap );
+				u.p1j = AllocateIntVec( u.fcap );
+				u.p2j = AllocateIntVec( u.fcap );
+				u.ftk = (u9e_t *)calloc( (size_t)u.fcap * ( U9_K + 1 ), sizeof( u9e_t ) );
+				u.ftkn = AllocateIntVec( u.fcap );
+			}
+			u9_phase( &u, U9_KIND_RESCAN, u.nchunks, par );
+			for( x=0; x<u.nfull; x++ )
+			{
+				m = 999.9; j = -1;
+				for( c=0; c<u.nchunks; c++ ) // j > pos first, in list order
+				{
+					if( u.p1v[x*u.nchunks+c] < m )
+					{
+						m = u.p1v[x*u.nchunks+c];
+						j = u.p1j[x*u.nchunks+c];
+					}
+				}
+				for( c=0; c<u.nchunks; c++ ) // then j < pos
+				{
+					if( u.p2v[x*u.nchunks+c] < m )
+					{
+						m = u.p2v[x*u.nchunks+c];
+						j = u.p2j[x*u.nchunks+c];
+					}
+				}
+				mindisfrom[u.full[x]] = m;
+				nearest[u.full[x]] = j;
+				nn = u9_mergetk( tkall, u.ftk + (size_t)x * u.nchunks * ( U9_K + 1 ), u.ftkn + x * u.nchunks, u.nchunks );
+				u9_setlist( &u, u.full[x], tkall, nn );
+			}
+		}
+		if( upgstat ) ustres += upg_now() - ustt;
+
+		// the next im: also im and the candidates, whose values were not final in the update loop
+		// (the lowest index wins ties, as in the running minimum over the list walk)
+		if( im != u.last && ( mindisfrom[im] < bv || ( bi != -1 && mindisfrom[im] == bv && im < bi ) ) )
+		{
+			bv = mindisfrom[im];
+			bi = im;
+		}
+		for( x=0; x<ncand; x++ )
+		{
+			i = candlist[x];
+			if( i == u.last ) continue;
+			if( mindisfrom[i] < bv || ( bi != -1 && mindisfrom[i] == bv && i < bi ) )
+			{
+				bv = mindisfrom[i];
+				bi = i;
+			}
+		}
+		minscore = bv;
+		if( bi != -1 ) im = bi;
+	}
+#ifdef enablemultithread
+	if( parallel )
+	{
+		__atomic_store_n( &u.next, U9_WORD( u.gen+1, U9_KIND_QUIT, 0, 0 ), __ATOMIC_RELEASE );
+		for( i=1; i<u.nth; i++ ) pthread_join( u.handle[i], NULL );
+	}
+	free( u.handle );
+	free( u.wargs );
+#endif
+	if( upgstat ) reporterr( "\nUPGSTAT v9 n=%d threads=%d init %.3f s (bands %.3f), loop %.3f s (top %.3f, update phase %.3f, combine %.3f, list scans %.3f, full rescans %.3f); rescans: %lld from lists, %lld full (no list %lld, none alive %lld, above bound %lld); list adds %lld, overflows %lld; update: %.3g strided values, %.3f thread-s in chunks\n", nseq, u.nth, ust1 - ust0, ustb - ust0, upg_now() - ust1, usttop, ustupd, ustcomb, ustscan, ustres, u.nlisthit, u.nfullscan, u.nfail[0], u.nfail[1], u.nfail[2], u.nlistadd, u.nlistinval, (double)u.nstrided, u.busyupd * 1e-9 );
+	free( (void *)tmptmplen ); tmptmplen = NULL;
+	free( hist ); hist = NULL;
+	free( (void *)nmemar ); nmemar = NULL;
+	free( mindisfrom );
+	free( nearest );
+	free( candlist );
+	free( u.act ); free( u.alive ); free( u.lst ); free( u.lcnt ); free( u.thv ); free( u.thr );
+	free( u.cand ); free( u.ccnt ); free( u.cv ); free( u.cj ); free( u.mv ); free( u.mi ); free( u.tk ); free( u.tkn ); free( u.cadd ); free( u.cinv );
+	free( u.full ); free( u.fullpos );
+	free( u.p1v ); free( u.p2v ); free( u.p1j ); free( u.p2j ); free( u.ftk ); free( u.ftkn );
 }
 void fixed_musclesupg_double_realloc_nobk_halfmtx( int nseq, double **eff, int ***topol, double **len, Treedep *dep, int progressout, int efffree )
 {
