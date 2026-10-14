@@ -1,4 +1,15 @@
-# Re-running the CARC evaluation
+# Evaluating on CARC
+
+**To evaluate fast-mafft yourself, use `run_eval.sh`.** It is self-contained: it builds MAFFT v7.526
+and fast-mafft from this repository on the job's node, runs both on any directory of FASTA files, and
+checks byte-identity and speedup. See the top-level README, "How to evaluate", or run
+`bash carc/run_eval.sh --help`.
+
+The rest of this file documents how the numbers in `../RESULTS.md` were produced: the
+`carc_v9_final.sh` jobs, whose paths point at the author's CARC scratch directory, and the logs in
+`logs/`.
+
+## The final-evaluation jobs
 
 ## Files
 
