@@ -1,0 +1,29 @@
+== rep 3 node b09-04.hpc.usc.edu Model name: AMD EPYC 7513 32-Core Processor gcc=13.3.0 start Tue Oct 13 14:52:25 PDT 2026
+built v9-aggr rc=0 	prefix=/scratch2/yihanhon/fast-mafft/carc-results/v9final-13072138/v9-aggr/libexec/mafft
+built v9-default rc=0 	prefix=/scratch2/yihanhon/fast-mafft/carc-results/v9final-13072138/v9-default/libexec/mafft
+== TIMING rep 3, --thread 32 (md5 of every timed run must match between baseline and v9)
+baseAggr-r3 rnasim5k t=32 wall=44.1 maxrss_gb=3.03 md5=455da94efd24 exit=0 stages=6mer:0.2,prog1:23.2,distmsa:1.7,prog2:16.3
+v9aggr-r3 rnasim5k t=32 wall=4.4 maxrss_gb=3.12 md5=455da94efd24 exit=0 stages=6mer:0.0,prog1:2.0,distmsa:0.0,prog2:1.7
+baseAggr-r3 rnasim10k t=32 wall=95.0 maxrss_gb=5.68 md5=5e7bb28c8e8e exit=0 stages=6mer:1.4,prog1:53.7,distmsa:3.2,prog2:25.5
+v9aggr-r3 rnasim10k t=32 wall=7.9 maxrss_gb=3.44 md5=5e7bb28c8e8e exit=0 stages=6mer:0.0,prog1:3.7,distmsa:0.3,prog2:2.8
+baseAggr-r3 16S.T t=32 wall=58.2 maxrss_gb=3.73 md5=f487c1a56702 exit=0 stages=6mer:0.6,prog1:23.7,distmsa:8.2,prog2:18.3
+v9aggr-r3 16S.T t=32 wall=5.0 maxrss_gb=4.07 md5=f487c1a56702 exit=0 stages=6mer:0.0,prog1:2.1,distmsa:0.3,prog2:1.9
+baseAggr-r3 16S.3 t=32 wall=46.6 maxrss_gb=3.10 md5=6b646c6b3c1f exit=0 stages=6mer:0.4,prog1:23.9,distmsa:0.6,prog2:16.1
+v9aggr-r3 16S.3 t=32 wall=4.0 maxrss_gb=3.00 md5=6b646c6b3c1f exit=0 stages=6mer:0.0,prog1:1.6,distmsa:0.1,prog2:1.5
+baseAggr-r3 homfam_p450 t=32 wall=140.0 maxrss_gb=2.46 md5=a8da25a0a301 exit=0 stages=6mer:12.3,prog1:65.0,distmsa:14.6,prog2:42.2
+v9aggr-r3 homfam_p450 t=32 wall=6.2 maxrss_gb=2.59 md5=a8da25a0a301 exit=0 stages=6mer:0.6,prog1:2.1,distmsa:0.9,prog2:1.9
+baseAggr-r3 rnasim20k t=32 wall=232.8 maxrss_gb=12.86 md5=89f21e3ddf15 exit=0 stages=6mer:12.9,prog1:71.7,distmsa:72.3,prog2:45.9
+v9aggr-r3 rnasim20k t=32 wall=17.5 maxrss_gb=5.46 md5=89f21e3ddf15 exit=0 stages=6mer:0.9,prog1:5.2,distmsa:3.9,prog2:5.8
+baseAggr-r3 16S.B.ALL t=32 wall=504.7 maxrss_gb=3.84 md5=8a066cfcbfbe exit=0 stages=6mer:46.3,prog1:198.5,distmsa:70.6,prog2:150.0
+v9aggr-r3 16S.B.ALL t=32 wall=17.8 maxrss_gb=4.41 md5=8a066cfcbfbe exit=0 stages=6mer:1.4,prog1:7.7,distmsa:2.9,prog2:3.7
+baseAggr-r3 homfam_sdr t=32 wall=267.4 maxrss_gb=9.96 md5=4d0ab395b00f exit=0 stages=6mer:82.8,prog1:40.7,distmsa:101.6,prog2:32.3
+v9aggr-r3 homfam_sdr t=32 wall=12.4 maxrss_gb=10.27 md5=4d0ab395b00f exit=0 stages=6mer:2.6,prog1:2.5,distmsa:3.9,prog2:2.2
+baseAggr-r3 homfam_Acetyltransf t=32 wall=172.4 maxrss_gb=8.47 md5=f9d7882de1bf exit=0 stages=6mer:58.4,prog1:22.7,distmsa:70.5,prog2:15.3
+v9aggr-r3 homfam_Acetyltransf t=32 wall=8.9 maxrss_gb=8.65 md5=f9d7882de1bf exit=0 stages=6mer:2.1,prog1:1.3,distmsa:3.4,prog2:0.8
+baseAggr-r3 rnasim25k t=32 wall=1204.8 maxrss_gb=4.00 md5=ce1f97d60307 exit=0 stages=6mer:25.9,prog1:596.0,distmsa:47.3,prog2:493.6
+v9aggr-r3 rnasim25k t=32 wall=27.0 maxrss_gb=4.60 md5=ce1f97d60307 exit=0 stages=6mer:1.0,prog1:9.7,distmsa:6.2,prog2:8.0
+baseAggr-r3 homfam_rvp t=32 wall=930.1 maxrss_gb=33.00 md5=a6774caadc06 exit=0 stages=6mer:403.4,prog1:35.5,distmsa:462.2,prog2:18.5
+v9aggr-r3 homfam_rvp t=32 wall=23.9 maxrss_gb=33.20 md5=a6774caadc06 exit=0 stages=6mer:7.6,prog1:3.9,distmsa:10.2,prog2:0.9
+baseAggr-r3 rnasim50k t=32 wall=2529.6 maxrss_gb=12.58 md5=47bb47d38946 exit=0 stages=6mer:170.4,prog1:975.8,distmsa:427.0,prog2:857.4
+v9aggr-r3 rnasim50k t=32 wall=68.1 maxrss_gb=12.77 md5=47bb47d38946 exit=0 stages=6mer:4.2,prog1:23.5,distmsa:20.9,prog2:15.1
+== end Tue Oct 13 16:39:59 PDT 2026
