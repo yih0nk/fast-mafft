@@ -29,6 +29,11 @@ the tables below from them.
 
 ## 2. Datasets
 
+The exact input files are published in this repository's `data-v1` release. `bash bench/get_data.sh`
+downloads them and verifies the checksums in `bench/DATA_MD5.txt`. Provenance and licenses are in
+`bench/DATA.md`. To rerun the comparison on them or on any other inputs, use `carc/run_eval.sh`.
+
+
 Lengths are ungapped, computed from the input files. The input md5 is the first 12 hex digits of the
 FASTA file.
 

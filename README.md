@@ -5,6 +5,27 @@ fast-mafft is a faster drop-in replacement for **MAFFT v7.526** in its default m
 v7.526's. It was built for the USC CSCI 270 bonus project and is evaluated on USC CARC: 32 cores,
 64 GB, large datasets, against v7.526 built with aggressive optimization.
 
+## How to evaluate (USC CARC)
+
+```
+git clone https://github.com/yih0nk/fast-mafft.git && cd fast-mafft
+bash bench/get_data.sh                     # optional: our 32 benchmark inputs (93 MB), checksum-verified
+sbatch --account=<account> carc/run_eval.sh                               # all of bench/data, --thread 32
+sbatch --account=<account> carc/run_eval.sh --data /path/to/fastas --reps 3   # your own inputs
+```
+
+`carc/run_eval.sh` builds **both** MAFFT v7.526 (from this repository's first commit, checked against
+known checksums) and fast-mafft on the node that runs the job, with the same compiler (gcc 13.3) and
+the same flags (default `-O3 -march=native -flto`). It then runs the two programs back to back on
+every input at `--thread 32`, checks that their outputs are **byte-identical**, and prints a table of
+wall time, speedup and peak memory to `fast-mafft-eval-<jobid>.log`. Options:
+
+- `--check-default` also compares the outputs of builds with the default Makefile flags;
+- `--selfcheck` also runs fast-mafft's internal bitwise self-checks;
+- `--threads`, `--reps`, `--flags` and `--work` are listed by `bash carc/run_eval.sh --help`.
+
+Run `bench/get_data.sh` on a login node, since compute nodes may have no internet access.
+
 ## Contents
 
 | path | what it is |
@@ -15,7 +36,8 @@ v7.526's. It was built for the USC CSCI 270 bonus project and is evaluated on US
 | [CHANGES.md](CHANGES.md) | Every optimization, stage by stage: what MAFFT did, what v9 does, why the output stays identical, and the measured effect. Also the bugs found and fixed. |
 | [VERIFICATION.md](VERIFICATION.md) | How identity was verified: datasets, thread counts, compilers and SIMD levels, self-check modes, edge cases, reference md5s. |
 | [RESULTS.md](RESULTS.md) | Final 3-run CARC evaluation on 12 datasets (`--thread 32`, 32 cores, 64 GB): **9.7x–36.2x mean speedup, minimum single run 8.3x, byte-identical output in every run**. Also methodology, datasets and raw runs. |
-| `carc/` | The CARC job script and timing harness (copies of `bench/carc_v9_final.sh` and `bench/carc_run.py`), a log summarizer, the three final job logs (`carc/logs/`), and a README on re-running the evaluation. |
+| `carc/` | `run_eval.sh`, the portable evaluation job above; the scripts, summarizer and logs of the final evaluation (`carc_v9_final.sh`, `summarize.py`, `logs/`); and a README. |
+| `bench/` | `get_data.sh` and `DATA.md` (benchmark inputs, provenance, licenses, checksums in `DATA_MD5.txt`), the timing harness `carc_run.py`, the development harness `run_bench.py`, and the synthetic-data generators. |
 
 ## Quick start (Linux)
 
@@ -50,18 +72,11 @@ exact in any order, tie rules are kept, and the one order-dependent piece of MAF
 switch) is reproduced explicitly. Each new kernel has a bitwise self-check against the original
 code.
 
-On CARC development runs, v9 measured 10–11x on rnasim10k and 16S.T, and 15–50x on the large HomFam
-sets, against the aggressive baseline. The final numbers will go in RESULTS.md.
+In the final CARC evaluation (3 runs on 3 nodes, 12 datasets, `--thread 32`), v9 was 9.7x–36.2x faster
+on average than MAFFT v7.526 built with `-O3 -march=native -flto`. Its slowest single run was 8.3x,
+and the output was byte-identical in every run. See RESULTS.md.
 
-## Verification of this package (2026-10-13)
+## Verification
 
-- **The patch applies cleanly.** It applies to a clean `git archive` of v7.526 with `patch -p1` (no
-  fuzz or offsets) and with `git apply`. Both results are identical to `fast-mafft-src/` in content
-  and permission bits.
-- **It builds.** Apple clang 15 builds the patched tree.
-- **The output is identical.** md5 at `--thread 4` matches `baseline-install` on sim1k
-  (3e271a550159), rnasim1k (d3d860c0602f) and prot2k (087f57deb475).
-- **The self-checks pass.** `MAFFT_SEXTET=check MAFFT_MSADIST=check MAFFT_UPG=check` passes on
-  rnasim1k and prot2k.
-
-Details are in VERIFICATION.md §3.
+See VERIFICATION.md: identity across compilers, SIMD levels, thread counts, BAliBASE and edge
+cases, plus the self-check modes.
