@@ -39,7 +39,7 @@ while [ $# -gt 0 ]; do
   case $1 in
     --data) DATA=$2; shift 2;; --threads) T=$2; shift 2;; --reps) REPS=$2; shift 2;;
     --flags) FLAGS=$2; shift 2;; --check-default) CHECKDEF=1; shift;; --selfcheck) SELFCHECK=1; shift;;
-    --work) WORK=$2; shift 2;; -h|--help) sed -n '2,32p' "$0"; exit 0;;
+    --work) WORK=$2; shift 2;; -h|--help) sed -n '/^# Evaluate fast-mafft/,/^set -uo/p' "$0" | sed -e '$d' -e 's/^# {0,1}//'; exit 0;;
     *) echo "unknown option $1"; exit 2;;
   esac
 done

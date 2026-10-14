@@ -17,7 +17,7 @@ if [ -f data/rnasim50k.fa ] || [ -f data/large/rnasim50k.fa ]; then
 else
   tmp=$(mktemp -d)
   echo "downloading $URL"
-  curl -fL --retry 3 -o "$tmp/data.tar.gz" "$URL"
+  curl -fL --retry 3 -# -o "$tmp/data.tar.gz" "$URL"
   tar -xzf "$tmp/data.tar.gz" -C "$HERE"
   rm -rf "$tmp"
 fi
@@ -48,7 +48,7 @@ if [ "${1:-}" = "--balibase" ]; then
   else
     tmp=$(mktemp -d)
     echo "downloading BAliBASE 3.0 from its official site"
-    curl -fL --retry 3 -o "$tmp/bb.tar.gz" "$BALIBASE_URL"
+    curl -fL --retry 3 -# -o "$tmp/bb.tar.gz" "$BALIBASE_URL"
     mkdir -p data/balibase && tar -xzf "$tmp/bb.tar.gz" -C data/balibase
     rm -rf "$tmp"
   fi
