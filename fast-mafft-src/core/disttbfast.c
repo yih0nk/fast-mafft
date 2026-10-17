@@ -5257,6 +5257,15 @@ static void *treebasethread( void *arg )
 			}
 		}
 
+		/* work/v10w: the step's aligner is taken from alg here, under the mutex, right after the switch
+		   check, instead of after the unlock (the original reads it a few microseconds later, unlocked).
+		   That is one of the original's own timings: whatever the original's step could read, it can
+		   read this value (alg only goes from 'A' to 'M', under this mutex).  It fixes the race at the
+		   start of an in-order pass, where the original's row copies inside the mutex let the steps
+		   claimed before the switching one read 'A' nearly always, and v9's shorter critical section
+		   (rows grown after the unlock) made them read 'M' as often as not (notes/v10w-lever.md).
+		   Reads inside Falign (per segment) stay as in the original. */
+		char algstep = alg;
 		if( alg == 'M' ) // hoka no thread ga M ni shitakamo shirenainode
 		{
 //			reporterr(       "Freeing commonIP (thread %d)\n", thread_no );
@@ -5510,7 +5519,7 @@ static void *treebasethread( void *arg )
 		else if( force_fft || ( use_fft && ffttry ) )
 		{
 			if( l < 500 || l % 100 == 0 ) reporterr(       " f\b\b" );
-			if( alg == 'M' )
+			if( algstep == 'M' ) // work/v10w: see algstep
 			{
 				if( l < 500 || l % 100 == 0 ) reporterr(       "m" );
 				pscore = Falign_udpari_long( NULL, NULL, dynamicmtx, mseq1, mseq2, effarr1, effarr2, NULL, NULL, clus1, clus2, *alloclen, fftlog+m1 );
@@ -5524,7 +5533,7 @@ static void *treebasethread( void *arg )
 		{
 			if( l < 500 || l % 100 == 0 ) reporterr(       " d\b\b" );
 			fftlog[m1] = 0;
-			switch( alg )
+			switch( algstep ) // work/v10w: see algstep
 			{
 				case( 'a' ):
 					pscore = Aalign( mseq1, mseq2, effarr1, effarr2, clus1, clus2, *alloclen );
@@ -8202,7 +8211,20 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			     redone with the original's own dispatch (and its own run-to-run behaviour);
 			   - switch impossible (--nomemsave, or already 'M' from pass 1): ready queue. */
 			static int tb_abandonedbefore = 0; // an earlier pass had to be redone: expect the same here
-			int tb_inorder = ( nthreadtb <= 1 || tb_abandonedbefore );
+			/* work/v10w: a pass that starts with alg == 'M' (--memsave; note that alg is reset to its
+			   initial value at the start of every pass, alg = algbackup above, so a switch in pass 1 does
+			   not carry over into pass 2, whatever the comment above says) has no order-dependent state:
+			   every step uses the memsave aligners whatever the order, so the ready queue gives the
+			   in-order pass's result (as with --nomemsave) */
+			int tb_inorder = ( nthreadtb <= 1 || ( tb_abandonedbefore && alg != 'M' ) );
+			/* work/v10w: when a sequence itself is longer than 30000 columns the switch is certain (at the
+			   first step that has it as a child, or earlier): the optimistic attempt can only be abandoned,
+			   so the pass starts in MAFFT's in-order dispatch at once, with fresh threads, as MAFFT does
+			   (the abandoned attempt made the redo's first claims race differently; see notes) */
+			if( !tb_inorder && !nevermemsave && alg != 'M' && !tb_origserial )
+			{
+				for( i=0; i<njob; i++ ) if( strlen( bseq[i] ) > 30000 ) { tb_inorder = 1; break; }
+			}
 #ifdef PROGTIMING
 			if( nthreadtb <= 1 && getenv( "MAFFT_READYQ1" ) && !tb_abandonedbefore ) tb_inorder = 0; // A/B: optimistic ready queue at one thread
 #endif
