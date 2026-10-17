@@ -25,8 +25,14 @@
 #   --flags "..."    CFLAGS for both builds (default: "-O3 -march=native -flto")
 #   --check-default  also build both with the Makefile's default flags, and confirm that the
 #                    default-flag outputs are byte-identical too (one extra run of each per input)
-#   --selfcheck      also run fast-mafft once per input with its internal self-checks on
-#                    (every 6-mer distance, MSA distance and guide-tree step recomputed the original way)
+#   --selfcheck      also run fast-mafft once per input with its internal self-checks on: every 6-mer
+#                    distance, MSA distance and guide-tree step, every anchor search, blockAlign2 call,
+#                    long FFT and Myers-Miller call recomputed the original way and compared bitwise
+#                    (slower: on inputs past 30,000 columns about the time of MAFFT itself)
+#
+# When the two outputs of a run differ, both programs run once more, to tell whether MAFFT itself gives
+# the same output twice on that input: past 30,000 columns, when MAFFT switches to its memsave mode in
+# the middle of a progressive pass, its multi-threaded output can depend on timing (VERIFICATION.md).
 #   --work DIR       build and output directory (default: <repo>/eval-work/<job id or date>)
 set -uo pipefail
 
@@ -102,19 +108,25 @@ EOF
 )
 echo "inputs: ${#INPUTS[@]}"
 RES=$WORK/runs.txt; : > "$RES"
+md5of() { local x=${1#* md5=}; echo "${x%% *}"; }
 for f in "${INPUTS[@]}"; do
   rel=${f#$DATA/}
   for r in $(seq 1 "$REPS"); do
-    $RUN "$WORK/mafft/bin/mafft" "$T" "$f" "mafft|$r|$rel" | tee -a "$RES"
-    $RUN "$WORK/fast/bin/mafft"  "$T" "$f" "fast|$r|$rel"  | tee -a "$RES"
+    lb=$($RUN "$WORK/mafft/bin/mafft" "$T" "$f" "mafft|$r|$rel"); echo "$lb" | tee -a "$RES"
+    lf=$($RUN "$WORK/fast/bin/mafft"  "$T" "$f" "fast|$r|$rel");  echo "$lf" | tee -a "$RES"
+    if [ "$(md5of "$lb")" != "$(md5of "$lf")" ]; then # the outputs differ: both again (does MAFFT reproduce itself?)
+      $RUN "$WORK/mafft/bin/mafft" "$T" "$f" "mafftagain|$r|$rel" | tee -a "$RES"
+      $RUN "$WORK/fast/bin/mafft"  "$T" "$f" "fastagain|$r|$rel"  | tee -a "$RES"
+    fi
   done
   if [ $CHECKDEF = 1 ]; then
     $RUN "$WORK/mafft-default/bin/mafft" "$T" "$f" "mafftdef|1|$rel" | tee -a "$RES"
     $RUN "$WORK/fast-default/bin/mafft"  "$T" "$f" "fastdef|1|$rel"  | tee -a "$RES"
   fi
   if [ $SELFCHECK = 1 ]; then
-    out=$(MAFFT_SEXTET=check MAFFT_MSADIST=check MAFFT_UPG=check "$WORK/fast/bin/mafft" --thread "$T" "$f" 2>&1 >/dev/null); rc=$?
-    if [ $rc -ne 0 ] || echo "$out" | grep -qiE "FAILED|mismatch"; then echo "SELFCHECK FAILED $rel (exit $rc)"; else echo "selfcheck passed $rel"; fi | tee -a "$RES"
+    out=$(MAFFT_SEXTET=check MAFFT_MSADIST=check MAFFT_UPG=check MAFFT_ARLCHECK=1 MAFFT_BA2CHECK=1 MAFFT_FFTCHECK=1 MAFFT_MSCHECK=1 \
+          "$WORK/fast/bin/mafft" --thread "$T" "$f" 2>&1 >/dev/null); rc=$?
+    if [ $rc -ne 0 ] || echo "$out" | grep -qE "FAILED|MISMATCH"; then echo "SELFCHECK FAILED $rel (exit $rc)"; else echo "selfcheck passed $rel"; fi | tee -a "$RES"
   fi
 done
 
@@ -132,22 +144,35 @@ for line in open(sys.argv[1]):
     rows.setdefault(rel, {}).setdefault(rep, {})[who] = (float(kv["wall"]), float(kv["maxrss_gb"]), kv["md5"], kv["exit"])
 print("| input | MAFFT mean (s) | fast-mafft mean (s) | speedup per rep | mean | min | identical | peak RSS MAFFT / fast (GB) |")
 print("|---|---:|---:|---|---:|---:|---|---|")
-allok = True; mins = []
+allok = True; mins = []; varies = []
 for rel, reps in rows.items():
     sp, b, v, ok, rb, rv = [], [], [], True, [], []
+    mouts, fouts = set(), set()
     for rep, d in sorted(reps.items()):
         if "mafft" in d and "fast" in d:
             b.append(d["mafft"][0]); v.append(d["fast"][0]); sp.append(d["mafft"][0] / max(d["fast"][0], 1e-9))
             ok &= d["mafft"][2] == d["fast"][2] and d["mafft"][3] == "0" and d["fast"][3] == "0"
             rb.append(d["mafft"][1]); rv.append(d["fast"][1])
+        for w in ("mafft", "mafftagain"):
+            if w in d: mouts.add(d[w][2])
+        for w in ("fast", "fastagain"):
+            if w in d: fouts.add(d[w][2])
         if "mafftdef" in d and "fastdef" in d:
             ok &= d["mafftdef"][2] == d["fastdef"][2] == reps["1"]["mafft"][2]
     if not sp: continue
-    allok &= ok; mins.append(min(sp))
+    mins.append(min(sp))
+    if ok: status = "yes"
+    elif len(mouts) > 1 and fouts <= mouts:
+        status = "MAFFT varies (%d outputs); fast-mafft gave only MAFFT's" % len(mouts); varies.append(rel)
+    elif len(mouts) > 1:
+        status = "**MAFFT varies (%d outputs); fast-mafft also gave others**" % len(mouts); varies.append(rel); allok = False
+    else:
+        status = "**NO**"; allok = False
     print("| %s | %.1f | %.1f | %s | %.1fx | %.1fx | %s | %.2f / %.2f |" % (rel, sum(b)/len(b), sum(v)/len(v),
-          " / ".join("%.1fx" % s for s in sp), sum(sp)/len(sp), min(sp), "yes" if ok else "**NO**", max(rb), max(rv)))
+          " / ".join("%.1fx" % s for s in sp), sum(sp)/len(sp), min(sp), status, max(rb), max(rv)))
 print()
-print("all outputs identical: %s;  lowest single-run speedup: %s" % ("YES" if allok else "NO", ("%.1fx" % min(mins)) if mins else "n/a"))
+print("all outputs identical: %s;  lowest single-run speedup: %s" % ("YES" if allok and not varies else ("NO" if not allok else "YES where MAFFT reproduces itself"), ("%.1fx" % min(mins)) if mins else "n/a"))
+if varies: print("MAFFT itself gave different outputs between runs on: %s (see VERIFICATION.md, memsave switch mid-pass)" % ", ".join(varies))
 if sys.argv[2] == "1": print("default-flag builds checked: both outputs equal the aggressive builds' (included in 'identical')")
 for f in fails: print(f)
 EOF
