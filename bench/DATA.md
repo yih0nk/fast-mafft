@@ -31,6 +31,34 @@ short indels) and [simulate_protein.py](simulate_protein.py): `sim1k`, `sim2k`, 
 long unaligned repeats inserted, so the final alignment exceeds 30,000 columns (MAFFT's internal
 `alg='M'` switch). That makes them a stress test for exact output.
 
+## Long-genome data (`--long`, release `data-long-v1`)
+
+`bash bench/get_data.sh --long` downloads 12 more inputs into `data/long/` (50 MB download, about
+210 MB unpacked) and checks them against [DATA_MD5_LONG.txt](DATA_MD5_LONG.txt). Their alignments come
+near or go past 30,000 columns, where MAFFT switches every later merge to its memsave aligners.
+
+| file | sequences | length | source |
+|---|---:|---|---|
+| `sarscov2_2000.fa` | 2,000 | 29,641 – 29,903 | Real complete SARS-CoV-2 genomes from NCBI Nucleotide, 881 of them with runs of N |
+| `sarscov2_500.fa`, `sarscov2_1000.fa` | 500 / 1,000 | as above | The first 500 / 1,000 records of `sarscov2_2000.fa` |
+| `long100x30k.fa` | 100 | ~30,000 | `simulate.py 100 30000 3` |
+| `long10x30k.fa`, `long30x30k.fa` | 10 / 30 | ~30,000 | The first 10 / 30 records of `long100x30k.fa` |
+| `long500x30k.fa` | 500 | ~30,000 | `simulate.py 500 30000 30` |
+| `long1000x30k.fa` | 1,000 | ~30,000 | `simulate.py 1000 30000 31 0.005 0.0005 0.002 0.0003` |
+| `long300x50k.fa` | 300 | ~50,000 | `simulate.py 300 50000 50 0.01 0.001 0.005 0.0005` |
+| `viral500.fa` | 500 | ~29,900 | `simulate.py 500 29900 29 0.003 0.0004 0.001 0.0002` (low divergence, like a virus collection) |
+| `viral100.fa` | 100 | ~29,900 | The first 100 records of `viral500.fa` |
+| `viral1000.fa` | 1,000 | ~29,900 | `simulate.py 1000 29900 1000 0.002 0.0003 0.0005 0.0001` |
+
+**SARS-CoV-2.** On 2026-10-14 an NCBI E-utilities search of the `nuccore` database,
+`SARS-CoV-2[Organism] AND "complete genome"[Title] AND 29000:30500[SLEN] NOT "partial"[Title]`
+(`retmax=2000`), returned the first 2,000 records; `efetch` (`rettype=fasta`) downloaded them in batches
+of 400, in that order. The versioned accessions are in the FASTA headers. GenBank sequence records are
+distributed by NCBI without use restrictions (see NCBI's policies on molecular data).
+
+**Simulated.** `simulate.py n L seed [sub indel final_sub final_indel]`: the rates are per generation
+and for a final pass over every sequence; without them it uses its defaults (0.02 0.003 0.01 0.002).
+
 ## BAliBASE 3.0
 
 Not redistributed here, because it has no license statement. `bash bench/get_data.sh --balibase`

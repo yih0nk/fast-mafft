@@ -1,0 +1,12 @@
+b2d9af9022d0dd8ba04c36f3c6c4401e  data/long/long10x30k.fa
+0e62af8831ac4ebe76a5b67c48855f3b  data/long/long30x30k.fa
+c2e45c11e7f760f727f519872287c696  data/long/long100x30k.fa
+e34d421411337632c0d35a2246590d57  data/long/long300x50k.fa
+e7fef196720c32b68d177a3764eedda5  data/long/long500x30k.fa
+a3f1a0317bc7c61c09b4d8255172a057  data/long/long1000x30k.fa
+ee57d2077213d18cabd98bb9c4231019  data/long/viral100.fa
+3ff030a49bec039e040e0216a756f917  data/long/viral500.fa
+04f54bc8d5c489483a7c1929c85666d2  data/long/viral1000.fa
+6f71c2ec1b8ed920ca0012a5bf218c93  data/long/sarscov2_500.fa
+67f8792c73abed86fa92d69a4c6cdc71  data/long/sarscov2_1000.fa
+9165c4850300cfdc7c8d1b97b54d78a2  data/long/sarscov2_2000.fa
