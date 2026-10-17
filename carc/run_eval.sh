@@ -62,8 +62,8 @@ if ROOT=$(git -C "$REPO" rev-list --max-parents=0 HEAD 2>/dev/null); then
   mkdir -p "$WORK/archive" && git -C "$REPO" archive "$ROOT" fast-mafft-src | tar -x -C "$WORK/archive" \
     && mv "$WORK/archive/fast-mafft-src" "$SRC_BASE" && rm -rf "$WORK/archive"
 else
-  echo "no git history: recreating MAFFT v7.526 by reversing fast-mafft-v9.patch"
-  cp -r "$REPO/fast-mafft-src" "$SRC_BASE" && (cd "$SRC_BASE" && patch -R -p1 -s < "$REPO/fast-mafft-v9.patch")
+  echo "no git history: recreating MAFFT v7.526 by reversing fast-mafft-v10.patch"
+  cp -r "$REPO/fast-mafft-src" "$SRC_BASE" && (cd "$SRC_BASE" && patch -R -p1 -s < "$REPO/fast-mafft-v10.patch")
 fi
 md5f() { python3 -c "import hashlib,sys;print(hashlib.md5(open(sys.argv[1],'rb').read()).hexdigest())" "$1"; }
 [ "$(md5f "$SRC_BASE/core/disttbfast.c")" = 564c5519e44b43d888f14b8badb23032 ] && [ "$(md5f "$SRC_BASE/core/mltaln9.c")" = c4c2055eb66c16905ef3c6090d74e580 ] \

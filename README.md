@@ -31,7 +31,7 @@ Run `bench/get_data.sh` on a login node, since compute nodes may have no interne
 | path | what it is |
 |---|---|
 | `fast-mafft-src/` | Complete MAFFT v7.526 source tree with the changes, and no build artifacts. Build it with the stock Makefile (see BUILD.md). |
-| `fast-mafft-v9.patch` | Unified diff against pristine v7.526 (GitLab `sysimm/mafft`, tag v7.526, commit `ee97999`). It covers 19 files under `core/`: 12 changed, 7 new. Apply with `patch -p1` or `git apply` from the top of a clean v7.526 tree. |
+| `fast-mafft-v10.patch` | Unified diff against pristine v7.526 (GitLab `sysimm/mafft`, tag v7.526, commit `ee97999`). It covers 21 files under `core/`: 14 changed, 7 new. Apply with `patch -p1` or `git apply` from the top of a clean v7.526 tree. |
 | [BUILD.md](BUILD.md) | Build on Linux/gcc (CARC: `module load gcc/13.3.0`) with default and aggressive flags, glibc notes, how to run, and every environment switch. |
 | [CHANGES.md](CHANGES.md) | Every optimization, stage by stage: what MAFFT did, what v9 does, why the output stays identical, and the measured effect. Also the bugs found and fixed. |
 | [VERIFICATION.md](VERIFICATION.md) | How identity was verified: datasets, thread counts, compilers and SIMD levels, self-check modes, edge cases, reference md5s. |

@@ -14,16 +14,16 @@ Use either of these:
 - **A clean v7.526 tree plus the patch**:
 
   ```
-  git clone https://gitlab.com/sysimm/mafft.git mafft-v9
-  git -C mafft-v9 checkout v7.526              # commit ee9799916df6a5d5103d46d54933f8eb6d28e244
-  cd mafft-v9 && patch -p1 < /path/to/fast-mafft-v9.patch && cd ..
+  git clone https://gitlab.com/sysimm/mafft.git mafft-v10
+  git -C mafft-v10 checkout v7.526             # commit ee9799916df6a5d5103d46d54933f8eb6d28e244
+  cd mafft-v10 && patch -p1 < /path/to/fast-mafft-v10.patch && cd ..
   ```
 
-  `git apply fast-mafft-v9.patch` also works. It prints harmless trailing-whitespace warnings for 9
+  `git apply fast-mafft-v10.patch` also works. It prints harmless trailing-whitespace warnings for 43
   added lines, which keep MAFFT's own style. The patched tree is identical, file for file, to
   `fast-mafft-src/`.
 
-The patch touches 19 files, all under `core/`. Twelve are changed and seven are new: `adpvec_body.h`,
+The patch touches 21 files, all under `core/`. Fourteen are changed and seven are new: `adpvec_body.h`,
 `crtolf.c`, `dphelp.h`, `gdpvec_body.h`, `lazygap.h`, `mrowblk_body.h` and `progtiming.h`. The new
 `crtolf` helper program is added to the Makefile. No other build change is needed.
 
