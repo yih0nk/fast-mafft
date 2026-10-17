@@ -139,6 +139,13 @@ extern int alignableReagion( int    clus1, int    clus2, char  **seq1, char  **s
 extern int alignableReagion_prep( int clus1, int clus2, char **seq1, char **seq2, double *eff1, double *eff2, void (*pfor)( int, int, double, double, void (*)( void *, int, int ), void * ), int (*pidle)( void ), int check ); // work/prog2; work/v8s: pfor/pidle (may be NULL), check
 extern void alignableReagion_prep_free( void ); // work/prog2
 extern int alignableReagion_lag( int off1, int off2, Segment *seg ); // work/prog2
+typedef struct { const double *p1, *p2; const int *k1, *k2; int nl1, nl2, len1, len2; double totaleff;
+	int *o1, *o2, *s1, *s2; double *v1, *v2; int nd[26*26]; } arp_ctx_t; // work/v10w (o1..nd: alignableReagion_ctx_csr)
+extern void alignableReagion_ctx_csr( arp_ctx_t *c ); // work/v10w
+extern void alignableReagion_ctx_free( arp_ctx_t *c ); // work/v10w
+extern void alignableReagion_getctx( arp_ctx_t *c ); // work/v10w
+extern int alignableReagion_lag_c( const arp_ctx_t *c, int off1, int off2, Segment *seg, double *stra ); // work/v10w
+extern int getKouho_fast( int *kouho, int nkouho, double *soukan, int nlen2 ); // work/v10w
 extern void blockAlign( int *cut1, int *cut2, double **ocrossscore, int *ncut );
 extern void blockAlign2( int *cut1, int *cut2, Segment **seg1, Segment **seg2, double **ocrossscore, int *ncut );
 extern void blockAlign3( int *cut1, int *cut2, Segment **seg1, Segment **seg2, double **ocrossscore, int *ncut );

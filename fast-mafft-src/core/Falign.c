@@ -3181,7 +3181,8 @@ double Falign_givenanchors( ExtAnch *pairanch,
 /*
 sakujo wo kentou (2010/10/05)
 */
-double Falign_udpari_long(
+/* work/v10w: the original, kept for the options the new version does not cover (see below) */
+static double Falign_udpari_long_orig(
 			  int **whichmtx, double ***scoringmatrices, 
 			  double **n_dynamicmtx,
 			  char  **seq1, char  **seq2, 
@@ -4024,4 +4025,604 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 	FreeCharMtx( rndseq2 );
 #endif
 	return( totalscore );
+}
+
+/* =============================================================================================
+   work/v10w: Falign_udpari_long (FFT anchors + MSalignmm per segment, used for every FFT step once
+   the alignment has passed 30000 columns and MAFFT has switched to the memsave mode).  Same results
+   as Falign_udpari_long_orig, faster:
+   - anchor search: the per-column profiles are built once per call (alignableReagion_prep, as
+     Falign does since work/prog2) instead of once per candidate lag; this function scores up to
+     NKOUHO_LONG = 500 lags per call, so the original rebuilt both groups' profiles 500 times.  The
+     lags are scored by idle helper threads in parallel (alignableReagion_lag_c, each lag into its own
+     segment buffer), and the segments are taken over in lag order, as the original loop finds them;
+   - getKouho_fast: the 500 best FFT lags in one pass instead of 500 passes (same order, same ties);
+   - no copies of the rows for the FFT input (they were read-only), the FFT input vectors of large
+     groups by column ranges with helpers, the two forward transforms at the same time;
+   - one segment covering both groups (no anchor kept) is aligned in place, as Falign does since
+     work/v8s: MSalignmm gets byte-identical rows and the same arguments (headgp = tailgp = outgap,
+     boundary gap patterns all 'o');
+   - otherwise the segments are appended at their offset instead of strcat (quadratic), into a
+     per-thread arena instead of four calloc'ed clus x alloclen matrices per call.
+   MAFFT_ARLCHECK=1 recomputes the lags' segments with the original alignableReagion, the lag list
+   with the original getKouho and the FFT input vectors with the original loops, and compares them
+   bitwise (exit on a mismatch). */
+static int arlcheck_v = -1;
+static int arlcheck( void )
+{
+	if( arlcheck_v < 0 ) arlcheck_v = ( getenv( "MAFFT_ARLCHECK" ) != NULL );
+	return( arlcheck_v );
+}
+static long arlcheck_n[3];
+static void arlcheck_report( void ) __attribute__(( destructor ));
+static void arlcheck_report( void )
+{
+	if( arlcheck_v > 0 ) reporterr( "\nARLCHECK: %ld Falign_udpari_long calls, %ld lags, %ld vector builds verified, no mismatch\n", arlcheck_n[0], arlcheck_n[1], arlcheck_n[2] );
+}
+static int udl_v10_on( void )
+{
+	static int v = -1;
+	if( v < 0 ) { char *e = getenv( "MAFFT_UDLV10" ); v = !( e && atoi( e ) == 0 ); } // MAFFT_UDLV10=0: the original (A/B)
+	return( v );
+}
+
+/* seq_vec_4 by column ranges: entry j gets, for each member i in ascending order, the same
+   "+= incr" / "-= incr" of member i's letter in column j as in seq_vec_4. */
+typedef struct { Fukusosuu *vec; char **seq; double *eff; int clus; } fvec4ctx_t;
+static void fvec4_cols( void *vctx, int lo, int hi )
+{
+	fvec4ctx_t *c = (fvec4ctx_t *)vctx;
+	int i, j;
+	for( i=0; i<c->clus; i++ )
+	{
+		const char *s = c->seq[i];
+		const double incr = c->eff[i];
+		Fukusosuu *result = c->vec;
+		for( j=lo; j<hi; j++ )
+		{
+			char x = s[j];
+			if( x == 'a' )
+				result[j].R += incr;
+			else if( x == 't' )
+				result[j].R -= incr;
+			else if( x == 'g' )
+				result[j].I += incr;
+			else if( x == 'c' )
+				result[j].I -= incr;
+		}
+	}
+}
+static void udl_vectors( Fukusosuu **vec, char **seq, double *eff, int clus, int len, int nlen )
+{
+	int i, j;
+	for( j=0; j<n20or4or2; j++ ) vec_init( vec[j], nlen );
+	if( scoremtx == -1 )
+	{
+		fvec4ctx_t c;
+		c.vec = vec[0]; c.seq = seq; c.eff = eff; c.clus = clus;
+#ifdef enablemultithread
+		dphelp_for( len, MAX( 256, len / 64 ), (double)clus * len, FVEC_MINWORK, fvec4_cols, &c );
+#else
+		fvec4_cols( &c, 0, len );
+#endif
+	}
+	else if( fftscore )
+	{
+		if( !Falign_vectors_par( vec, seq, eff, clus, len, n20or4or2, 1 ) )
+			for( i=0; i<clus; i++ ) seq_vec_5( vec[0], polarity, volume, eff[i], seq[i] );
+	}
+	else
+	{
+		if( !Falign_vectors_par( vec, seq, eff, clus, len, n20or4or2, 0 ) )
+			for( i=0; i<clus; i++ ) seq_vec_3( vec, eff[i], seq[i] );
+	}
+	if( arlcheck() ) // the original loops into fresh vectors, compared bitwise
+	{
+		int k;
+		Fukusosuu **ref = AllocateFukusosuuMtx( n20or4or2, nlen+1 );
+		for( k=0; k<n20or4or2; k++ ) vec_init( ref[k], nlen );
+		for( i=0; i<clus; i++ )
+		{
+			if( scoremtx == -1 ) seq_vec_4( ref[0], eff[i], seq[i] );
+			else if( fftscore ) seq_vec_5( ref[0], polarity, volume, eff[i], seq[i] );
+			else seq_vec_3( ref, eff[i], seq[i] );
+		}
+		for( k=0; k<n20or4or2; k++ )
+			if( memcmp( ref[k], vec[k], sizeof( Fukusosuu ) * nlen ) ) { reporterr( "\nARLCHECK MISMATCH in the FFT vectors (channel %d)\n", k ); exit( 1 ); }
+		FreeFukusosuuMtx( ref );
+		__atomic_add_fetch( arlcheck_n + 2, 1, __ATOMIC_RELAXED );
+	}
+}
+
+/* the candidate lags, scored in parallel */
+typedef struct { arp_ctx_t ctx; int *off1, *off2, *nseg; Segment *segs; int cap, stralen; } udlagctx_t;
+static void udl_lags_body( void *vctx, int lo, int hi )
+{
+	udlagctx_t *u = (udlagctx_t *)vctx;
+	double *stra = malloc( sizeof( double ) * u->stralen );
+	int k;
+	if( stra == NULL ) ErrorExit( "Cannot allocate in Falign_udpari_long.\n" );
+	for( k=lo; k<hi; k++ )
+		u->nseg[k] = alignableReagion_lag_c( &u->ctx, u->off1[k], u->off2[k], u->segs + (size_t)k * u->cap, stra );
+	free( stra );
+}
+
+static double Falign_udpari_long_v10(
+			  double **n_dynamicmtx,
+			  char  **seq1, char  **seq2, 
+			  double *eff1, double *eff2, 
+			  int    clus1, int    clus2,
+			  int alloclen, int *fftlog )
+{
+	int i, j, k, l, m, maxk;
+	int nlen, nlen2, nlen4;
+	static TLS int crossscoresize = 0;
+	char **tmpres1 = NULL;
+	char **tmpres2 = NULL;
+	char **result1 = NULL;
+	char **result2 = NULL;
+	static TLS Fukusosuu **seqVector1 = NULL;
+	static TLS Fukusosuu **seqVector2 = NULL;
+	static TLS Fukusosuu **naiseki = NULL;   
+	static TLS Fukusosuu *naisekiNoWa = NULL; 
+	static TLS double *soukan = NULL;
+	static TLS double **crossscore = NULL;
+	int nlentmp;
+	static TLS int *kouho = NULL;
+	static TLS Segment *segment = NULL;
+	static TLS Segment *segment1 = NULL;
+	static TLS Segment *segment2 = NULL;
+	static TLS Segment **sortedseg1 = NULL;
+	static TLS Segment **sortedseg2 = NULL;
+	static TLS int *cut1 = NULL;
+	static TLS int *cut2 = NULL;
+	char *sgap1, *egap1, *sgap2, *egap2;
+	static TLS int localalloclen = 0;
+	int lag;
+	int tmpint;
+	int count, count0;
+	int len1, len2;
+	int totallen;
+	double totalscore;
+	int nkouho = 0;
+	int headgp, tailgp;
+
+	if( seq1 == NULL )
+	{
+		if( kouho ) 
+		{
+			localalloclen = 0;
+			crossscoresize = 0;
+			if( crossscore ) FreeDoubleMtx( crossscore );
+			crossscore = NULL;
+			free( kouho );
+			kouho = NULL;
+			free( cut1 );
+			free( cut2 );
+			free( segment );
+			free( segment1 );
+			free( segment2 );
+			free( sortedseg1 );
+			free( sortedseg2 );
+			FreeFukusosuuMtx ( seqVector1 );
+			FreeFukusosuuMtx ( seqVector2 );
+			FreeFukusosuuVec( naisekiNoWa );
+			FreeFukusosuuMtx( naiseki );
+			FreeDoubleVec( soukan );
+			alignableReagion_prep_free();
+			Falign_rows_free();
+		}
+		return( 0.0 );
+	}
+
+	len1 = strlen( seq1[0] );
+	len2 = strlen( seq2[0] );
+	nlentmp = MAX( len1, len2 );
+
+	nlen = 1;
+	while( nlentmp >= nlen ) nlen <<= 1;
+	nlen2 = nlen/2; nlen4 = nlen2 / 2;
+
+	sgap1 = AllocateCharVec( clus1 );
+	egap1 = AllocateCharVec( clus1 );
+	sgap2 = AllocateCharVec( clus2 );
+	egap2 = AllocateCharVec( clus2 );
+
+	if( !localalloclen )
+	{
+		kouho = AllocateIntVec( NKOUHO_LONG );
+		cut1 = AllocateIntVec( MAXSEG );
+		cut2 = AllocateIntVec( MAXSEG );
+		segment = (Segment *)calloc( MAXSEG, sizeof( Segment ) );
+		segment1 = (Segment *)calloc( MAXSEG, sizeof( Segment ) );
+		segment2 = (Segment *)calloc( MAXSEG, sizeof( Segment ) );
+		sortedseg1 = (Segment **)calloc( MAXSEG, sizeof( Segment * ) );
+		sortedseg2 = (Segment **)calloc( MAXSEG, sizeof( Segment * ) );
+		if( !( segment && segment1 && segment2 && sortedseg1 && sortedseg2 ) )
+			ErrorExit( "Allocation error\n" );
+
+		if     ( scoremtx == -1 ) n20or4or2 = 1;
+		else if( fftscore )       n20or4or2 = 1;
+		else                      n20or4or2 = 20;
+	}
+
+	if( localalloclen < nlen )
+	{
+		if( localalloclen )
+		{
+			FreeFukusosuuMtx ( seqVector1 );
+			FreeFukusosuuMtx ( seqVector2 );
+			FreeFukusosuuVec( naisekiNoWa );
+			FreeFukusosuuMtx( naiseki );
+			FreeDoubleVec( soukan );
+		}
+		naisekiNoWa = AllocateFukusosuuVec( nlen );
+		naiseki = AllocateFukusosuuMtx( n20or4or2, nlen );
+		seqVector1 = AllocateFukusosuuMtx( n20or4or2, nlen+1 );
+		seqVector2 = AllocateFukusosuuMtx( n20or4or2, nlen+1 );
+		soukan = AllocateDoubleVec( nlen+1 );
+		localalloclen = nlen;
+	}
+
+	/* the FFT of both groups (the original copied the rows into tmpseq1/2 first and read the copies) */
+	if( fftkeika ) fprintf( stderr,  " FFT ... " );
+	udl_vectors( seqVector1, seq1, eff1, clus1, len1, nlen );
+	udl_vectors( seqVector2, seq2, eff2, clus2, len2, nlen );
+
+	if( n20or4or2 != 1 || !Falign_fft2_par( nlen, seqVector2[0], seqVector1[0] ) )
+	{
+		for( j=0; j<n20or4or2; j++ )
+		{
+			fft( nlen, seqVector2[j], 0 );
+			fft( nlen, seqVector1[j], 0 );
+		}
+	}
+
+	for( k=0; k<n20or4or2; k++ ) 
+	{
+		for( l=0; l<nlen; l++ ) 
+			calcNaiseki( naiseki[k]+l, seqVector1[k]+l, seqVector2[k]+l );
+	}
+	for( l=0; l<nlen; l++ ) 
+	{
+		naisekiNoWa[l].R = 0.0;
+		naisekiNoWa[l].I = 0.0;
+		for( k=0; k<n20or4or2; k++ ) 
+		{
+			naisekiNoWa[l].R += naiseki[k][l].R;
+			naisekiNoWa[l].I += naiseki[k][l].I;
+		}
+	}
+
+	fft( -nlen, naisekiNoWa, 0 );
+
+	for( m=0; m<=nlen2; m++ ) 
+		soukan[m] = naisekiNoWa[nlen2-m].R;
+	for( m=nlen2+1; m<nlen; m++ ) 
+		soukan[m] = naisekiNoWa[nlen+nlen2-m].R;
+
+	if( arlcheck() ) // the original getKouho on a copy, compared (lags and the modified soukan)
+	{
+		double *sc = malloc( sizeof( double ) * nlen );
+		int *kc = malloc( sizeof( int ) * NKOUHO_LONG ), nc;
+		memcpy( sc, soukan, sizeof( double ) * nlen );
+		nc = getKouho( kc, NKOUHO_LONG, sc, nlen );
+		nkouho = getKouho_fast( kouho, NKOUHO_LONG, soukan, nlen );
+		if( nc != nkouho || memcmp( kc, kouho, sizeof( int ) * nc ) || memcmp( sc, soukan, sizeof( double ) * nlen ) ) { reporterr( "\nARLCHECK MISMATCH in getKouho\n" ); exit( 1 ); }
+		free( sc ); free( kc );
+	}
+	else
+		nkouho = getKouho_fast( kouho, NKOUHO_LONG, soukan, nlen );
+
+	count = 0;
+	maxk = nkouho;
+
+	/* the anchor search: profiles once, then the lags (in parallel when helpers are idle) */
+	{
+		udlagctx_t u;
+		int nlag = 0, *lagk, t;
+		double work;
+#ifdef enablemultithread
+		alignableReagion_prep( clus1, clus2, seq1, seq2, eff1, eff2, dphelp_for, dphelp_idle, 0 );
+#else
+		alignableReagion_prep( clus1, clus2, seq1, seq2, eff1, eff2, NULL, NULL, 0 );
+#endif
+		alignableReagion_getctx( &u.ctx );
+		alignableReagion_ctx_csr( &u.ctx );
+		u.off1 = malloc( sizeof( int ) * ( maxk + 1 ) );
+		u.off2 = malloc( sizeof( int ) * ( maxk + 1 ) );
+		u.nseg = malloc( sizeof( int ) * ( maxk + 1 ) );
+		lagk = malloc( sizeof( int ) * ( maxk + 1 ) );
+		if( !u.off1 || !u.off2 || !u.nseg || !lagk ) ErrorExit( "Cannot allocate in Falign_udpari_long.\n" );
+		for( k=0; k<maxk; k++ ) 
+		{
+			lag = kouho[k];
+			if( lag <= -len1 || len2 <= lag ) continue;
+			u.off1[nlag] = lag > 0 ? 0 : -lag;
+			u.off2[nlag] = lag > 0 ? lag : 0;
+			lagk[nlag] = k;
+			nlag++;
+		}
+		u.cap = MAX( len1, len2 ) / ( fftWinSize > 0 ? fftWinSize : 1 ) + 4; // a segment spans more than fftWinSize columns; +2 for the boundary flags
+		u.stralen = MAX( len1, len2 ) + fftWinSize + 1;
+		u.segs = calloc( (size_t)( nlag ? nlag : 1 ) * u.cap, sizeof( Segment ) );
+		if( u.segs == NULL ) ErrorExit( "Cannot allocate in Falign_udpari_long.\n" );
+		work = (double)nlag * MAX( len1, len2 ) * ( u.ctx.nl1 * u.ctx.nl2 + 2 );
+#ifdef enablemultithread
+		dphelp_for( nlag, MAX( 1, nlag / 64 ), work, 2.0e6, udl_lags_body, &u );
+#else
+		udl_lags_body( &u, 0, nlag );
+#endif
+		if( arlcheck() ) // every lag again with the original alignableReagion, compared segment by segment
+		{
+			char **tp1 = calloc( clus1, sizeof( char * ) ), **tp2 = calloc( clus2, sizeof( char * ) );
+			Segment *chk = calloc( (size_t)u.cap + MAXSEG / 4, sizeof( Segment ) );
+			int ref;
+			for( l=0; l<nlag; l++ )
+			{
+				Segment *sg = u.segs + (size_t)l * u.cap;
+				zurasu2( kouho[lagk[l]], clus1, clus2, seq1, seq2, tp1, tp2 );
+				ref = alignableReagion( clus1, clus2, tp1, tp2, eff1, eff2, chk );
+				if( ref != u.nseg[l] ) { reporterr( "\nARLCHECK MISMATCH: lag %d, %d vs %d segments\n", kouho[lagk[l]], u.nseg[l], ref ); exit( 1 ); }
+				for( t=0; t<ref; t++ )
+					if( chk[t].start != sg[t].start || chk[t].end != sg[t].end || chk[t].center != sg[t].center || memcmp( &chk[t].score, &sg[t].score, sizeof( double ) ) )
+					{
+						reporterr( "\nARLCHECK MISMATCH in segment %d of lag %d\n", t, kouho[lagk[l]] ); exit( 1 );
+					}
+				__atomic_add_fetch( arlcheck_n + 1, 1, __ATOMIC_RELAXED );
+			}
+			free( tp1 ); free( tp2 ); free( chk );
+			__atomic_add_fetch( arlcheck_n + 0, 1, __ATOMIC_RELAXED );
+		}
+		for( l=0; l<nlag; l++ ) // in lag order, as the original loop
+		{
+			Segment *sg = u.segs + (size_t)l * u.cap;
+			lag = kouho[lagk[l]];
+			tmpint = u.nseg[l];
+			if( count+tmpint > MAXSEG -3 ) ErrorExit( "TOO MANY SEGMENTS.\n" );
+			for( t=0; t<tmpint; t++ ) segment[count+t] = sg[t];
+			while( tmpint-- > 0 )
+			{
+				if( lag > 0 )
+				{
+					segment1[count].start  = segment[count].start ;
+					segment1[count].end    = segment[count].end   ;
+					segment1[count].center = segment[count].center;
+					segment1[count].score  = segment[count].score;
+
+					segment2[count].start  = segment[count].start  + lag;
+					segment2[count].end    = segment[count].end    + lag;
+					segment2[count].center = segment[count].center + lag;
+					segment2[count].score  = segment[count].score       ;
+				}
+				else
+				{
+					segment1[count].start  = segment[count].start  - lag;
+					segment1[count].end    = segment[count].end    - lag;
+					segment1[count].center = segment[count].center - lag;
+					segment1[count].score  = segment[count].score       ;
+
+					segment2[count].start  = segment[count].start ;
+					segment2[count].end    = segment[count].end   ;
+					segment2[count].center = segment[count].center;
+					segment2[count].score  = segment[count].score ;
+				}
+				segment1[count].pair = &segment2[count];
+				segment2[count].pair = &segment1[count];
+				count++;
+			}
+		}
+		free( u.off1 ); free( u.off2 ); free( u.nseg ); free( u.segs ); free( lagk );
+		alignableReagion_ctx_free( &u.ctx );
+		if( MAX( len1, len2 ) > 4096 ) alignableReagion_prep_free(); // memory: the per-thread profile buffers of long groups are not kept
+	}
+	if( fftkeika ) fprintf( stderr, "done. (%d anchors) ", count );
+	if( !count && fftNoAnchStop )
+		ErrorExit( "Cannot detect anchor!" );
+
+	for( i=0; i<count; i++ )
+	{
+		sortedseg1[i] = &segment1[i];
+		sortedseg2[i] = &segment2[i];
+	}
+	mymergesort( 0, count-1, sortedseg1 ); 
+	mymergesort( 0, count-1, sortedseg2 ); 
+	for( i=0; i<count; i++ ) sortedseg1[i]->number = i;
+	for( i=0; i<count; i++ ) sortedseg2[i]->number = i;
+
+	if( count < 5000 )
+	{
+		if( crossscoresize < count+2 )
+		{
+			crossscoresize = count+2;
+			if( fftkeika ) fprintf( stderr, "######allocating crossscore, size = %d\n", crossscoresize );
+			if( crossscore ) FreeDoubleMtx( crossscore );
+			crossscore = AllocateDoubleMtx( crossscoresize, crossscoresize );
+		}
+		for( i=0; i<count+2; i++ ) for( j=0; j<count+2; j++ )
+			crossscore[i][j] = 0.0;
+		for( i=0; i<count; i++ )
+		{
+			crossscore[segment1[i].number+1][segment1[i].pair->number+1] = segment1[i].score;
+			cut1[i+1] = sortedseg1[i]->center;
+			cut2[i+1] = sortedseg2[i]->center;
+		}
+
+		crossscore[0][0] = 10000000.0;
+		cut1[0] = 0; 
+		cut2[0] = 0;
+		crossscore[count+1][count+1] = 10000000.0;
+		cut1[count+1] = len1;
+		cut2[count+1] = len2;
+		count += 2;
+		count0 = count;
+	
+		blockAlign2( cut1, cut2, sortedseg1, sortedseg2, crossscore, &count );
+
+		if( fftkeika )
+			fprintf( stderr, "%d anchors found\n", count );
+		if( fftkeika )
+		{
+			if( count0 > count )
+			{
+				fprintf( stderr, "REPEAT!? \n" ); 
+				if( fftRepeatStop ) exit( 1 );
+			}
+		}
+	}
+	else
+	{
+		fprintf( stderr, "\nMany anchors were found. The upper-level DP is skipped.\n\n" );
+
+		cut1[0] = 0; 
+		cut2[0] = 0;
+		count0 = 0;
+		for( i=0; i<count; i++ )
+		{
+			if( sortedseg1[i]->center > cut1[count0]
+			 && sortedseg1[i]->pair->center > cut2[count0] )
+			{
+				count0++;
+				cut1[count0] = sortedseg1[i]->center;
+				cut2[count0] = sortedseg1[i]->pair->center;
+			}
+			else
+			{
+				if( i && sortedseg1[i]->score > sortedseg1[i-1]->score )
+				{
+					if( sortedseg1[i]->center > cut1[count0-1]
+					 && sortedseg1[i]->pair->center > cut2[count0-1] )
+					{
+						cut1[count0] = sortedseg1[i]->center;
+						cut2[count0] = sortedseg1[i]->pair->center;
+					}
+					else
+					{
+					}
+				}
+			}
+		}
+		cut1[count0+1] = len1;
+		cut2[count0+1] = len2;
+		count = count0 + 2;
+		count0 = count;
+	}
+
+	totalscore = 0.0;
+	*fftlog = -1;
+	if( count - 1 == 1 && cut1[0] == 0 && cut2[0] == 0 && cut1[1] == len1 && cut2[1] == len2 )
+	{
+		/* one segment covering both groups: in place (see above).  The loop would set sgap/egap to
+		   'o' (cut points 0 and len), copy every row into tmpres, align tmpres, append it to empty
+		   result rows and copy those back. */
+		*fftlog += 1;
+		headgp = outgap;
+		tailgp = outgap;
+		for( j=0; j<clus1; j++ ) sgap1[j] = 'o';
+		for( j=0; j<clus2; j++ ) sgap2[j] = 'o';
+		for( j=0; j<clus1; j++ ) egap1[j] = 'o';
+		for( j=0; j<clus2; j++ ) egap2[j] = 'o';
+		if( 1 || fftkeika ) fprintf( stderr, "DP %05d / %05d \b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b", 1, count-1 );
+		totalscore += MSalignmm( n_dynamicmtx, seq1, seq2, eff1, eff2, clus1, clus2, alloclen, sgap1, sgap2, egap1, egap2, NULL, 0, NULL, headgp, tailgp, NULL, NULL, NULL, 0.0, 0.0 );
+		nlen = strlen( seq1[0] );
+		if( nlen > alloclen )
+		{
+			fprintf( stderr, "totallen=%d +  nlen=%d > alloclen = %d\n", 0, nlen, alloclen );
+			ErrorExit( "LENGTH OVER in Falign\n " );
+		}
+	}
+	else
+	{
+		int rowlen = len1 + len2 + 100;
+		if( rowlen > alloclen ) rowlen = alloclen;
+		Falign_rows( clus1, clus2, rowlen + 1, &result1, &result2, &tmpres1, &tmpres2 ); // (rows of the original: alloclen bytes)
+		totallen = 0;
+		for( j=0; j<clus1; j++ ) result1[j][0] = 0;
+		for( j=0; j<clus2; j++ ) result2[j][0] = 0;
+		for( i=0; i<count-1; i++ )
+		{
+			*fftlog += 1;
+			if( i == 0 ) headgp = outgap; else headgp = 1;
+			if( i == count-2 ) tailgp = outgap; else tailgp = 1;
+
+			if( cut1[i] )
+				getkyokaigap( sgap1, seq1, cut1[i]-1, clus1 );
+			else
+				for( j=0; j<clus1; j++ ) sgap1[j] = 'o';
+			if( cut2[i] )
+				getkyokaigap( sgap2, seq2, cut2[i]-1, clus2 );
+			else
+				for( j=0; j<clus2; j++ ) sgap2[j] = 'o';
+
+			if( cut1[i+1] != len1 )
+				getkyokaigap( egap1, seq1, cut1[i+1], clus1 );
+			else    
+				for( j=0; j<clus1; j++ ) egap1[j] = 'o';
+			if( cut2[i+1] != len2 )
+				getkyokaigap( egap2, seq2, cut2[i+1], clus2 );
+			else    
+				for( j=0; j<clus2; j++ ) egap2[j] = 'o';
+
+			if( 1 || fftkeika ) fprintf( stderr, "DP %05d / %05d \b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b", i+1, count-1 );
+			if( !rows_copy_par( tmpres1, seq1, clus1, cut1[i], cut1[i+1]-cut1[i], 0 ) )
+				for( j=0; j<clus1; j++ )
+				{
+					strncpy( tmpres1[j], seq1[j]+cut1[i], cut1[i+1]-cut1[i] );
+					tmpres1[j][cut1[i+1]-cut1[i]] = 0;
+				}
+			if( cut2[i+1]-cut2[i] <= 0 )
+				for( j=0; j<clus2; j++ ) fprintf( stderr, "### cut2[i+1]=%d, cut2[i]=%d\n", cut2[i+1], cut2[i] );
+			if( !rows_copy_par( tmpres2, seq2, clus2, cut2[i], cut2[i+1]-cut2[i], 0 ) )
+				for( j=0; j<clus2; j++ )
+				{
+					strncpy( tmpres2[j], seq2[j]+cut2[i], cut2[i+1]-cut2[i] );
+					tmpres2[j][cut2[i+1]-cut2[i]] = 0;
+				}
+
+			totalscore += MSalignmm( n_dynamicmtx, tmpres1, tmpres2, eff1, eff2, clus1, clus2, alloclen, sgap1, sgap2, egap1, egap2, NULL, 0, NULL, headgp, tailgp, NULL, NULL, NULL, 0.0, 0.0 );
+
+			nlen = strlen( tmpres1[0] );
+			if( totallen + nlen > alloclen )
+			{
+				fprintf( stderr, "totallen=%d +  nlen=%d > alloclen = %d\n", totallen, nlen, alloclen );
+				ErrorExit( "LENGTH OVER in Falign\n " );
+			}
+			if( totallen + nlen > rowlen ) ErrorExit( "Falign_udpari_long: row arena too small.\n" ); // cannot happen: segments of both groups add up to <= len1 + len2
+			if( !rows_copy_par( result1, tmpres1, clus1, totallen, nlen, 1 ) )
+				for( j=0; j<clus1; j++ ) memcpy( result1[j]+totallen, tmpres1[j], nlen+1 ); // = strcat( result1[j], tmpres1[j] )
+			if( !rows_copy_par( result2, tmpres2, clus2, totallen, nlen, 1 ) )
+				for( j=0; j<clus2; j++ ) memcpy( result2[j]+totallen, tmpres2[j], nlen+1 );
+			totallen += nlen;
+		}
+		if( !rows_copy_par( seq1, result1, clus1, 0, totallen, 2 ) )
+			for( j=0; j<clus1; j++ ) strcpy( seq1[j], result1[j] );
+		if( !rows_copy_par( seq2, result2, clus2, 0, totallen, 2 ) )
+			for( j=0; j<clus2; j++ ) strcpy( seq2[j], result2[j] );
+		Falign_trim( (size_t)16 << 20 ); // memory: the original allocated these rows per call; a large arena is not kept per thread
+	}
+
+	free( sgap1 );
+	free( egap1 );
+	free( sgap2 );
+	free( egap2 );
+	return( totalscore );
+}
+
+double Falign_udpari_long(
+			  int **whichmtx, double ***scoringmatrices, 
+			  double **n_dynamicmtx,
+			  char  **seq1, char  **seq2, 
+			  double *eff1, double *eff2, 
+			  double **eff1s, double **eff2s,
+			  int    clus1, int    clus2,
+			  int alloclen, int *fftlog )
+{
+	if( seq1 == NULL ) // free both versions' arrays
+	{
+		Falign_udpari_long_v10( NULL, NULL, NULL, NULL, NULL, 0, 0, 0, NULL );
+		return( Falign_udpari_long_orig( whichmtx, scoringmatrices, n_dynamicmtx, seq1, seq2, eff1, eff2, eff1s, eff2s, clus1, clus2, alloclen, fftlog ) );
+	}
+	if( !udl_v10_on() || kobetsubunkatsu || scoringmatrices || constraint || alg != 'M' )
+		return( Falign_udpari_long_orig( whichmtx, scoringmatrices, n_dynamicmtx, seq1, seq2, eff1, eff2, eff1s, eff2s, clus1, clus2, alloclen, fftlog ) );
+	return( Falign_udpari_long_v10( n_dynamicmtx, seq1, seq2, eff1, eff2, clus1, clus2, alloclen, fftlog ) );
 }

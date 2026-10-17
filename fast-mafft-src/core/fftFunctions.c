@@ -660,6 +660,254 @@ int alignableReagion_lag( int off1, int off2, Segment *seg )
 }
 
 
+/* work/v10w: alignableReagion_lag() with the prep state passed explicitly, so that several threads
+   can score different lags of one Falign_udpari_long call (500 candidate lags per call) at once.
+   alignableReagion_getctx() snapshots the calling thread's prep state (profiles, letter lists,
+   totaleff); alignableReagion_lag_c() is alignableReagion_lag() verbatim except that it reads that
+   snapshot and writes into the caller's stra buffer.  Every stra[i] is the same sum, term by term,
+   in the same order (letters of profile 1 in slot order, then of profile 2, zero entries skipped,
+   each term one "s += n * p1 * p2" statement from s = 0.0, then s / totaleff), and the window scan
+   is the same code. */
+void alignableReagion_getctx( arp_ctx_t *c )
+{
+	c->p1 = arp_p1; c->p2 = arp_p2;
+	c->k1 = arp_k1; c->k2 = arp_k2;
+	c->nl1 = arp_nl1; c->nl2 = arp_nl2;
+	c->len1 = arp_len1; c->len2 = arp_len2;
+	c->totaleff = arp_totaleff;
+	c->o1 = c->o2 = c->s1 = c->s2 = NULL;
+	c->v1 = c->v2 = NULL;
+}
+
+/* work/v10w: the nonzero profile entries of every column, in slot order (compressed rows), and the
+   n_disFFT entries of the slot pairs: the per-lag scoring then visits exactly the terms the hats
+   visit, in the same order, without testing the zero ones. */
+static void arp_csr_one( const double *p, int len, int nl, int **op, int **sp, double **vp )
+{
+	int c, t, ne = 0;
+	int *o = malloc( sizeof( int ) * ( len + 1 ) ), *s;
+	double *v;
+	if( o == NULL ) ErrorExit( "Cannot allocate in alignableReagion_ctx_csr.\n" );
+	for( c=0; c<len; c++ ) for( t=0; t<nl; t++ ) if( p[(size_t)c*nl+t] ) ne++;
+	s = malloc( sizeof( int ) * ( ne + 1 ) );
+	v = malloc( sizeof( double ) * ( ne + 1 ) );
+	if( s == NULL || v == NULL ) ErrorExit( "Cannot allocate in alignableReagion_ctx_csr.\n" );
+	ne = 0;
+	for( c=0; c<len; c++ )
+	{
+		o[c] = ne;
+		for( t=0; t<nl; t++ ) if( p[(size_t)c*nl+t] ) { s[ne] = t; v[ne] = p[(size_t)c*nl+t]; ne++; }
+	}
+	o[len] = ne;
+	*op = o; *sp = s; *vp = v;
+}
+void alignableReagion_ctx_csr( arp_ctx_t *c )
+{
+	int t1, t2;
+	if( c->nl1 > 26 || c->nl2 > 26 ) return; // (cannot happen: slots are letters 0..25)
+	arp_csr_one( c->p1, c->len1, c->nl1, &c->o1, &c->s1, &c->v1 );
+	arp_csr_one( c->p2, c->len2, c->nl2, &c->o2, &c->s2, &c->v2 );
+	for( t1=0; t1<c->nl1; t1++ ) for( t2=0; t2<c->nl2; t2++ ) c->nd[t1*c->nl2+t2] = n_disFFT[c->k1[t1]][c->k2[t2]];
+}
+void alignableReagion_ctx_free( arp_ctx_t *c )
+{
+	free( c->o1 ); free( c->o2 ); free( c->s1 ); free( c->s2 ); free( c->v1 ); free( c->v2 );
+	c->o1 = c->o2 = c->s1 = c->s2 = NULL;
+	c->v1 = c->v2 = NULL;
+}
+
+int alignableReagion_lag_c( const arp_ctx_t *c, int off1, int off2, Segment *seg, double *stra )
+{
+	int i, j;
+	int status, starttmp = 0;
+	double score;
+	int value = 0;
+	int len;
+	int length = 0;
+	double cumscore;
+	double threshold;
+	const int nl1 = c->nl1, nl2 = c->nl2;
+	const double totaleff = c->totaleff;
+
+	len = MIN( c->len1 - off1, c->len2 - off2 );
+	threshold = (int)fftThreshold / 100.0 * 600.0 * fftWinSize;
+
+	if( c->o1 ) // the nonzero entries only (see alignableReagion_ctx_csr): the same terms in the same order
+	{
+		const int *o1 = c->o1 + off1, *o2 = c->o2 + off2, *s1 = c->s1, *s2 = c->s2, *nd = c->nd;
+		const double *v1 = c->v1, *v2 = c->v2;
+		for( i=0; i<len; i++ )
+		{
+			int e1, e2;
+			const int b0 = o2[i], b1 = o2[i+1];
+			double s = 0.0;
+			for( e1=o1[i]; e1<o1[i+1]; e1++ )
+			{
+				const int *ndr = nd + s1[e1] * nl2;
+				const double x = v1[e1];
+				for( e2=b0; e2<b1; e2++ )
+					s += ndr[s2[e2]] * x * v2[e2];
+			}
+			stra[i] = s / totaleff;
+		}
+	}
+	else
+	for( i=0; i<len; i++ )
+	{
+		const double *p1 = c->p1 + (size_t)( i + off1 ) * nl1;
+		const double *p2 = c->p2 + (size_t)( i + off2 ) * nl2;
+		int t1, t2;
+		double s = 0.0;
+		for( t1=0; t1<nl1; t1++ )
+		{
+			int k = c->k1[t1];
+			if( !p1[t1] ) continue;
+			for( t2=0; t2<nl2; t2++ )
+			{
+				j = c->k2[t2];
+				if( !p2[t2] ) continue;
+				s += n_disFFT[k][j] * p1[t1] * p2[t2];
+			}
+		}
+		stra[i] = s / totaleff;
+	}
+
+	/* the rest is alignableReagion() verbatim */
+	(seg+0)->skipForeward = 0;
+	(seg+1)->skipBackward = 0;
+	status = 0;
+	cumscore = 0.0;
+	score = 0.0;
+	for( j=0; j<fftWinSize; j++ ) score += stra[j];
+
+	for( i=1; i<len-fftWinSize; i++ )
+	{
+		score = score - stra[i-1] + stra[i+fftWinSize-1];
+		if( score > threshold )
+		{
+			if( !status )
+			{
+				status = 1;
+				starttmp = i;
+				length = 0;
+				cumscore = 0.0;
+			}
+			length++;
+			cumscore += score;
+		}
+		if( score <= threshold || length > SEGMENTSIZE )
+		{
+			if( status )
+			{
+				if( length > fftWinSize )
+				{
+					seg->start = starttmp;
+					seg->end = i;
+					seg->center = ( seg->start + seg->end + fftWinSize ) / 2 ;
+					seg->score = cumscore;
+					if( length > SEGMENTSIZE )
+					{
+						(seg+0)->skipForeward = 1;
+						(seg+1)->skipBackward = 1;
+					}
+					else
+					{
+						(seg+0)->skipForeward = 0;
+						(seg+1)->skipBackward = 0;
+					}
+					value++;
+					seg++;
+				}
+				length = 0;
+				cumscore = 0.0;
+				status = 0;
+				starttmp = i;
+				if( value > MAXSEG - 3 ) ErrorExit( "TOO MANY SEGMENTS!");
+			}
+		}
+	}
+	if( status && length > fftWinSize )
+	{
+		seg->end = i;
+		seg->start = starttmp;
+		seg->center = ( starttmp + i + fftWinSize ) / 2 ;
+		seg->score = cumscore;
+		value++;
+	}
+	return( value );
+}
+
+/* work/v10w: getKouho() in one pass.  The original takes nkouho times the first index (strict >)
+   of the largest value above -9999.9 and overwrites it with -9999.9, i.e. it returns the entries
+   with soukan[i] > -9999.9 in the order (value descending, index ascending); once none is left
+   every further round repeats the last index found (0 if none).  Here the nkouho best entries in
+   that order are kept in a bounded heap (one pass), sorted, and padded the same way; the chosen
+   entries are set to -9999.9 as before.  Comparisons only, so the lags are the same ints. */
+static int gk_better( double va, int ia, double vb, int ib ) // a comes before b
+{
+	return( va > vb || ( va == vb && ia < ib ) );
+}
+static void gk_siftdown( double *hv, int *hi, int n, int p ) // heap of the kept entries, the worst on top
+{
+	while( 1 )
+	{
+		int c = 2 * p + 1, w = p;
+		if( c < n && gk_better( hv[w], hi[w], hv[c], hi[c] ) ) w = c;
+		if( c + 1 < n && gk_better( hv[w], hi[w], hv[c+1], hi[c+1] ) ) w = c + 1;
+		if( w == p ) return;
+		{ double tv = hv[p]; int ti = hi[p]; hv[p] = hv[w]; hi[p] = hi[w]; hv[w] = tv; hi[w] = ti; }
+		p = w;
+	}
+}
+int getKouho_fast( int *kouho, int nkouho, double *soukan, int nlen2 )
+{
+	int i, j, n = 0, last = 0;
+	int nlen4 = nlen2 / 2;
+	double *hv;
+	int *hi;
+	if( nkouho <= 0 ) return( 0 );
+	hv = malloc( sizeof( double ) * nkouho );
+	hi = malloc( sizeof( int ) * nkouho );
+	if( hv == NULL || hi == NULL ) ErrorExit( "Cannot allocate in getKouho_fast.\n" );
+	for( i=0; i<nlen2; i++ )
+	{
+		double v = soukan[i];
+		if( !( v > -9999.9 ) ) continue;
+		if( n < nkouho )
+		{
+			int c = n++;
+			hv[c] = v; hi[c] = i;
+			while( c > 0 ) // sift up: the worst entry rises to the top
+			{
+				int p = ( c - 1 ) / 2;
+				if( !gk_better( hv[p], hi[p], hv[c], hi[c] ) ) break;
+				{ double tv = hv[p]; int ti = hi[p]; hv[p] = hv[c]; hi[p] = hi[c]; hv[c] = tv; hi[c] = ti; }
+				c = p;
+			}
+		}
+		else if( gk_better( v, i, hv[0], hi[0] ) )
+		{
+			hv[0] = v; hi[0] = i;
+			gk_siftdown( hv, hi, n, 0 );
+		}
+	}
+	for( j=n-1; j>0; j-- ) // heap sort: the worst kept entry goes to the end
+	{
+		{ double tv = hv[0]; int ti = hi[0]; hv[0] = hv[j]; hi[0] = hi[j]; hv[j] = tv; hi[j] = ti; }
+		gk_siftdown( hv, hi, j, 0 );
+	}
+	for( j=0; j<n; j++ )
+	{
+		kouho[j] = hi[j] - nlen4;
+		soukan[hi[j]] = -9999.9;
+		last = hi[j];
+	}
+	for( ; j<nkouho; j++ ) kouho[j] = last - nlen4;
+	free( hv );
+	free( hi );
+	return( nkouho );
+}
+
 static int permit( Segment *seg1, Segment *seg2 )
 {
 	return( 0 );
