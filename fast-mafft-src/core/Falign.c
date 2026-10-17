@@ -1016,7 +1016,12 @@ void Falign_trim( size_t keep ) // work/largen: give a large row arena back (see
    So segments can be aligned by any thread in any order, each into its own buffers, and then
    appended in order: every row of the result gets the same bytes as in the sequential loop.  The
    aligners keep their working state per thread (TLS), the totalscore sum is formed in segment order.
-   Used for alg 'A' without constraint/codon options, when idle helper threads exist. */
+   Used for alg 'A' without constraint/codon options, when idle helper threads exist.
+   work/v10w: the segments' buffers are the rows of the per-thread arena (tmpres1/tmpres2, segment i
+   at offset soff[i] of every row, room for its two lengths + terminator), not a separate block; and
+   the result is concatenated straight into seq1/seq2, row by row with idle helpers, once every
+   segment is done (nothing reads seq1/seq2 after that), instead of appending into result1/result2
+   serially and copying those back: the rows of seq1/seq2 get the bytes the final strcpy gives them. */
 typedef struct
 {
 	char **seq1, **seq2;
@@ -1024,23 +1029,35 @@ typedef struct
 	const int *cut1, *cut2;
 	double **n_dynamicmtx;
 	double *eff1, *eff2;
-	char ***r1, ***r2;      // per segment: the rows it aligns in place
-	char **sg;              // per segment: sgap1, sgap2, egap1, egap2 (4 consecutive blocks)
+	char **t1, **t2;        // the arena rows; segment i in t1[j]+soff[i], t2[j]+soff[i]
+	size_t *soff;
+	char *sg;               // per segment: sgap1, sgap2, egap1, egap2 (4 consecutive blocks)
 	double *score;
+	int *olen1, *olen2;     // per segment: its output length (row 0)
+	int *doff1, *doff2;     // per segment: where its output goes in the result rows
+	int total1, total2;
+	int *ord;               // work/v10w: the segments in the order they are claimed (largest DP first)
 } psegctx_t;
 
 static void pseg_body( void *vctx, int lo, int hi )
 {
 	psegctx_t *c = (psegctx_t *)vctx;
 	int i, j;
-	for( i=lo; i<hi; i++ )
+	int clus1 = c->clus1, clus2 = c->clus2;
+	char **tmpres1 = malloc( sizeof( char * ) * ( clus1 + 1 ) ), **tmpres2 = malloc( sizeof( char * ) * ( clus2 + 1 ) );
+	if( !tmpres1 || !tmpres2 ) ErrorExit( "Cannot allocate the segment rows in Falign.\n" );
+	int ii;
+	for( ii=lo; ii<hi; ii++ )
 	{
 		const int *cut1 = c->cut1, *cut2 = c->cut2;
-		int clus1 = c->clus1, clus2 = c->clus2, headgp, tailgp;
-		char **tmpres1 = c->r1[i], **tmpres2 = c->r2[i];
-		char *sgap1 = c->sg[i], *sgap2 = sgap1 + clus1, *egap1 = sgap2 + clus2, *egap2 = egap1 + clus1;
+		int headgp, tailgp;
+		i = c->ord[ii];
+		char *sgap1 = c->sg + (size_t)i * 2 * ( clus1 + clus2 ), *sgap2 = sgap1 + clus1, *egap1 = sgap2 + clus2, *egap2 = egap1 + clus1;
 		int len1 = cut1[c->nseg], len2 = cut2[c->nseg];
 		double dumdb = 0.0;
+		for( j=0; j<clus1; j++ ) tmpres1[j] = c->t1[j] + c->soff[i];
+		for( j=0; j<clus2; j++ ) tmpres2[j] = c->t2[j] + c->soff[i];
+		tmpres1[clus1] = tmpres2[clus2] = NULL;
 		if( i == 0 ) headgp = outgap; else headgp = 1;
 		if( i == c->nseg-1 ) tailgp = outgap; else tailgp = 1;
 		if( cut1[i] )
@@ -1073,7 +1090,42 @@ static void pseg_body( void *vctx, int lo, int hi )
 			c->score[i] = G__align11( c->n_dynamicmtx, tmpres1, tmpres2, c->alloclen, headgp, tailgp );
 		else
 			c->score[i] = A__align( c->n_dynamicmtx, penalty, penalty_ex, tmpres1, tmpres2, c->eff1, c->eff2, clus1, clus2, c->alloclen, 0, &dumdb, sgap1, sgap2, egap1, egap2, NULL, 0, NULL, headgp, tailgp, -1, -1, NULL, NULL, NULL, 0.0, 0.0 );
+		c->olen1[i] = strlen( tmpres1[0] );
+		c->olen2[i] = strlen( tmpres2[0] );
 	}
+	free( tmpres1 ); free( tmpres2 );
+}
+
+static void pseg_cat( void *vctx, int lo, int hi ) // rows lo..hi-1 of the result (group 1, then group 2)
+{
+	psegctx_t *c = (psegctx_t *)vctx;
+	int r, i;
+	for( r=lo; r<hi; r++ )
+	{
+		int g2 = ( r >= c->clus1 ), j = g2 ? r - c->clus1 : r;
+		char *dst = g2 ? c->seq2[j] : c->seq1[j], *src = g2 ? c->t2[j] : c->t1[j];
+		const int *olen = g2 ? c->olen2 : c->olen1, *doff = g2 ? c->doff2 : c->doff1;
+		for( i=0; i<c->nseg; i++ ) memcpy( dst + doff[i], src + c->soff[i], olen[i] );
+		dst[g2 ? c->total2 : c->total1] = 0;
+	}
+}
+
+static TLS const int *pseg_cut1, *pseg_cut2; // work/v10w: for pseg_cmpsize (qsort has no context argument)
+static int pseg_cmpsize( const void *a, const void *b ) // larger DP (cells) first, then by index
+{
+	int i = *(const int *)a, j = *(const int *)b;
+	double ci = (double)( pseg_cut1[i+1]-pseg_cut1[i] ) * ( pseg_cut2[i+1]-pseg_cut2[i] );
+	double cj = (double)( pseg_cut1[j+1]-pseg_cut1[j] ) * ( pseg_cut2[j+1]-pseg_cut2[j] );
+	if( ci != cj ) return( ci > cj ? -1 : 1 );
+	return( i - j );
+}
+
+static size_t pseg_rowlen( int nseg, const int *cut1, const int *cut2 ) // the arena row length Falign_psegs needs
+{
+	size_t n = 0;
+	int i;
+	for( i=0; i<nseg; i++ ) n += ( cut1[i+1]-cut1[i] ) + ( cut2[i+1]-cut2[i] ) + 2;
+	return( n );
 }
 
 #ifdef PROGTIMING
@@ -1094,68 +1146,95 @@ static int pseg_force( void ) // MAFFT_PSEGFORCE=1 (timing builds): every multi-
 	return( 0 );
 #endif
 }
+static int arlcheck( void ); // work/v10w (defined with Falign_udpari_long)
+typedef struct { arp_ctx_t ctx; int k[2], off1[2], off2[2], nseg[2]; Segment *segs; int cap, stralen; } lag2ctx_t; // work/v10w
+static void lag2_body( void *vctx, int lo, int hi )
+{
+	lag2ctx_t *L = (lag2ctx_t *)vctx;
+	int t;
+	double *stra = malloc( sizeof( double ) * L->stralen );
+	if( stra == NULL ) ErrorExit( "Cannot allocate in Falign.\n" );
+	for( t=lo; t<hi; t++ ) L->nseg[t] = alignableReagion_lag_c( &L->ctx, L->off1[t], L->off2[t], L->segs + (size_t)t * L->cap, stra );
+	free( stra );
+}
+static long lag2check_n = 0;
+static void lag2check_report( void ) __attribute__(( destructor ));
+static void lag2check_report( void ) { if( lag2check_n ) reporterr( "\nARLCHECK: %ld lags scored in parallel in Falign verified, no mismatch\n", lag2check_n ); }
+static int lag2_v = -1;
+static int lag2_on( void ) // MAFFT_LAG2=0 turns it off
+{
+	if( lag2_v < 0 ) { char *e = getenv( "MAFFT_LAG2" ); lag2_v = !( e && atoi( e ) == 0 ); }
+	return( lag2_v );
+}
 static int pseg_v = -1;
 static int pseg_on( void )
 {
 	if( pseg_v < 0 )
 	{
-		/* work/prog3: off by default.  The segments' private buffers hold a second copy of both groups
-		   while the segments run, on several threads at once: +0.7-0.8 GB peak RSS on 16S.T at 10
-		   threads (above the baseline's), for a gain that did not show clearly.  MAFFT_PSEG=1 turns it
-		   on in timing builds (A/B, PSEGCHECK). */
+		/* work/prog3: was off by default.  The segments' private buffers hold a second copy of both
+		   groups while the segments run, on several threads at once: +0.7-0.8 GB peak RSS on 16S.T at
+		   10 threads (above the baseline's), for a gain that did not show clearly there (few segments
+		   per call).  work/v10w: on for calls with many segments (PSEG_MINSEG, see Falign), where the
+		   segment DPs are most of a step: near-identical genomes (~200 anchors per call, ~55% of each
+		   step on the critical chain of SARS-CoV-2 sets).  MAFFT_PSEG=0 turns it off (A/B);
+		   MAFFT_PSEG=1 (timing builds) also takes it for calls with fewer segments, as before. */
+		char *e = getenv( "MAFFT_PSEG" );
+		if( e && atoi( e ) == 0 ) pseg_v = 0;
 #ifdef PROGTIMING
-		pseg_v = ( getenv( "MAFFT_PSEG" ) != NULL );
-#else
-		pseg_v = 0;
+		else if( e ) pseg_v = 2;
 #endif
+		else pseg_v = 1;
 	}
 	return( pseg_v );
 }
+#define PSEG_MINSEG 16 // work/v10w: segments per call for the parallel segments by default
 
-/* Aligns the nseg segments (cut points cut1[0..nseg], cut2[0..nseg]) and appends them, in order, to
-   result1/result2 (which start empty); returns totalscore, as the sequential loop does. */
+/* Aligns the nseg segments (cut points cut1[0..nseg], cut2[0..nseg]) in the arena rows t1/t2 (row
+   length at least pseg_rowlen()), and writes the result, the segments in order, into seq1/seq2;
+   returns totalscore, as the sequential loop does. */
 static double Falign_psegs( char **seq1, char **seq2, int clus1, int clus2, int nseg, const int *cut1, const int *cut2,
-	double **n_dynamicmtx, double *eff1, double *eff2, int alloclen, char **result1, char **result2 )
+	double **n_dynamicmtx, double *eff1, double *eff2, int alloclen, char **t1, char **t2 )
 {
 	psegctx_t c;
-	size_t rowbytes = 0, k;
-	char *blk, *p;
-	int i, j, totallen = 0, off1 = 0, off2 = 0;
+	int i, totallen = 0, off1 = 0, off2 = 0;
+	size_t so = 0;
 	double totalscore = 0.0;
-	for( i=0; i<nseg; i++ ) rowbytes += ( cut1[i+1]-cut1[i] ) + ( cut2[i+1]-cut2[i] ) + 2;
-	blk = malloc( rowbytes * ( clus1 + clus2 ) + (size_t)nseg * 2 * ( clus1 + clus2 ) );
-	c.r1 = malloc( sizeof( char ** ) * nseg ); c.r2 = malloc( sizeof( char ** ) * nseg );
-	c.sg = malloc( sizeof( char * ) * nseg ); c.score = malloc( sizeof( double ) * nseg );
-	if( !blk || !c.r1 || !c.r2 || !c.sg || !c.score ) ErrorExit( "Cannot allocate the segment buffers in Falign.\n" );
-	p = blk;
-	for( i=0; i<nseg; i++ )
-	{
-		k = ( cut1[i+1]-cut1[i] ) + ( cut2[i+1]-cut2[i] ) + 2;
-		c.r1[i] = malloc( sizeof( char * ) * clus1 ); c.r2[i] = malloc( sizeof( char * ) * clus2 );
-		for( j=0; j<clus1; j++ ) { c.r1[i][j] = p; p += k; }
-		for( j=0; j<clus2; j++ ) { c.r2[i][j] = p; p += k; }
-		c.sg[i] = p; p += 2 * ( clus1 + clus2 );
-	}
+	c.soff = malloc( sizeof( size_t ) * nseg );
+	c.sg = malloc( (size_t)nseg * 2 * ( clus1 + clus2 ) );
+	c.score = malloc( sizeof( double ) * nseg );
+	c.olen1 = malloc( sizeof( int ) * nseg * 4 );
+	if( !c.soff || !c.sg || !c.score || !c.olen1 ) ErrorExit( "Cannot allocate the segment buffers in Falign.\n" );
+	c.olen2 = c.olen1 + nseg; c.doff1 = c.olen2 + nseg; c.doff2 = c.doff1 + nseg;
+	for( i=0; i<nseg; i++ ) { c.soff[i] = so; so += ( cut1[i+1]-cut1[i] ) + ( cut2[i+1]-cut2[i] ) + 2; }
+	/* work/v10w: the largest DPs are claimed first, so that a long segment (an unanchored stretch, e.g. a
+	   run of N) does not start last and hold up the call; where and in which order a segment is aligned
+	   does not change its result (see above) */
+	c.ord = malloc( sizeof( int ) * nseg );
+	if( !c.ord ) ErrorExit( "Cannot allocate the segment buffers in Falign.\n" );
+	for( i=0; i<nseg; i++ ) c.ord[i] = i;
+	pseg_cut1 = cut1; pseg_cut2 = cut2;
+	qsort( c.ord, nseg, sizeof( int ), pseg_cmpsize );
 	c.seq1 = seq1; c.seq2 = seq2; c.clus1 = clus1; c.clus2 = clus2; c.nseg = nseg; c.alloclen = alloclen;
 	c.cut1 = cut1; c.cut2 = cut2; c.n_dynamicmtx = n_dynamicmtx; c.eff1 = eff1; c.eff2 = eff2;
+	c.t1 = t1; c.t2 = t2;
 	dphelp_for( nseg, 1, 1.0, 0.0, pseg_body, &c ); // one segment per claim, any thread, any order
-	for( i=0; i<nseg; i++ ) // append in order, exactly as the sequential loop
+	for( i=0; i<nseg; i++ ) // the lengths in order, exactly as the sequential loop
 	{
-		int nlen = strlen( c.r1[i][0] ), add2 = strlen( c.r2[i][0] );
+		int nlen = c.olen1[i];
 		totalscore += c.score[i];
 		if( totallen + nlen > alloclen )
 		{
 			fprintf( stderr, "totallen=%d +  nlen=%d > alloclen = %d\n", totallen, nlen, alloclen );
 			ErrorExit( "LENGTH OVER in Falign\n " );
 		}
-		for( j=0; j<clus1; j++ ) memcpy( result1[j]+off1, c.r1[i][j], nlen+1 );
-		for( j=0; j<clus2; j++ ) memcpy( result2[j]+off2, c.r2[i][j], add2+1 );
-		off1 += nlen;
-		off2 += add2;
+		c.doff1[i] = off1; c.doff2[i] = off2;
+		off1 += c.olen1[i];
+		off2 += c.olen2[i];
 		totallen += nlen;
 	}
-	for( i=0; i<nseg; i++ ) { free( c.r1[i] ); free( c.r2[i] ); }
-	free( c.r1 ); free( c.r2 ); free( c.sg ); free( c.score ); free( blk );
+	c.total1 = off1; c.total2 = off2;
+	dphelp_for( clus1 + clus2, MAX( 8, ( clus1 + clus2 ) / 64 ), (double)( clus1 + clus2 ) * ( off1 + off2 ) / 2, RCPY_MINWORK, pseg_cat, &c );
+	free( c.soff ); free( c.sg ); free( c.score ); free( c.olen1 ); free( c.ord );
 	return( totalscore );
 }
 
@@ -1206,6 +1285,9 @@ double Falign( int **whichmtx, double ***scoringmatrices, double **n_dynamicmtx,
 	int totallen;
 	int off1, off2; // work/prog: current length of the rows of result1 / result2
 	int inpl; // work/v8s: one segment, aligned in place
+	int usepseg = 0; // work/v10w: the segments in parallel (Falign_psegs)
+	lag2ctx_t lag2; // work/v10w: the first two lags scored at once
+	int lag2used = 0;
 	double totalscore;
 	double dumdb = 0.0;
 	int headgp, tailgp;
@@ -1621,6 +1703,9 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 #ifdef PROGTIMING
 		pt_acc[39] += pt_now() - _v0; // work/v8s: FFT input vectors
 #endif
+#ifdef PROGTIMING
+		double _f0 = pt_now();
+#endif
 		for( j=0; j<n20or4or2; j++ )
 		{
 			if( Falign_fft2_par( nlen, seqVector2[j], seqVector1[j] ) ) continue; // work/v8s: the two transforms at once
@@ -1640,6 +1725,9 @@ fclose( fftfp );
 system( "less seqVec2 < /dev/tty > /dev/tty" );
 #endif
 
+#ifdef PROGTIMING
+		double _f1 = pt_now(); pt_acc[44] += _f1 - _f0; // work/v10w (timing): forward transforms
+#endif
 		for( k=0; k<n20or4or2; k++ ) 
 		{
 			for( l=0; l<nlen; l++ ) 
@@ -1696,7 +1784,24 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 #endif
 
 
-		getKouho( kouho, NKOUHO, soukan, nlen );
+#ifdef PROGTIMING
+		double _f2 = pt_now(); pt_acc[45] += _f2 - _f1; // work/v10w: products, inverse transform
+#endif
+		if( arlcheck() ) // work/v10w: the original getKouho on a copy, compared (lags and the modified soukan)
+		{
+			double *sc = malloc( sizeof( double ) * nlen );
+			int kc[NKOUHO];
+			memcpy( sc, soukan, sizeof( double ) * nlen );
+			getKouho( kc, NKOUHO, sc, nlen );
+			getKouho_fast( kouho, NKOUHO, soukan, nlen );
+			if( memcmp( kc, kouho, sizeof( int ) * NKOUHO ) || memcmp( sc, soukan, sizeof( double ) * nlen ) ) { reporterr( "\nARLCHECK MISMATCH in getKouho (Falign)\n" ); exit( 1 ); }
+			free( sc );
+		}
+		else
+			getKouho_fast( kouho, NKOUHO, soukan, nlen ); // work/v10w: = getKouho( kouho, NKOUHO, soukan, nlen ), one pass instead of NKOUHO
+#ifdef PROGTIMING
+		pt_acc[46] += pt_now() - _f2; // work/v10w: getKouho
+#endif
 		PT_ADD(1);
 
 #if 0
@@ -1748,6 +1853,33 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 #ifdef PROGTIMING
 	pt_acc[36] += pt_now() - _a0; } // work/v8s: anchors, profiles
 #endif
+#ifdef enablemultithread
+	/* work/v10w: the first two usable candidate lags scored at the same time, the second by an idle
+	   helper (alignableReagion_lag_c on a snapshot of this thread's profiles, each into its own buffer).
+	   The loop below takes them over in order, exactly where it would have scored them; the second one
+	   is only wasted when the first has no segment (the loop then stops).  On near-identical genomes
+	   the loop scores two lags per call (the second finds nothing), ~0.6 ms of each chain step. */
+	if( !kobetsubunkatsu && maxk >= 2 && MAX( len1, len2 ) >= 4096 && lag2_on() && dphelp_idle() > 0 )
+	{
+		int np = 0;
+		for( k=0; k<maxk && np<2; k++ )
+		{
+			lag = kouho[k];
+			if( lag <= -len1 || len2 <= lag ) continue;
+			lag2.k[np] = k; lag2.off1[np] = lag > 0 ? 0 : -lag; lag2.off2[np] = lag > 0 ? lag : 0; np++;
+		}
+		if( np == 2 )
+		{
+			alignableReagion_getctx( &lag2.ctx ); // (no compressed rows: the dense path of alignableReagion_lag_c)
+			lag2.cap = MAX( len1, len2 ) / ( fftWinSize > 0 ? fftWinSize : 1 ) + 4; // a segment spans more than fftWinSize columns; +2 for the boundary flags
+			lag2.stralen = MAX( len1, len2 ) + fftWinSize + 1;
+			lag2.segs = calloc( (size_t)2 * lag2.cap, sizeof( Segment ) );
+			if( lag2.segs == NULL ) ErrorExit( "Cannot allocate in Falign.\n" );
+			dphelp_for( 2, 1, 1.0, 0.0, lag2_body, &lag2 );
+			lag2used = 1;
+		}
+	}
+#endif
 	for( k=0; k<maxk; k++ ) 
 	{
 		lag = kouho[k];
@@ -1767,6 +1899,26 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 #ifdef PROGTIMING
 		{ double _a0 = pt_now();
 #endif
+		if( lag2used && ( k == lag2.k[0] || k == lag2.k[1] ) ) // work/v10w: scored above
+		{
+			int t = ( k == lag2.k[0] ) ? 0 : 1;
+			tmpint = lag2.nseg[t];
+			if( count+tmpint > MAXSEG -3 ) ErrorExit( "TOO MANY SEGMENTS.\n" );
+			memcpy( segment+count, lag2.segs + (size_t)t * lag2.cap, sizeof( Segment ) * ( tmpint + 2 ) ); // (with the two flag entries, as alignableReagion_lag writes them)
+			if( arlcheck() ) // the lag again on this thread with alignableReagion_lag, compared
+			{
+				Segment *chk = calloc( (size_t)lag2.cap, sizeof( Segment ) );
+				int ref = alignableReagion_lag( lag > 0 ? 0 : -lag, lag > 0 ? lag : 0, chk ), u;
+				if( ref != tmpint ) { reporterr( "\nARLCHECK MISMATCH (Falign, lag %d): %d vs %d segments\n", lag, tmpint, ref ); exit( 1 ); }
+				for( u=0; u<ref+2; u++ ) // (both buffers start zeroed, so the two flag entries compare whole too)
+					if( chk[u].start != segment[count+u].start || chk[u].end != segment[count+u].end || chk[u].center != segment[count+u].center || memcmp( &chk[u].score, &segment[count+u].score, sizeof( double ) )
+					 || chk[u].skipForeward != segment[count+u].skipForeward || chk[u].skipBackward != segment[count+u].skipBackward )
+					{ reporterr( "\nARLCHECK MISMATCH (Falign, lag %d) in segment %d\n", lag, u ); exit( 1 ); }
+				free( chk );
+				__atomic_add_fetch( &lag2check_n, 1, __ATOMIC_RELAXED );
+			}
+		}
+		else
 		tmpint = alignableReagion_lag( lag > 0 ? 0 : -lag, lag > 0 ? lag : 0, segment+count ); // = alignableReagion( clus1, clus2, tmpptr1, tmpptr2, eff1, eff2, segment+count )
 #ifdef PROGTIMING
 		pt_acc[37] += pt_now() - _a0; pt_acc[38] += 1.0; } // work/v8s: anchors, per-lag scoring and scan
@@ -1845,6 +1997,7 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 	if( !kobetsubunkatsu && fftkeika )
 		fprintf( stderr, "%d anchors found\r", count );
 #endif
+	if( lag2used ) { free( lag2.segs ); lag2used = 0; } // work/v10w
 	if( !count && fftNoAnchStop )
 		ErrorExit( "Cannot detect anchor!" );
 #if 0
@@ -1984,6 +2137,7 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 	pt_acc[28] += 1.0;
 #endif
 	PT_ADD(2);
+	usepseg = 0;
 	inpl = ( count - 1 == 1 && cut1[0] == 0 && cut2[0] == 0 && cut1[1] == len1 && cut2[1] == len2
 	    && alg == 'A' && !scoringmatrices && !kobetsubunkatsu && !codonpos && !codonscore && !constraint && chudanpt == NULL
 	    && !( clus1 == 1 && clus2 == 1 ) && fa_inplace_on() ); // work/v8s: see below
@@ -1995,6 +2149,18 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 	{
 		int rowlen = len1 + len2 + 100;
 		if( rowlen > alloclen ) rowlen = alloclen;
+#ifdef enablemultithread
+		/* work/prog3: segments in parallel (Falign_psegs) when helpers are idle and there is enough work.
+		   work/v10w: by default for calls with at least PSEG_MINSEG segments; their buffers are the
+		   arena's rows (pseg_rowlen) */
+		if( !inpl && count - 1 >= 2 && pseg_on() && alg == 'A' && !scoringmatrices && !kobetsubunkatsu && !codonpos && !codonscore && !constraint && chudanpt == NULL
+		    && ( pseg_force() || ( dphelp_idle() > 0 && (double)( clus1 + clus2 ) * ( len1 + len2 ) >= 2.0e5 && ( pseg_on() == 2 || count - 1 >= PSEG_MINSEG ) ) ) )
+		{
+			size_t pl = pseg_rowlen( count-1, cut1, cut2 );
+			usepseg = 1;
+			if( pl > (size_t)rowlen ) rowlen = (int)pl;
+		}
+#endif
 #ifdef PROGTIMING
 		double _fr0 = pt_now();
 #endif
@@ -2056,27 +2222,36 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 		goto inplace_done;
 	}
 #ifdef enablemultithread
-	/* work/prog3: segments in parallel (Falign_psegs) when helpers are idle and there is enough work */
-	if( count - 1 >= 2 && pseg_on() && alg == 'A' && !scoringmatrices && !kobetsubunkatsu && !codonpos && !codonscore && chudanpt == NULL
-	    && ( pseg_force() || ( dphelp_idle() > 0 && (double)( clus1 + clus2 ) * ( len1 + len2 ) >= 2.0e5 ) ) )
+	if( usepseg ) // work/prog3, work/v10w: see above; the result goes straight into seq1/seq2
 	{
-		totalscore = Falign_psegs( seq1, seq2, clus1, clus2, count-1, cut1, cut2, n_dynamicmtx, eff1, eff2, alloclen, result1, result2 );
+#ifdef PROGTIMING
+		char **in1 = NULL, **in2 = NULL;
+		double _ps0 = pt_now();
+		if( getenv( "MAFFT_PSEGCHECK" ) ) // the input rows, for the sequential loop below
+		{
+			in1 = malloc( sizeof( char * ) * clus1 ); in2 = malloc( sizeof( char * ) * clus2 );
+			for( j=0; j<clus1; j++ ) in1[j] = strdup( seq1[j] );
+			for( j=0; j<clus2; j++ ) in2[j] = strdup( seq2[j] );
+		}
+#endif
+		totalscore = Falign_psegs( seq1, seq2, clus1, clus2, count-1, cut1, cut2, n_dynamicmtx, eff1, eff2, alloclen, tmpres1, tmpres2 );
 		*fftlog = count - 2; // as after count-1 increments from -1
 #ifdef PROGTIMING
-		if( getenv( "MAFFT_PSEGCHECK" ) ) // the sequential loop again, into copies, compared bitwise
+		pt_acc[47] += pt_now() - _ps0; // work/v10w
+		if( in1 ) // the sequential loop again, on the input rows, compared bitwise (at pseg_check_pending)
 		{
 			char **save1 = malloc( sizeof( char * ) * clus1 ), **save2 = malloc( sizeof( char * ) * clus2 );
-			double ts = totalscore;
-			for( j=0; j<clus1; j++ ) { save1[j] = strdup( result1[j] ); result1[j][0] = 0; }
-			for( j=0; j<clus2; j++ ) { save2[j] = strdup( result2[j] ); result2[j][0] = 0; }
+			for( j=0; j<clus1; j++ ) { save1[j] = strdup( seq1[j] ); strcpy( seq1[j], in1[j] ); free( in1[j] ); }
+			for( j=0; j<clus2; j++ ) { save2[j] = strdup( seq2[j] ); strcpy( seq2[j], in2[j] ); free( in2[j] ); }
+			free( in1 ); free( in2 );
 			pseg_check_pending = 1;
-			pseg_check_save1 = save1; pseg_check_save2 = save2; pseg_check_ts = ts;
+			pseg_check_save1 = save1; pseg_check_save2 = save2; pseg_check_ts = totalscore;
 			totalscore = 0.0;
 			*fftlog = -1;
 			goto pseg_sequential;
 		}
 #endif
-		goto pseg_done;
+		goto inplace_done;
 	}
 #endif
 #ifdef PROGTIMING
@@ -2359,10 +2534,6 @@ system( "less seqVec2 < /dev/tty > /dev/tty" );
 		__atomic_add_fetch( &pseg_checked, 1, __ATOMIC_RELAXED );
 	}
 #endif
-#ifdef enablemultithread
-	pseg_done:
-#endif
-
 	if( !rows_copy_par( seq1, result1, clus1, 0, off1, 2 ) ) // work/v8s
 	for( j=0; j<clus1; j++ ) strcpy( seq1[j], result1[j] );
 	if( !rows_copy_par( seq2, result2, clus2, 0, off2, 2 ) )
