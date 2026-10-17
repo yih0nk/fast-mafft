@@ -916,7 +916,37 @@ static int permit( Segment *seg1, Segment *seg2 )
 	else return( 1 );
 }
 
+/* work/v10w: permit() returns 0, so in the two k-loops below every k other than 0 is skipped unless
+   j (first loop) or i (second loop) is the last cut point: k < klim <= *ncut-3 always, so the skip
+   condition reduces to ( k && j<*ncut-1 ).  The loops visited O(ncut) skipped k for each (i,j),
+   O(ncut^3) per call: ~15% of a progressive step on near-identical genomes (~200 anchors).  With
+   ba2_fast the loops stop after k=0 in that case; the k they evaluate, their order and the
+   comparisons are the same (including the first loop's comparison against maxj), so cut1/cut2/ncut
+   are the same.  MAFFT_BA2CHECK=1 reruns every call with the full loops on copies and compares. */
+static void blockAlign2_body( int *cut1, int *cut2, Segment **seg1, Segment **seg2, double **ocrossscore, int *ncut, int ba2_fast );
+static int ba2check_v = -1;
+static long ba2check_n = 0;
+static void ba2check_report( void ) __attribute__(( destructor ));
+static void ba2check_report( void ) { if( ba2check_v > 0 ) reporterr( "\nBA2CHECK: %ld blockAlign2 calls verified, no mismatch\n", ba2check_n ); }
 void blockAlign2( int *cut1, int *cut2, Segment **seg1, Segment **seg2, double **ocrossscore, int *ncut )
+{
+	if( ba2check_v < 0 ) ba2check_v = ( getenv( "MAFFT_BA2CHECK" ) != NULL );
+	if( ba2check_v > 0 && cut1 != NULL )
+	{
+		int n0 = *ncut, nc = *ncut, t;
+		int *c1 = malloc( sizeof( int ) * ( n0 + 1 ) ), *c2 = malloc( sizeof( int ) * ( n0 + 1 ) );
+		memcpy( c1, cut1, sizeof( int ) * n0 ); memcpy( c2, cut2, sizeof( int ) * n0 );
+		blockAlign2_body( c1, c2, seg1, seg2, ocrossscore, &nc, 0 );
+		blockAlign2_body( cut1, cut2, seg1, seg2, ocrossscore, ncut, 1 );
+		if( nc != *ncut ) { reporterr( "\nBA2CHECK MISMATCH: ncut %d vs %d\n", *ncut, nc ); exit( 1 ); }
+		for( t=0; t<nc; t++ ) if( c1[t] != cut1[t] || c2[t] != cut2[t] ) { reporterr( "\nBA2CHECK MISMATCH at cut %d\n", t ); exit( 1 ); }
+		free( c1 ); free( c2 );
+		__atomic_add_fetch( &ba2check_n, 1, __ATOMIC_RELAXED );
+		return;
+	}
+	blockAlign2_body( cut1, cut2, seg1, seg2, ocrossscore, ncut, 1 );
+}
+static void blockAlign2_body( int *cut1, int *cut2, Segment **seg1, Segment **seg2, double **ocrossscore, int *ncut, int ba2_fast )
 {
 	int i, j, k, shift, cur1, cur2, count, klim;
 	static TLS int crossscoresize = 0;
@@ -994,6 +1024,7 @@ void blockAlign2( int *cut1, int *cut2, Segment **seg1, Segment **seg2, double *
 		{
 			pointi = 0; maxi = 0.0;
 			klim = j-2;
+			if( ba2_fast && j < *ncut-1 && klim > 1 ) klim = 1; // work/v10w: see above
 			for( k=0; k<klim; k++ )
 			{
 /*
@@ -1009,6 +1040,7 @@ void blockAlign2( int *cut1, int *cut2, Segment **seg1, Segment **seg2, double *
 
 			pointj = 0; maxj = 0.0;
 			klim = i-2;
+			if( ba2_fast && i < *ncut-1 && klim > 1 ) klim = 1; // work/v10w: see above
 			for( k=0; k<klim; k++ )
 			{
 				if( k && k<*ncut-1 && i<*ncut-1 && !permit( seg2[k-1], seg2[i-1] ) ) continue;
