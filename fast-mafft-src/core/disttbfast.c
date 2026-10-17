@@ -180,6 +180,7 @@ typedef struct _treebasethread_arg
 	int nocopy;
 	struct _lzstate *lz; // work/prog3: deferred gap insertion (lazygap.h), NULL = off
 	int nrunmax; // work/v7: threads of this attempt (the limit on steps in flight; was nthreadtb)
+	int helperonly; // work/v10w: in-order attempts: a thread beyond the original's nthreadtb, which never takes a step and only helps
 } treebasethread_arg_t;
 
 typedef struct _distancematrixthread_arg
@@ -5003,7 +5004,34 @@ static void *treebasethread( void *arg )
 			}
 		}
 		else
-			l = *jobpospt;
+		{
+			/* work/v10w: the original in-order dispatch.  A thread that finds every step handed out
+			   used to leave; with a helper pool it now stays and helps the steps still running (the
+			   last merges at the root, which run one at a time) until the root is done.  Threads beyond
+			   the original's count (helperonly: --thread above the 16 that mafft.tmpl gives the pass)
+			   never take a step; they only help.  Which thread runs which step, and in which order steps
+			   are handed out and check the memsave switch, is the original's. */
+			l = targ->helperonly ? njob-1 : *jobpospt;
+			if( l == njob-1 && dphelppool && njob > 1 )
+			{
+				/* (memory: the step code's per-thread buffers are given back first, as at the exit below) */
+				pthread_mutex_unlock( targ->mutex );
+				if( commonIP ) FreeIntMtx( commonIP );
+				commonIP = NULL;
+				Falign( NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, NULL, NULL, 0, NULL );
+				Falign_udpari_long( NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, NULL );
+				A__align( NULL, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, 0, 0, -1, -1, NULL, NULL, NULL, 0.0, 0.0 );
+				G__align11( NULL, NULL, NULL, 0, 0, 0 );
+				pthread_mutex_lock( targ->mutex );
+				while( !dep[njob-2].done )
+				{
+					if( dphelp_serve_locked() ) continue;
+					dphelppool->nidle++;
+					pthread_cond_wait( targ->treecond, targ->mutex );
+					dphelppool->nidle--;
+				}
+			}
+		}
 		if( l == njob-1 )
 		{
 			pthread_mutex_unlock( targ->mutex );
@@ -8241,6 +8269,8 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			/* work/v7: the order-independent attempts (ready queue) run nthread_q threads, the in-order
 			   dispatch nthreadtb, as the original (see nthreadtbq) */
 			nthread_yoyu = tbsched.inorder ? nthreadtb : nthread_q;
+			/* work/v10w: an in-order attempt also starts nthread_q - nthreadtb helper-only threads (see treebasethread) */
+			int nthread_create = ( tbsched.inorder && nthread_yoyu > 1 && nthread_q > nthread_yoyu ) ? nthread_q : nthread_yoyu;
 			/* work/prog3: deferred gap insertion needs the rows in place, and a fixed aligner per step:
 			   either the optimistic ready queue (a memsave switch abandons the attempt) or one thread
 			   (the switch happens in the same thread, before the step looks at alg) */
@@ -8275,8 +8305,9 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			struct rusage pt_ru0; double pt_w0 = pt_now(); getrusage( RUSAGE_SELF, &pt_ru0 );
 #endif
 	
-			for( i=0; i<nthread_yoyu; i++ )
+			for( i=0; i<nthread_create; i++ )
 			{
+				targ[i].helperonly = ( i >= nthread_yoyu ); // work/v10w
 				targ[i].thread_no = i;
 				targ[i].njob = njob;
 				targ[i].nrunpt = &nrun;
@@ -8320,7 +8351,7 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 				if( pthread_create( handle+i, &tbattr, treebasethread, (void *)(targ+i) ) ) ErrorExit( "Cannot create a thread for the progressive alignment.\n" ); // work/largen: stack size
 			}
 
-			for( i=0; i<nthread_yoyu; i++ )
+			for( i=0; i<nthread_create; i++ ) // work/v10w
 			{
 				pthread_join( handle[i], NULL );
 			}
