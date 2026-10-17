@@ -5333,6 +5333,8 @@ static void *treebasethread( void *arg )
 		   reused across steps, instead of a calloc() per row per step. */
 		{
 			size_t need = (size_t)localcopylen * ( clus1 + clus2 ), k = 0;
+			if( need > lccap && lcblk == NULL && need >= BIGPOOL_MIN ) // work/v10w: a pooled block (see bigpool_take in Falign.c)
+				lcblk = bigpool_take( need, &lccap );
 			if( need > lccap )
 			{
 				free( lcblk );
@@ -5732,6 +5734,9 @@ static void *treebasethread( void *arg )
 			A__align_trim( tb_keepbytes );
 			Falign_trim( tb_keepbytes );
 		}
+		/* work/v10w: large arenas go to the shared pool when a step ends (see bigpool_take in Falign.c) */
+		Falign_release();
+		if( lccap >= BIGPOOL_MIN ) { bigpool_put( lcblk, lccap ); lcblk = NULL; lccap = 0; }
 
 
 
@@ -8377,6 +8382,7 @@ int disttbfast( int ngui, int lgui, char **namegui, char **seqgui, int argc, cha
 			{
 				pthread_join( handle[i], NULL );
 			}
+			bigpool_free(); // work/v10w: the pooled arenas of this attempt
 #ifdef PROGTIMING
 			{
 				struct rusage pt_ru1; double pt_w1 = pt_now(); getrusage( RUSAGE_SELF, &pt_ru1 );

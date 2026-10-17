@@ -163,6 +163,11 @@ extern double A__align_gapmap( char **seq1, char **seq2, double *eff1, double *e
 extern double translate_and_Calign( char **mseq1, char **mseq2, double *effarr1, double *effarr2, int clus1, int clus2, int alloclen );
 extern double Fgetlag( double **scoringmtx, char  **seq1, char  **seq2, double *eff1, double *eff2, int    clus1, int    clus2, int alloclen );
 extern void Falign_trim( size_t keep ); // work/largen
+#define BIGPOOL_MIN ( (size_t)4 << 20 ) // work/v10w: arenas of at least this size are shared through a pool between steps
+extern char *bigpool_take( size_t need, size_t *cap ); // work/v10w
+extern void bigpool_put( char *b, size_t cap ); // work/v10w
+extern void bigpool_free( void ); // work/v10w
+extern void Falign_release( void ); // work/v10w
 extern void A__align_trim( size_t keep ); // work/largen
 extern int A__align_nopool; // work/largen
 extern double Falign( int **whichmtx, double ***scoringmatrices, double **scoreingmtx, char  **seq1, char  **seq2, double *eff1, double *eff2, double **eff1s, double **eff2s, int    clus1, int    clus2, int alloclen, int *fftlog, int *, int, int * );

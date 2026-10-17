@@ -963,11 +963,96 @@ static TLS size_t fa_cap = 0;
 static TLS char **fa_rows = NULL;
 static TLS int fa_rowcap = 0;
 
+/* work/v10w: a small shared pool for the large per-thread arenas (Falign's rows here, the member-row
+   copies in treebasethread).  Every thread used to keep its arenas, grown to the largest step it ever
+   ran; on the critical chain of a large set the big steps run one after another on whichever thread is
+   free, so every thread ended up holding arenas for the largest groups: peak RSS ~3x the baseline's at
+   32 threads on SARS-CoV-2 sets (the original allocates these buffers per call and frees them).  Now a
+   thread gives an arena of at least BIGPOOL_MIN bytes back when its step ends, and the next step, on
+   any thread, takes the best-fitting pooled block (or the largest one, grown with realloc).  So the
+   large blocks in existence are about those of the running steps plus at most BIGPOOL_MAX pooled ones
+   (two: on the critical chain a step gives back its two arenas and the next step takes them).
+   The contents of an arena never matter (every row is written before it is read). */
+#define BIGPOOL_MAX 2
+#ifdef enablemultithread
+static pthread_mutex_t bigpool_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
+static char *bigpool_blk[BIGPOOL_MAX];
+static size_t bigpool_cap[BIGPOOL_MAX];
+static int bigpool_n = 0;
+char *bigpool_take( size_t need, size_t *cap ) // a block of at least need bytes (its size in *cap), or NULL
+{
+	char *b = NULL;
+	int k, best = -1;
+#ifdef enablemultithread
+	pthread_mutex_lock( &bigpool_mutex );
+#endif
+	for( k=0; k<bigpool_n; k++ ) if( bigpool_cap[k] >= need && ( best < 0 || bigpool_cap[k] < bigpool_cap[best] ) ) best = k;
+	if( best < 0 ) for( k=0; k<bigpool_n; k++ ) if( best < 0 || bigpool_cap[k] > bigpool_cap[best] ) best = k; // none fits: the largest, grown
+	if( best >= 0 )
+	{
+		b = bigpool_blk[best]; *cap = bigpool_cap[best];
+		bigpool_n--; bigpool_blk[best] = bigpool_blk[bigpool_n]; bigpool_cap[best] = bigpool_cap[bigpool_n];
+	}
+#ifdef enablemultithread
+	pthread_mutex_unlock( &bigpool_mutex );
+#endif
+	if( b && *cap < need )
+	{
+		char *nb = realloc( b, need + need / 2 );
+		if( nb == NULL ) { free( b ); return( NULL ); }
+		b = nb; *cap = need + need / 2;
+	}
+	return( b );
+}
+void bigpool_put( char *b, size_t cap ) // gives a block back (or frees it, or a smaller pooled one, when the pool is full)
+{
+	int k, small = -1;
+	char *f = NULL;
+	if( b == NULL ) return;
+#ifdef enablemultithread
+	pthread_mutex_lock( &bigpool_mutex );
+#endif
+	if( bigpool_n < BIGPOOL_MAX ) { bigpool_blk[bigpool_n] = b; bigpool_cap[bigpool_n] = cap; bigpool_n++; }
+	else
+	{
+		for( k=0; k<bigpool_n; k++ ) if( small < 0 || bigpool_cap[k] < bigpool_cap[small] ) small = k;
+		if( bigpool_cap[small] < cap ) { f = bigpool_blk[small]; bigpool_blk[small] = b; bigpool_cap[small] = cap; }
+		else f = b;
+	}
+#ifdef enablemultithread
+	pthread_mutex_unlock( &bigpool_mutex );
+#endif
+	free( f );
+}
+void bigpool_free( void ) // at the end of a pass
+{
+	int k;
+#ifdef enablemultithread
+	pthread_mutex_lock( &bigpool_mutex );
+#endif
+	for( k=0; k<bigpool_n; k++ ) free( bigpool_blk[k] );
+	bigpool_n = 0;
+#ifdef enablemultithread
+	pthread_mutex_unlock( &bigpool_mutex );
+#endif
+}
+void Falign_release( void ) // work/v10w: when a step ends, a large row arena goes to the pool
+{
+	if( fa_cap >= BIGPOOL_MIN ) { bigpool_put( fa_blk, fa_cap ); fa_blk = NULL; fa_cap = 0; }
+}
+
 static void Falign_rows( int clus1, int clus2, int alloclen, char ***r1, char ***r2, char ***t1, char ***t2 )
 {
 	int n = 2 * ( clus1 + clus2 ), i;
 	size_t need = (size_t)n * alloclen;
 	char **p;
+	if( need > fa_cap && fa_blk == NULL && need >= BIGPOOL_MIN ) // work/v10w: a pooled block
+	{
+		size_t c = 0;
+		char *b = bigpool_take( need, &c );
+		if( b ) { fa_blk = b; fa_cap = c; }
+	}
 	if( need > fa_cap )
 	{
 #ifdef PROGTIMING
