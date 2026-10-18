@@ -1,6 +1,6 @@
-# Building and running fast-mafft v9
+# Building and running fast-mafft v10
 
-fast-mafft v9 is MAFFT v7.526 (GitLab `sysimm/mafft`, tag `v7.526`, commit `ee97999`) with faster
+fast-mafft v10 is MAFFT v7.526 (GitLab `sysimm/mafft`, tag `v7.526`, commit `ee97999`) with faster
 code in the default strategy, FFT-NS-2. The command line is unchanged. With the same compiler and
 flags, stdout is byte-identical to v7.526's. What changed is in [CHANGES.md](CHANGES.md); how
 identity was checked is in [VERIFICATION.md](VERIFICATION.md).
@@ -58,14 +58,14 @@ build() {  # build SRC PREFIX [CFLAGS]
   make -C "$1/core" PREFIX="$2" ${3:+CFLAGS="$3"} install >> "$2.build.log" 2>&1
   grep -m1 '^	prefix=/' "$2/bin/mafft"
 }
-build $PWD/fast-mafft-src $PWD/v9-default
+build $PWD/fast-mafft-src $PWD/fm-default
 build $PWD/mafft-7.526    $PWD/base-default        # a clean v7.526 tree, for comparison
 ```
 
 ### Aggressive build (the evaluation's "most aggressive compile optimization")
 
 ```
-build $PWD/fast-mafft-src $PWD/v9-aggr   "-O3 -march=native -flto"
+build $PWD/fast-mafft-src $PWD/fm-aggr   "-O3 -march=native -flto"
 build $PWD/mafft-7.526    $PWD/base-aggr "-O3 -march=native -flto"
 ```
 
@@ -111,7 +111,7 @@ unless a feature macro is defined. The baseline relies on the bare `#define _XOP
 - **Tested so far:** the final source was built on CARC with gcc 13.3, with default flags and with
   `-O3 -march=native -flto` (job 13066113). Locally it builds with Apple clang 15 and with gcc-15
   (arm64). gcc 14 or later on glibc has not been tried.
-- **Transparent huge pages.** v9 holds the N(N+1)/2 distance half-matrix in one anonymous mapping.
+- **Transparent huge pages.** fast-mafft holds the N(N+1)/2 distance half-matrix in one anonymous mapping.
   When `/sys/kernel/mm/transparent_hugepage/enabled` is `madvise`, it requests huge pages with
   `madvise(MADV_HUGEPAGE)`. Under `always` (CARC's setting) it gets them without asking.
   `MAFFT_V9SLAB=0` restores MAFFT's per-row `calloc`. The output does not change either way.
@@ -121,7 +121,7 @@ unless a feature macro is defined. The baseline relies on the bare `#define _XOP
 ## 3. Run
 
 ```
-v9-default/bin/mafft --thread 32 in.fa > out.fa
+fm-default/bin/mafft --thread 32 in.fa > out.fa
 ```
 
 The command line is MAFFT v7.526's. `mafft in.fa` with no strategy option runs FFT-NS-2, and the
@@ -130,14 +130,15 @@ alignment on stdout is byte-identical to v7.526's at the same `--thread` value.
 - **`--thread N`.** The 6-mer distances, the guide trees and the msa distances use N threads.
   - v7.526 caps the progressive passes at 16 threads when N ≥ 16. The launcher passes
     `disttbfast -C 32-16`.
-  - v9 passes `-C N-16-N`. It uses all N threads wherever the progressive result cannot depend on
+  - fast-mafft passes `-C N-16-N`. It uses all N threads wherever the progressive result cannot depend on
     the order of the steps or on the thread count: the ready queue, and every pass above 20,000
     sequences.
-  - It keeps v7.526's 16 threads in the one order-dependent case. That case is the in-order redo of a
-    pass after MAFFT's memsave switch, which fires when an alignment grows past 30,000 columns with
-    at most 20,000 sequences. CHANGES.md §3.6 explains it.
+  - It keeps v7.526's 16 step-claiming threads in the one order-dependent case: MAFFT's in-order
+    dispatch, used for a pass in which the memsave switch fires (an alignment grows past 30,000
+    columns, with at most 20,000 sequences). CHANGES.md §3.6 explains it. v10 starts the other
+    N − 16 threads there too, but they only help inside steps (CHANGES.md §8.3).
 - **Above 20,000 sequences.** v7.526 runs both progressive passes on one core whatever `--thread`
-  says. v9 runs them threaded with the same result. `--threadtb 1` restores the serial passes.
+  says. fast-mafft runs them threaded with the same result. `--threadtb 1` restores the serial passes.
 - **Compare runs at the same `--thread` value.** `mafft` without `--thread` takes MAFFT's
   unthreaded code path, and that can give a different alignment than `--thread N` (v7.526 does the
   same).
@@ -147,7 +148,7 @@ alignment on stdout is byte-identical to v7.526's at the same `--thread` value.
   stdout only.
 - **Other strategies.** `--auto`, L-INS-i, FFT-NS-i, `--add` and so on share some of the changed
   code: input reading, `f2cl`, the launcher, and the A__align/G__align11 kernels. During development
-  they were spot-checked for identical output, mostly on earlier builds (VERIFICATION.md §5). They
+  they were spot-checked for identical output, mostly on earlier builds (VERIFICATION.md §6). They
   were not tuned or timed. In v7.526 itself the iterative modes are not deterministic at
   `--thread` > 1.
 
@@ -157,7 +158,7 @@ flags.
 ```
 h() { "$1" --thread "$2" "$3" 2>/dev/null | md5sum | cut -c1-12; }
 for d in sim1k rnasim1k prot2k 16S.T; do for t in 1 8 32; do
-  echo "$d t=$t base=$(h base-default/bin/mafft $t $d.fa) v9=$(h v9-default/bin/mafft $t $d.fa)"
+  echo "$d t=$t base=$(h base-default/bin/mafft $t $d.fa) fm=$(h fm-default/bin/mafft $t $d.fa)"
 done; done
 ```
 
@@ -182,7 +183,15 @@ by a lot.
 | `MAFFT_UPGTHREADS=n` | At most n guide-tree threads. The tree does not depend on n. |
 | `MAFFT_UPGSTAT=1` | Guide-tree timers and counts on stderr. |
 | `MAFFT_SIMD=scalar\|sse2\|popcnt\|avx2` (`neon` on ARM) | Lower the SIMD level of the 6-mer and msa-distance kernels. A level above the CPU's prints a warning and uses the CPU's level. Use it with the two `check` modes to test each level. |
-| `MAFFT_ADPVEC=0\|2\|4` | Width of the progressive DP row kernels. 4 = AVX2 lanes, 2 = SSE2/NEON lanes, 0 = scalar. Default: 4 on x86 with AVX2, 2 on other x86, 0 on ARM. |
+| `MAFFT_MSCHECK=1` | (v10) Every Myers-Miller call (`MSalignmm`, past 30,000 columns) is also run with the original recursion; the score, both gap tables, every row and the fused profiles are compared. Prints `MSCHECK: N MSalignmm calls ... no mismatch`. About MAFFT's own time on long genomes. |
+| `MAFFT_MSKCHECK=1` | (v10) Every recursion node's forward and backward sweeps are recomputed by the original loops; the midpoint, jumps and split are compared. Slow. |
+| `MAFFT_ARLCHECK=1` | (v10) The anchor search: every lag's segments against the original `alignableReagion`, the lag lists against the original `getKouho`, the FFT input vectors against the original loops, and every lag scored by a helper. |
+| `MAFFT_BA2CHECK=1` | (v10) Every `blockAlign2` call also runs the full original loops; the cut points are compared. |
+| `MAFFT_FFTCHECK=1` | (v10) Every transform of 16,384 points or more is also computed in the original order and compared bitwise. |
+| `MAFFT_MSFAST=0`, `MAFFT_UDLV10=0` | (v10, A/B) The original `MSalignmm` recursion; the original `Falign_udpari_long`. |
+| `MAFFT_PSEG=0`, `MAFFT_LAG2=0` | (v10, A/B) Align Falign's segments one after another; score the FFT lags one at a time. |
+| `MAFFT_MSFORCEPAR=1`, `MAFFT_MSBANDW=n` | (v10, tests) Use the Myers-Miller task stack and bands even without idle helpers; band width in columns (default 1,024). |
+| `MAFFT_ADPVEC=0\|2\|4` | Width of the progressive DP row kernels. 4 = AVX2 lanes, 2 = SSE2/NEON lanes, 0 = scalar. Default: 4 on x86 with AVX2, 2 on other x86, 0 on ARM. In v10 it also sets the Myers-Miller cell kernels. |
 | `MAFFT_V9SLAB=0\|1\|2` | Distance half-matrix: `0` uses v7.526's per-row `calloc`, `1` uses one mapping and never calls madvise, `2` always calls madvise(MADV_HUGEPAGE). By default it calls madvise only when the THP mode is `madvise`. |
 | `MAFFT_V9PTIME=1` | Stage timers for the distance stages, and huge-page use. |
 | `MAFFT_BINARIES=dir` | v7.526's own variable: run the programs in `dir` instead of the installed `libexec/mafft`. |
@@ -190,8 +199,9 @@ by a lot.
 Recommended self-check run (it passes on every set tried; see VERIFICATION.md):
 
 ```
-MAFFT_SEXTET=check MAFFT_MSADIST=check MAFFT_UPG=check v9-default/bin/mafft --thread 32 in.fa | md5sum
-for s in scalar sse2 avx2; do MAFFT_SIMD=$s MAFFT_SEXTET=check MAFFT_MSADIST=check,forceskip v9-default/bin/mafft --thread 8 in.fa | md5sum; done
+MAFFT_SEXTET=check MAFFT_MSADIST=check MAFFT_UPG=check fm-default/bin/mafft --thread 32 in.fa | md5sum
+MAFFT_ARLCHECK=1 MAFFT_BA2CHECK=1 MAFFT_FFTCHECK=1 MAFFT_MSCHECK=1 fm-default/bin/mafft --thread 32 long.fa | md5sum
+for s in scalar sse2 avx2; do MAFFT_SIMD=$s MAFFT_SEXTET=check MAFFT_MSADIST=check,forceskip fm-default/bin/mafft --thread 8 in.fa | md5sum; done
 ```
 
 ### Timing build (`-DPROGTIMING`): progressive-pass self-checks, logs and A/B switches
@@ -199,12 +209,12 @@ for s in scalar sse2 avx2; do MAFFT_SIMD=$s MAFFT_SEXTET=check MAFFT_MSADIST=che
 Only `disttbfast` needs rebuilding. Point an installed launcher at it with `MAFFT_BINARIES`:
 
 ```
-cp -R fast-mafft-src v9-pt && make -C v9-pt/core clean > /dev/null
-make -C v9-pt/core CFLAGS="-O3 -DPROGTIMING -DGCCPAR_TBTEST -D_GNU_SOURCE" disttbfast -j32
-mkdir -p v9-pt/libexec && cp v9-pt/core/disttbfast v9-pt/libexec/
-for f in v9-default/libexec/mafft/*; do [ "$(basename $f)" = disttbfast ] || ln -sf $PWD/$f v9-pt/libexec/; done
-MAFFT_BINARIES=$PWD/v9-pt/libexec MAFFT_VECCHECK=1 MAFFT_DPCHECK=1 MAFFT_LAZYCHECK=1 \
-  v9-default/bin/mafft --thread 8 rnasim1k.fa | md5sum
+cp -R fast-mafft-src fm-pt && make -C fm-pt/core clean > /dev/null
+make -C fm-pt/core CFLAGS="-O3 -DPROGTIMING -DGCCPAR_TBTEST -D_GNU_SOURCE" disttbfast -j32
+mkdir -p fm-pt/libexec && cp fm-pt/core/disttbfast fm-pt/libexec/
+for f in fm-default/libexec/mafft/*; do [ "$(basename $f)" = disttbfast ] || ln -sf $PWD/$f fm-pt/libexec/; done
+MAFFT_BINARIES=$PWD/fm-pt/libexec MAFFT_VECCHECK=1 MAFFT_DPCHECK=1 MAFFT_LAZYCHECK=1 \
+  fm-default/bin/mafft --thread 8 rnasim1k.fa | md5sum
 ```
 
 | variable (timing build) | checks or does |
@@ -215,7 +225,7 @@ MAFFT_BINARIES=$PWD/v9-pt/libexec MAFFT_VECCHECK=1 MAFFT_DPCHECK=1 MAFFT_LAZYCHE
 | `MAFFT_LAZYCHECK=1` | Deferred gap insertion: shadow rows receive every gap table immediately and must equal the real rows whenever those are current. |
 | `MAFFT_PROFCHECK=1`, `MAFFT_ARCHECK=1` | One-pass profiles and the dense first row and column; the hoisted anchor search. Each is compared with the original functions. |
 | `MAFFT_V8CHECK=1` | Parallel FFT input vectors and transform pairs, anchor-profile builds, parallel row copies and in-place Falign segments, each redone by the original code and compared. |
-| `MAFFT_PSEG=1 MAFFT_PSEGCHECK=1` (`MAFFT_PSEGFORCE=1`) | Parallel Falign segments (off by default) and their check. |
+| `MAFFT_PSEGCHECK=1` (`MAFFT_PSEG=1`, `MAFFT_PSEGFORCE=1`) | Parallel Falign segments are also run sequentially and compared. (In v10 they are on by default for calls with at least 16 segments; `MAFFT_PSEG=1` also uses them for smaller calls, `MAFFT_PSEGFORCE=1` for every call.) |
 | `MAFFT_PROGLOG=/abs/file`, `MAFFT_V8STAT=1` | Per-step log of the progressive passes; row-kernel and tiling statistics. |
 | A/B switches | `MAFFT_NOFASTDP` (original DP loops), `MAFFT_INORDER` (original in-order dispatch), `MAFFT_READYQ1` (ready queue at one thread), `MAFFT_NOHELP`, `MAFFT_NOHELPFOR`, `MAFFT_NOTILE`, `MAFFT_NOGENERAL`, `MAFFT_NOLAZY`, `MAFFT_LZTWOPHASE=0`, `MAFFT_COPYROWS` (row copies under `aseqlock`; this restores the old deadlock-prone path), `MAFFT_SCHEDPRIO=0` (old priorities), `MAFFT_CRITHELP=1`, `MAFFT_FAINPLACE=0`, `MAFFT_LARGEN_TB1` |
 | Tiling parameters | `MAFFT_TILEWIDTH`, `MAFFT_TILEMINCELLS`, `MAFFT_TILEFORCE`, `MAFFT_TILEOLD`, `MAFFT_TILENBFAC`, `MAFFT_TILEALIGN`, `MAFFT_TILEBATCH`, `MAFFT_TILECLAIM`, `MAFFT_TILEBANDMAJOR`, `MAFFT_TILELOCALSETUP`, `MAFFT_CRITNB`, `MAFFT_CRITMINCELLS`. `MAFFT_TILEIJPTEST` is for diagnosis only: it makes the output wrong on purpose. |
