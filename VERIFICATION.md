@@ -1,7 +1,7 @@
 # How byte-identical output was verified
 
-Every count below comes from the lever notes (`notes/*.md`) or from the final packaging checks run
-for this deliverable (§3). "M5" is the development Mac (Apple M5); "CARC" is USC CARC (AMD EPYC
+Every count below comes from the lever notes (`notes/*.md`), the CARC job logs (`carc/logs/`), or
+the packaging checks (§3, §4). "M5" is the development Mac (Apple M5); "CARC" is USC CARC (AMD EPYC
 7513/7542, gcc 13.3).
 
 ## 1. What "identical" means here
@@ -20,9 +20,11 @@ for this deliverable (§3). "M5" is the development Mac (Apple M5); "CARC" is US
   own aggressive build gives the same md5 as its default build.
 - **Two places where v7.526 itself is not deterministic,** and how they were handled:
   - **The memsave switch.** When an alignment exceeds 30,000 columns with at most 20,000 sequences
-    and more than one thread, the result depends on the schedule. Here fast-mafft must produce
-    outputs from the same set (CHANGES.md §3.6). At `--thread 1`, and above 20,000 sequences, it
-    must match exactly.
+    and more than one thread, the result depends on the schedule (CHANGES.md §3.6, §8.4). When the
+    switch fires in the first steps of a pass, fast-mafft reproduces the outcome MAFFT's timing makes
+    dominant. When it fires in the middle of a pass, MAFFT's own output depends on timing, and
+    fast-mafft's race has different odds: §3 has the measurements. At `--thread 1`, and above 20,000
+    sequences, fast-mafft must match exactly.
   - **The iterative strategies at `--thread` > 1.** FFT-NS-i, L-INS-i and `--auto` on small inputs
     vary from run to run in v7.526 itself, so they are compared at `--thread 1` only.
 
@@ -44,7 +46,99 @@ for this deliverable (§3). "M5" is the development Mac (Apple M5); "CARC" is US
 | | subsets p450_1k, rvp2k, ald1500, homfam_rvp_sub5k/20k/30k, homfam_sdr_sub3k/20k, homfam_Acetyltransf_sub20k | 1,000 to 30,000 | the same paths at sizes that run locally or quickly |
 | BAliBASE 3.0 core (R1–5) | 386 `.tfa` inputs, RV11–RV50 | small (about 29 on average per reference case) | diverse small real protein inputs: short sequences, `X`, extensions, insertions |
 
-## 3. Checks on the final packaged tree (this deliverable, 2026-10-13)
+## 3. Checks on v10 (2026-10-14 to 10-18)
+
+v10 adds long-genome and near-identical-genome code (CHANGES.md §8). Its new kernels each have a
+bitwise self-check in the normal build (`MAFFT_MSCHECK`, `MSKCHECK`, `ARLCHECK`, `BA2CHECK`,
+`FFTCHECK`; §7).
+
+**The final CARC evaluation** (`carc/carc_v10_final.sh`, REP = 1, gcc 13.3, reference = v7.526 built
+with the default flags; RESULTS.md):
+
+- **Part std (job 13224806, node a03-19): 45 md5 checks, 0 differ; BAliBASE 772 runs, 0 differ.**
+  sim1k, rnasim579, rnasim1k, prot2k and rnasim2k at 1, 8 and 32 threads; edge, edge_noshort and 16S.3
+  at 1 and 8 (each against the reference at that thread count, for both fast-mafft builds), and the
+  self-checks at 32 threads on rnasim1k, 16S.T and homfam_aldosered (6-mer distances, MSA distances,
+  guide trees, 1,998 / 14,579 / 25,664 `blockAlign2` calls, anchors and lags): all passed.
+- **Part long (job 13224807, same node): 23 checks, 2 differ.** Strict one-thread identity on
+  sarscov2_500 (`e8be67d631bc`) and sarscov2_1000 (`3b000a61e12a`); long10x30k and long30x30k at 1 and
+  8 threads; the self-checks on sarscov2_500 / 1000 at 8 threads and sarscov2_500 at 32 (998 / 1,998
+  `blockAlign2` calls, 2,994 / 5,994 long transforms, 382 / 198 / 940 helper-scored lags) and on
+  long30x30k at 32 with every check (3,334 Myers-Miller calls and 22,012 recursion nodes verified); and
+  long10x30k at one thread at `MAFFT_SIMD=scalar`, `sse2` and `avx2` with `MAFFT_MSCHECK`: all
+  identical, no mismatch. The two differences are viral100 at 8 threads (both fast-mafft builds gave
+  the one-thread output `4f9775f500b2`, the reference `1e80180224db`); see the last subsection.
+- **Timed runs: 74 of 75 identical** (25 inputs × 3 repetitions at 32 threads). The exception is
+  sarscov2_2000 in REP 1; see the last subsection.
+
+**Earlier CARC jobs on v10** (gcc 13.3 `-O3 -march=native -flto`, against the same-flag baseline,
+which equals the default build's):
+
+- **Job 13178138** (the final v10 source): 15/15 identical, including strict one-thread identity on
+  500 and 1,000 real SARS-CoV-2 genomes (`e8be67d631bc`, `3b000a61e12a`), the self-checks at 8 and 32
+  threads, `long30x30k` at 32 threads with every check, and `long10x30k` at each `MAFFT_SIMD` level.
+  Every timed run (15 pairs) matched.
+- **Job 13159523** (the first v10 build, before the race fix and the SARS-CoV-2 changes): 12/12
+  identical; all 16 timed pairs on the long sets matched.
+
+**The development Mac** (final source; clang `-O3 -g` against `baseline-install` unless noted):
+
+| what | runs | result |
+|---|---:|---|
+| SARS-CoV-2: 500 genomes at 1 (strict), 4 and 10 threads, 1,000 at 1 (strict) and 10, with `BA2CHECK` + `FFTCHECK` + `ARLCHECK` | 5 | identical; 998 / 1,998 `blockAlign2` calls and 2,994 / 5,994 long transforms verified |
+| long and edge sets at 1 and 4 threads: long10x30k, long30x30k, long100x30k, viral100, viral500, edge, edge_noshort | 13 | identical |
+| `--thread 10` on edge, long100x30k, long500x30k, long1000x30k | 4 | identical (long500x30k is the case the race fix of CHANGES.md §8.4 fixed) |
+| long30x30k at 4 threads with every check (`MSKCHECK`, `MSCHECK`, `BA2CHECK`, `FFTCHECK`, `ARLCHECK`) | 1 | identical, no mismatch |
+| `--memsave` (prot2k, rnasim1k, sim1k, 16S.T subset; with `MSKCHECK` + `MSCHECK`) | 7 | identical |
+| regression: sim1k, rnasim579, rnasim1k, rnasim2k, rnasim5k, prot2k, 16S.T, homfam_aldosered at 1 and 4 threads; rnasim10k, 16S.B.ALL at 4; rnasim5k, 16S.T at 10 | 20 | identical |
+| BAliBASE 3.0 at 1 and 4 threads, and at 1 thread with `--memsave` | 3 × 386 | 0 differ |
+| gcc-15 arm64 against a gcc-15 baseline (rnasim1k, edge, long10x30k with every check, long30x30k, prot2k `--memsave`, sarscov2_500 at 1 and 4 with the checks) | 8 | identical |
+| x86-64 under Rosetta against an x86 baseline, at `MAFFT_SIMD=scalar`, `sse2`, default and AVX2 (rnasim1k, edge, long10x30k with every check, prot2k `--memsave`, sarscov2_500) | 15 | identical |
+| the last two changes (largest segments first, two lags at once), re-checked: 30 clang runs, BAliBASE at 4 threads, gcc-15 4, Rosetta 3 | | identical; 538 helper-scored lags verified |
+
+**The 12 commits that took v9 to v10** were each built (clang `-O3 -g`) and checked on rnasim1k
+(4 threads), long10x30k (4 threads, every self-check), viral100 (1 thread) and sarscov2_500
+(4 threads, with the checks): 32 of 32 identical, no self-check mismatch. `fast-mafft-v10.patch`
+applied with `patch -p1` and with `git apply` to a clean v7.526 tree reproduces `fast-mafft-src/`
+exactly; reversed, it gives v7.526 back.
+
+### Inputs whose alignment crosses 30,000 columns in the middle of a pass
+
+When the memsave switch fires **in the middle of a progressive pass**, while other steps are in
+flight, which of those steps (and which of their segments) still use the normal aligner depends on
+thread timing, in MAFFT as in fast-mafft (CHANGES.md §8.4). The output can then differ between
+runs at more than one thread. Diagnostic job 13226265 ([`carc/carc_v10_mix.sh`](carc/carc_v10_mix.sh), node
+a04-16, log `carc/logs/v10mix-13226265.log`) ran builds of both programs that log every step's
+aligner (`carc/diag_mix.py`; stdout unchanged), on the same node:
+
+| input | threads | MAFFT v7.526 | fast-mafft v10 |
+|---|---:|---|---|
+| viral100 | 8 | `1e80180224db` in 8 of 8 runs | `1e80180224db` in 6 of 8; `4f9775f500b2` (the one-thread output) in 2 |
+| viral100 | 32 | `96dcc1cd7d39` in 3 of 4, `f47ba74470f8` in 1 | 4 different md5s in 4 runs, one of them `96dcc1cd7d39` |
+| sarscov2_2000 | 32 | `e6734daa2634` in 5 of 5 (with the timed runs) | `e6734daa2634` in 11 of 16; `300dbffd1556` in 5 |
+
+- **Same switch, different race.** All 37 logged runs switched at the same steps (viral100: 49 in
+  pass 1, 50 in pass 2; sarscov2_2000: 1884 and 1981). They differ only in which steps near the switch
+  read the new mode at the top level, and where the in-flight Falign calls were split between the two
+  aligners. MAFFT's own split points vary widely from run to run (on viral100 at 8 threads, step 42
+  was split anywhere from 137/40 to 167/10 segments) while its output stays the same, so only a few
+  segments decide the result.
+- **Why MAFFT usually agrees with itself.** Its steps near the switch take about the same time from
+  run to run, so one outcome of the race usually wins on a given machine, though not always (viral100
+  at 32 threads). fast-mafft runs those steps 20–200 times faster overall, by different factors for
+  different steps, so the race has different odds, and sometimes a different winner.
+- **What holds.** At `--thread 1` there is no race, and fast-mafft was identical on every input
+  tested. Every input whose alignment stays under 30,000 columns, or crosses it in the first steps of
+  a pass (the simulated long sets, edge, edge_noshort), was identical in every run, at every thread
+  count. Inputs that cross it mid-pass are collections of genomes of about 30 kb, such as large
+  SARS-CoV-2 collections (2,000 genomes here; 500 and 1,000 stay below 30,000 columns).
+- **On the Mac** (clang): `viral1000` at `--thread 10`, three runs of v7.526 gave three different md5s;
+  each of them also came from fast-mafft, which also gave a fourth.
+
+`carc/run_eval.sh` and `carc/carc_v10_final.sh` rerun both programs when an md5 pair differs and
+report whether MAFFT gave the same output twice.
+
+## 4. Checks on the packaged v9 tree (2026-10-13)
 
 - **The patch applies cleanly.**
   - Base: `git archive ee97999` of `baseline-src`, which is clean v7.526 without the build artifacts
@@ -75,7 +169,7 @@ for this deliverable (§3). "M5" is the development Mac (Apple M5); "CARC" is US
 - **Final CARC suite.** REP=1 of `carc/carc_v9_final.sh` runs 42 md5 checks, the self-check modes
   and BAliBASE at 1 and 8 threads. Its result goes into RESULTS.md.
 
-## 4. Checks on the final v9 source (v9p lever)
+## 5. Checks on the final v9 source (v9p lever)
 
 **CARC, job 13066113** (node a03-17). Reference: v7.526 built with gcc 13.3 default flags. Candidates:
 v9 built with default flags and with `-O3 -march=native -flto`. **88 md5 checks, 0 differ.**
@@ -119,7 +213,7 @@ Further checks on CARC:
   fail often and run the parallel phases on small inputs. `MAFFT_UPG=check` on prot2k, sim1k,
   rvp_sub5k, sdr_sub3k and rnasim1k at 1, 3, 5, 8 and 10 threads all passed.
 
-## 5. Checks during development (each lever, against the same-flag baseline)
+## 6. Checks during development (each lever, against the same-flag baseline)
 
 | lever (notes file) | md5 checks | other checks |
 |---|---|---|
@@ -140,7 +234,7 @@ The 386-input BAliBASE suite was run by the sextet, overhead, prog2, gccpar (onc
 x86simd, prog3, largen, v7, v8s and v9p levers, and on CARC. Each run covered two thread counts, and
 none found a difference.
 
-## 6. The self-check modes
+## 7. The self-check modes
 
 Every new kernel can be checked against the code it replaces, bitwise, inside a real run. A mismatch
 prints the location and exits non-zero. BUILD.md §4 has the switches.
@@ -155,8 +249,10 @@ prints the location and exits non-zero. BUILD.md §4 has the switches.
 | `MAFFT_TILECHECK` | timing | every tiled DP against the serial loop, traceback included | 3,727 forced-tiled DPs per run; 1,476 DPs (3.9 G cells) per run in the gccpar runs |
 | `MAFFT_LAZYCHECK` | timing | deferred gap insertion against eagerly updated shadow rows | 1,541 deferred tables on homfam_p450 (above 20,000) |
 | `MAFFT_PROFCHECK`, `MAFFT_ARCHECK`, `MAFFT_V8CHECK`, `MAFFT_PSEGCHECK` | timing | profiles, anchor search, parallel Falign pieces, parallel segments | 684 anchor-profile builds and 1,398 in-place segments (16S.T) |
+| `MAFFT_MSCHECK`, `MAFFT_MSKCHECK` (v10) | normal | every Myers-Miller call; every recursion node's sweeps | 3,334 calls and 22,012 nodes (long30x30k, CARC, 32 threads) |
+| `MAFFT_ARLCHECK`, `MAFFT_BA2CHECK`, `MAFFT_FFTCHECK` (v10) | normal | anchors, lag lists, FFT vectors, helper-scored lags; `blockAlign2`; long FFTs | 29,000 lags (long30x30k); 25,664 `blockAlign2` calls (homfam_aldosered); 5,994 long transforms (sarscov2_1000) |
 
-## 7. Compilers and SIMD levels
+## 8. Compilers and SIMD levels
 
 | build | where | reference | used by |
 |---|---|---|---|
@@ -174,7 +270,7 @@ Rosetta was used only for correctness. It emulates AVX2 slowly, so its timings m
 - M5: 1, 2, 3, 4, 5, 7, 8, 10, 16, and 32 (oversubscribed).
 - CARC: 1, 4, 8 and 32.
 
-## 8. Edge cases
+## 9. Edge cases
 
 - **The memsave switch (alignments over 30,000 columns).**
   - edge.fa and edge_noshort.fa (59–66 k columns) at 1, 4, 8, 10 and 32 threads, and sim3k_long.
@@ -203,7 +299,7 @@ Rosetta was used only for correctness. It emulates AVX2 slowly, so its timings m
   - Names over 254 characters, `=`/`<`/`>`/NUL in sequences, a missing final newline.
   - One fuzz input hangs both the original and fast-mafft, as expected.
 
-## 9. Reference md5s (first 12 hex digits; the same at every thread count unless noted)
+## 10. Reference md5s (first 12 hex digits; the same at every thread count unless noted)
 
 For orientation only. The reference in any new environment is v7.526 built there with the same
 compiler and flags.
