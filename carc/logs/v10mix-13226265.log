@@ -1,0 +1,43 @@
+== node a04-16.hpc.usc.edu start Sun Oct 18 07:44:45 PDT 2026
+ok 1
+built diag base rc=0 	prefix=/scratch2/yihanhon/fm-v10/carc-results/v10mix-13226265/base/libexec/mafft
+ok 1
+built diag v10 rc=0 	prefix=/scratch2/yihanhon/fm-v10/carc-results/v10mix-13226265/v10/libexec/mafft
+v100t8-base-1 base viral100 t=8 md5=1e80180224db wall=80.1
+v100t8-v10-1 v10 viral100 t=8 md5=1e80180224db wall=4.4
+v100t8-base-2 base viral100 t=8 md5=1e80180224db wall=79.5
+v100t8-v10-2 v10 viral100 t=8 md5=4f9775f500b2 wall=4.2
+v100t8-base-3 base viral100 t=8 md5=1e80180224db wall=79.7
+v100t8-v10-3 v10 viral100 t=8 md5=4f9775f500b2 wall=4.1
+v100t8-base-4 base viral100 t=8 md5=1e80180224db wall=79.9
+v100t8-v10-4 v10 viral100 t=8 md5=1e80180224db wall=4.4
+v100t8-base-5 base viral100 t=8 md5=1e80180224db wall=80.1
+v100t8-v10-5 v10 viral100 t=8 md5=1e80180224db wall=4.2
+v100t8-base-6 base viral100 t=8 md5=1e80180224db wall=79.7
+v100t8-v10-6 v10 viral100 t=8 md5=1e80180224db wall=4.2
+v100t8-base-7 base viral100 t=8 md5=1e80180224db wall=79.6
+v100t8-v10-7 v10 viral100 t=8 md5=1e80180224db wall=4.3
+v100t8-base-8 base viral100 t=8 md5=1e80180224db wall=79.5
+v100t8-v10-8 v10 viral100 t=8 md5=1e80180224db wall=4.3
+v100t32-base-1 base viral100 t=32 md5=96dcc1cd7d39 wall=78.0
+v100t32-v10-1 v10 viral100 t=32 md5=7db77b6a89ae wall=3.6
+v100t32-base-2 base viral100 t=32 md5=f47ba74470f8 wall=78.0
+v100t32-v10-2 v10 viral100 t=32 md5=1cce26df6151 wall=3.5
+v100t32-base-3 base viral100 t=32 md5=96dcc1cd7d39 wall=78.3
+v100t32-v10-3 v10 viral100 t=32 md5=96dcc1cd7d39 wall=3.4
+v100t32-base-4 base viral100 t=32 md5=96dcc1cd7d39 wall=78.6
+v100t32-v10-4 v10 viral100 t=32 md5=4f9775f500b2 wall=3.4
+sc2k-v10-1 v10 sarscov2_2000 t=32 md5=e6734daa2634 wall=19.5
+sc2k-v10-2 v10 sarscov2_2000 t=32 md5=300dbffd1556 wall=19.3
+sc2k-v10-3 v10 sarscov2_2000 t=32 md5=300dbffd1556 wall=19.9
+sc2k-v10-4 v10 sarscov2_2000 t=32 md5=e6734daa2634 wall=19.3
+sc2k-v10-5 v10 sarscov2_2000 t=32 md5=e6734daa2634 wall=19.0
+sc2k-v10-6 v10 sarscov2_2000 t=32 md5=e6734daa2634 wall=19.6
+sc2k-v10-7 v10 sarscov2_2000 t=32 md5=e6734daa2634 wall=19.3
+sc2k-v10-8 v10 sarscov2_2000 t=32 md5=e6734daa2634 wall=19.0
+sc2k-v10-9 v10 sarscov2_2000 t=32 md5=e6734daa2634 wall=19.6
+sc2k-v10-10 v10 sarscov2_2000 t=32 md5=300dbffd1556 wall=18.9
+sc2k-v10-11 v10 sarscov2_2000 t=32 md5=e6734daa2634 wall=19.1
+sc2k-v10-12 v10 sarscov2_2000 t=32 md5=300dbffd1556 wall=18.8
+sc2k-base-1 base sarscov2_2000 t=32 md5=e6734daa2634 wall=3802.2
+== end Sun Oct 18 09:09:15 PDT 2026
