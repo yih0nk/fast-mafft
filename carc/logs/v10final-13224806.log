@@ -1,0 +1,70 @@
+== rep 1 part std node a03-19.hpc.usc.edu Model name: AMD EPYC 7513 32-Core Processor gcc=13.3.0 start Sun Oct 18 03:31:16 PDT 2026
+== repo b35964d  Cpus_allowed_list: 0-31
+built base-aggr rc=0 	prefix=/scratch2/yihanhon/fm-v10/carc-results/v10final-13224806/base-aggr/libexec/mafft
+built v10-aggr rc=0 	prefix=/scratch2/yihanhon/fm-v10/carc-results/v10final-13224806/v10-aggr/libexec/mafft
+built base-default rc=0 	prefix=/scratch2/yihanhon/fm-v10/carc-results/v10final-13224806/base-default/libexec/mafft
+built v10-default rc=0 	prefix=/scratch2/yihanhon/fm-v10/carc-results/v10final-13224806/v10-default/libexec/mafft
+== IDENTITY, part std (reference = MAFFT v7.526 built with the default flags)
+sim1k.fa t=1 ref=85a82397cf39 v10def=85a82397cf39 v10aggr=85a82397cf39 ok
+sim1k.fa t=8 ref=85a82397cf39 v10def=85a82397cf39 v10aggr=85a82397cf39 ok
+sim1k.fa t=32 ref=85a82397cf39 v10def=85a82397cf39 v10aggr=85a82397cf39 ok
+rnasim579.fa t=1 ref=26b86f22a0b1 v10def=26b86f22a0b1 v10aggr=26b86f22a0b1 ok
+rnasim579.fa t=8 ref=26b86f22a0b1 v10def=26b86f22a0b1 v10aggr=26b86f22a0b1 ok
+rnasim579.fa t=32 ref=26b86f22a0b1 v10def=26b86f22a0b1 v10aggr=26b86f22a0b1 ok
+rnasim1k.fa t=1 ref=4ec80fa72d83 v10def=4ec80fa72d83 v10aggr=4ec80fa72d83 ok
+rnasim1k.fa t=8 ref=4ec80fa72d83 v10def=4ec80fa72d83 v10aggr=4ec80fa72d83 ok
+rnasim1k.fa t=32 ref=4ec80fa72d83 v10def=4ec80fa72d83 v10aggr=4ec80fa72d83 ok
+prot2k.fa t=1 ref=54420c021453 v10def=54420c021453 v10aggr=54420c021453 ok
+prot2k.fa t=8 ref=54420c021453 v10def=54420c021453 v10aggr=54420c021453 ok
+prot2k.fa t=32 ref=54420c021453 v10def=54420c021453 v10aggr=54420c021453 ok
+rnasim2k.fa t=1 ref=af6ae72412b3 v10def=af6ae72412b3 v10aggr=af6ae72412b3 ok
+rnasim2k.fa t=8 ref=af6ae72412b3 v10def=af6ae72412b3 v10aggr=af6ae72412b3 ok
+rnasim2k.fa t=32 ref=af6ae72412b3 v10def=af6ae72412b3 v10aggr=af6ae72412b3 ok
+edge.fa t=1 ref=cc0dbbde5397 v10def=cc0dbbde5397 v10aggr=cc0dbbde5397 ok
+edge.fa t=8 ref=cc0dbbde5397 v10def=cc0dbbde5397 v10aggr=cc0dbbde5397 ok
+edge_noshort.fa t=1 ref=776c3c8d33f6 v10def=776c3c8d33f6 v10aggr=776c3c8d33f6 ok
+edge_noshort.fa t=8 ref=4b1480a524ef v10def=4b1480a524ef v10aggr=4b1480a524ef ok
+16S.3.fa t=1 ref=6b646c6b3c1f v10def=6b646c6b3c1f v10aggr=6b646c6b3c1f ok
+16S.3.fa t=8 ref=6b646c6b3c1f v10def=6b646c6b3c1f v10aggr=6b646c6b3c1f ok
+-- self-checks (6-mer distances, MSA distances, guide tree; blockAlign2, FFT lags, anchors)
+rnasim1k.fa t=32 MAFFT_SEXTET=check MAFFT_MSADIST=check MAFFT_UPG=check MAFFT_BA2CHECK=1 MAFFT_ARLCHECK=1 MAFFT_FFTCHECK=1 ref=4ec80fa72d83 v10aggr=4ec80fa72d83 ok | sextetfast check passed: kind 1, simd level 2, 1000 rows, every pair's distance bitwise identical UPGMA check passed: n=1000 efffree=0, 999 merges, topol/len/dep and the matrix identical to the _mt version UPGMA check passed: n=1000 efffree=1, 999 merges, topol/len/dep and the matrix identical to the _mt version ARLCHECK: 13 lags scored in parallel in Falign verified, no mismatch ARLCHECK: 0 Falign_udpari_long calls, 0 lags, 0 vector builds verified, no mismatch FFTCHECK: 0 long transforms verified, no mismatch BA2CHECK: 1998 blockAlign2 calls verified, no mismatch 
+16S.T.fa t=32 MAFFT_SEXTET=check MAFFT_MSADIST=check MAFFT_UPG=check MAFFT_BA2CHECK=1 MAFFT_ARLCHECK=1 MAFFT_FFTCHECK=1 ref=f487c1a56702 v10aggr=f487c1a56702 ok | sextetfast check passed: kind 1, simd level 2, 7350 rows, every pair's distance bitwise identical UPGMA check passed: n=7350 efffree=0, 7349 merges, topol/len/dep and the matrix identical to the _mt version UPGMA check passed: n=7350 efffree=1, 7349 merges, topol/len/dep and the matrix identical to the _mt version ARLCHECK: 119 lags scored in parallel in Falign verified, no mismatch ARLCHECK: 0 Falign_udpari_long calls, 0 lags, 0 vector builds verified, no mismatch FFTCHECK: 6 long transforms verified, no mismatch BA2CHECK: 14579 blockAlign2 calls verified, no mismatch 
+homfam_aldosered.fa t=32 MAFFT_SEXTET=check MAFFT_MSADIST=check MAFFT_UPG=check MAFFT_BA2CHECK=1 MAFFT_ARLCHECK=1 MAFFT_FFTCHECK=1 ref=4843a24ee507 v10aggr=4843a24ee507 ok | sextetfast check passed: kind 4, simd level 2, 13277 rows, every pair's distance bitwise identical UPGMA check passed: n=13277 efffree=0, 13276 merges, topol/len/dep and the matrix identical to the _mt version UPGMA check passed: n=13277 efffree=1, 13276 merges, topol/len/dep and the matrix identical to the _mt version ARLCHECK: 0 Falign_udpari_long calls, 0 lags, 0 vector builds verified, no mismatch FFTCHECK: 0 long transforms verified, no mismatch BA2CHECK: 25664 blockAlign2 calls verified, no mismatch 
+-- BAliBASE 3.0 (fast-mafft default build vs reference, t=1 and t=8)
+== IDENTITY SUMMARY: 45 checks, 0 differ; BAliBASE 772 runs, 0 differ
+== TIMING rep 1 part std, --thread 32, baseline then fast-mafft on each input (same node)
+baseAggr-r1 sim1k t=32 wall=5.8 maxrss_gb=0.67 md5=85a82397cf39 exit=0 stages=6mer:0.0,prog1:2.5,distmsa:0.1,prog2:2.6
+v10aggr-r1 sim1k t=32 wall=1.2 maxrss_gb=1.93 md5=85a82397cf39 exit=0 stages=6mer:0.0,prog1:0.4,distmsa:0.0,prog2:0.4
+baseAggr-r1 rnasim1k t=32 wall=10.4 maxrss_gb=0.87 md5=4ec80fa72d83 exit=0 stages=6mer:0.0,prog1:5.7,distmsa:0.2,prog2:4.1
+v10aggr-r1 rnasim1k t=32 wall=2.0 maxrss_gb=2.32 md5=4ec80fa72d83 exit=0 stages=6mer:0.0,prog1:0.9,distmsa:0.0,prog2:0.7
+baseAggr-r1 prot2k t=32 wall=1.6 maxrss_gb=0.32 md5=54420c021453 exit=0 stages=6mer:0.0,prog1:0.6,distmsa:0.0,prog2:0.6
+v10aggr-r1 prot2k t=32 wall=0.6 maxrss_gb=0.82 md5=54420c021453 exit=0 stages=6mer:0.0,prog1:0.2,distmsa:0.0,prog2:0.2
+baseAggr-r1 sim2k t=32 wall=12.0 maxrss_gb=0.97 md5=f9b5e4a733ca exit=0 stages=6mer:0.0,prog1:5.8,distmsa:0.1,prog2:5.5
+v10aggr-r1 sim2k t=32 wall=1.7 maxrss_gb=2.39 md5=f9b5e4a733ca exit=0 stages=6mer:0.0,prog1:0.8,distmsa:0.0,prog2:0.6
+baseAggr-r1 rnasim2k t=32 wall=19.7 maxrss_gb=1.76 md5=af6ae72412b3 exit=0 stages=6mer:0.0,prog1:11.4,distmsa:0.1,prog2:7.5
+v10aggr-r1 rnasim2k t=32 wall=2.7 maxrss_gb=2.54 md5=af6ae72412b3 exit=0 stages=6mer:0.0,prog1:1.5,distmsa:0.0,prog2:0.9
+baseAggr-r1 rnasim5k t=32 wall=44.1 maxrss_gb=2.85 md5=455da94efd24 exit=0 stages=6mer:0.2,prog1:23.2,distmsa:1.6,prog2:16.1
+v10aggr-r1 rnasim5k t=32 wall=4.4 maxrss_gb=3.13 md5=455da94efd24 exit=0 stages=6mer:0.0,prog1:2.0,distmsa:0.0,prog2:1.7
+baseAggr-r1 rnasim10k t=32 wall=94.0 maxrss_gb=5.75 md5=5e7bb28c8e8e exit=0 stages=6mer:1.4,prog1:52.9,distmsa:3.1,prog2:25.4
+v10aggr-r1 rnasim10k t=32 wall=7.8 maxrss_gb=3.68 md5=5e7bb28c8e8e exit=0 stages=6mer:0.0,prog1:3.6,distmsa:0.3,prog2:2.8
+baseAggr-r1 16S.T t=32 wall=58.0 maxrss_gb=3.64 md5=f487c1a56702 exit=0 stages=6mer:0.6,prog1:23.6,distmsa:8.0,prog2:18.2
+v10aggr-r1 16S.T t=32 wall=5.0 maxrss_gb=4.02 md5=f487c1a56702 exit=0 stages=6mer:0.0,prog1:2.1,distmsa:0.3,prog2:1.9
+baseAggr-r1 16S.3 t=32 wall=46.5 maxrss_gb=3.15 md5=6b646c6b3c1f exit=0 stages=6mer:0.4,prog1:23.9,distmsa:0.6,prog2:15.8
+v10aggr-r1 16S.3 t=32 wall=3.9 maxrss_gb=2.95 md5=6b646c6b3c1f exit=0 stages=6mer:0.0,prog1:1.6,distmsa:0.1,prog2:1.5
+baseAggr-r1 homfam_p450 t=32 wall=139.3 maxrss_gb=2.46 md5=a8da25a0a301 exit=0 stages=6mer:12.5,prog1:63.6,distmsa:14.9,prog2:42.2
+v10aggr-r1 homfam_p450 t=32 wall=6.5 maxrss_gb=2.59 md5=a8da25a0a301 exit=0 stages=6mer:0.6,prog1:2.2,distmsa:0.9,prog2:2.0
+baseAggr-r1 rnasim20k t=32 wall=230.1 maxrss_gb=12.30 md5=89f21e3ddf15 exit=0 stages=6mer:12.2,prog1:70.1,distmsa:71.6,prog2:46.7
+v10aggr-r1 rnasim20k t=32 wall=17.2 maxrss_gb=4.91 md5=89f21e3ddf15 exit=0 stages=6mer:1.0,prog1:5.0,distmsa:4.0,prog2:5.4
+baseAggr-r1 16S.B.ALL t=32 wall=505.0 maxrss_gb=3.83 md5=8a066cfcbfbe exit=0 stages=6mer:45.0,prog1:198.6,distmsa:70.8,prog2:152.1
+v10aggr-r1 16S.B.ALL t=32 wall=17.5 maxrss_gb=4.41 md5=8a066cfcbfbe exit=0 stages=6mer:1.4,prog1:7.4,distmsa:2.8,prog2:3.9
+baseAggr-r1 homfam_sdr t=32 wall=267.9 maxrss_gb=9.96 md5=4d0ab395b00f exit=0 stages=6mer:85.3,prog1:40.3,distmsa:100.0,prog2:32.3
+v10aggr-r1 homfam_sdr t=32 wall=11.9 maxrss_gb=10.26 md5=4d0ab395b00f exit=0 stages=6mer:2.5,prog1:2.5,distmsa:3.8,prog2:2.0
+baseAggr-r1 homfam_Acetyltransf t=32 wall=173.1 maxrss_gb=8.47 md5=f9d7882de1bf exit=0 stages=6mer:55.9,prog1:22.1,distmsa:74.1,prog2:15.4
+v10aggr-r1 homfam_Acetyltransf t=32 wall=8.9 maxrss_gb=8.65 md5=f9d7882de1bf exit=0 stages=6mer:2.1,prog1:1.3,distmsa:3.4,prog2:0.8
+baseAggr-r1 rnasim25k t=32 wall=1183.5 maxrss_gb=4.00 md5=ce1f97d60307 exit=0 stages=6mer:23.9,prog1:586.8,distmsa:43.9,prog2:488.0
+v10aggr-r1 rnasim25k t=32 wall=27.8 maxrss_gb=4.51 md5=ce1f97d60307 exit=0 stages=6mer:1.1,prog1:10.6,distmsa:5.7,prog2:8.2
+baseAggr-r1 homfam_rvp t=32 wall=878.5 maxrss_gb=33.00 md5=a6774caadc06 exit=0 stages=6mer:372.6,prog1:35.7,distmsa:440.4,prog2:18.7
+v10aggr-r1 homfam_rvp t=32 wall=26.1 maxrss_gb=33.17 md5=a6774caadc06 exit=0 stages=6mer:8.2,prog1:3.8,distmsa:11.7,prog2:1.0
+baseAggr-r1 rnasim50k t=32 wall=2512.2 maxrss_gb=12.59 md5=47bb47d38946 exit=0 stages=6mer:164.4,prog1:976.8,distmsa:417.9,prog2:857.0
+v10aggr-r1 rnasim50k t=32 wall=70.6 maxrss_gb=12.94 md5=47bb47d38946 exit=0 stages=6mer:4.1,prog1:24.5,distmsa:22.2,prog2:15.6
+== end Sun Oct 18 05:53:10 PDT 2026

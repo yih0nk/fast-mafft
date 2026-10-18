@@ -1,0 +1,22 @@
+== rep 3 part long node b10-03.hpc.usc.edu Model name: AMD EPYC 7513 32-Core Processor gcc=13.3.0 start Sun Oct 18 03:31:16 PDT 2026
+== repo b35964d  Cpus_allowed_list: 0-31
+built base-aggr rc=0 	prefix=/scratch2/yihanhon/fm-v10/carc-results/v10final-13224811/base-aggr/libexec/mafft
+built v10-aggr rc=0 	prefix=/scratch2/yihanhon/fm-v10/carc-results/v10final-13224811/v10-aggr/libexec/mafft
+== TIMING rep 3 part long, --thread 32, baseline then fast-mafft on each input (same node)
+baseAggr-r3 sarscov2_500 t=32 wall=28.7 maxrss_gb=0.71 md5=e8be67d631bc exit=0 stages=6mer:0.0,prog1:16.7,distmsa:0.0,prog2:10.9
+v10aggr-r3 sarscov2_500 t=32 wall=2.4 maxrss_gb=1.55 md5=e8be67d631bc exit=0 stages=6mer:0.0,prog1:1.0,distmsa:0.0,prog2:0.9
+baseAggr-r3 sarscov2_1000 t=32 wall=48.6 maxrss_gb=1.37 md5=3b000a61e12a exit=0 stages=6mer:0.0,prog1:28.6,distmsa:0.3,prog2:17.8
+v10aggr-r3 sarscov2_1000 t=32 wall=4.3 maxrss_gb=1.97 md5=3b000a61e12a exit=0 stages=6mer:0.0,prog1:1.7,distmsa:0.1,prog2:1.4
+baseAggr-r3 edge t=32 wall=80.1 maxrss_gb=5.98 md5=cc0dbbde5397 exit=0 stages=6mer:0.0,prog1:34.3,distmsa:0.1,prog2:45.0
+v10aggr-r3 edge t=32 wall=5.5 maxrss_gb=5.64 md5=cc0dbbde5397 exit=0 stages=6mer:0.0,prog1:2.8,distmsa:0.0,prog2:2.5
+baseAggr-r3 long100x30k t=32 wall=325.1 maxrss_gb=0.44 md5=337e5ebd176c exit=0 stages=6mer:0.0,prog1:161.5,distmsa:0.0,prog2:162.7
+v10aggr-r3 long100x30k t=32 wall=9.3 maxrss_gb=0.76 md5=337e5ebd176c exit=0 stages=6mer:0.0,prog1:4.8,distmsa:0.0,prog2:4.3
+baseAggr-r3 long1000x30k t=32 wall=940.4 maxrss_gb=0.93 md5=25999048f8b2 exit=0 stages=6mer:0.0,prog1:483.3,distmsa:0.0,prog2:454.4
+v10aggr-r3 long1000x30k t=32 wall=23.6 maxrss_gb=1.33 md5=25999048f8b2 exit=0 stages=6mer:0.0,prog1:11.5,distmsa:0.0,prog2:11.0
+baseAggr-r3 long300x50k t=32 wall=2050.9 maxrss_gb=0.57 md5=edb16ecc771b exit=0 stages=6mer:0.0,prog1:1016.4,distmsa:0.0,prog2:1031.9
+v10aggr-r3 long300x50k t=32 wall=32.3 maxrss_gb=1.50 md5=edb16ecc771b exit=0 stages=6mer:0.0,prog1:16.9,distmsa:0.0,prog2:14.3
+baseAggr-r3 long500x30k t=32 wall=1624.3 maxrss_gb=0.78 md5=2c2158b4d42d exit=0 stages=6mer:0.0,prog1:815.0,distmsa:0.0,prog2:807.4
+v10aggr-r3 long500x30k t=32 wall=42.1 maxrss_gb=1.41 md5=2c2158b4d42d exit=0 stages=6mer:0.0,prog1:20.5,distmsa:0.0,prog2:20.6
+baseAggr-r3 sarscov2_2000 t=32 wall=3820.2 maxrss_gb=2.87 md5=e6734daa2634 exit=0 stages=6mer:0.0,prog1:2325.9,distmsa:0.0,prog2:1488.7
+v10aggr-r3 sarscov2_2000 t=32 wall=18.2 maxrss_gb=2.71 md5=e6734daa2634 exit=0 stages=6mer:0.0,prog1:10.4,distmsa:0.0,prog2:6.0
+== end Sun Oct 18 06:02:45 PDT 2026

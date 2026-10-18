@@ -1,0 +1,47 @@
+== rep 1 part long node a03-19.hpc.usc.edu Model name: AMD EPYC 7513 32-Core Processor gcc=13.3.0 start Sun Oct 18 03:31:16 PDT 2026
+== repo b35964d  Cpus_allowed_list: 32-63
+built base-aggr rc=0 	prefix=/scratch2/yihanhon/fm-v10/carc-results/v10final-13224807/base-aggr/libexec/mafft
+built v10-aggr rc=0 	prefix=/scratch2/yihanhon/fm-v10/carc-results/v10final-13224807/v10-aggr/libexec/mafft
+built base-default rc=0 	prefix=/scratch2/yihanhon/fm-v10/carc-results/v10final-13224807/base-default/libexec/mafft
+built v10-default rc=0 	prefix=/scratch2/yihanhon/fm-v10/carc-results/v10final-13224807/v10-default/libexec/mafft
+== IDENTITY, part long (reference = MAFFT v7.526 built with the default flags)
+-- strict one-thread identity, real SARS-CoV-2 collections
+sarscov2_500.fa t=1 ref=e8be67d631bc v10def=e8be67d631bc v10aggr=e8be67d631bc ok
+sarscov2_1000.fa t=1 ref=3b000a61e12a v10def=3b000a61e12a v10aggr=3b000a61e12a ok
+-- long-genome sets (switch to MAFFT's memsave mode in the first steps of pass 1, or mid-pass for viral100)
+long10x30k.fa t=1 ref=b58c025c0b56 v10def=b58c025c0b56 v10aggr=b58c025c0b56 ok
+long10x30k.fa t=8 ref=b58c025c0b56 v10def=b58c025c0b56 v10aggr=b58c025c0b56 ok
+long30x30k.fa t=1 ref=f891671c076c v10def=f891671c076c v10aggr=f891671c076c ok
+long30x30k.fa t=8 ref=f891671c076c v10def=f891671c076c v10aggr=f891671c076c ok
+viral100.fa t=1 ref=4f9775f500b2 v10def=4f9775f500b2 v10aggr=4f9775f500b2 ok
+viral100.fa t=8 ref=1e80180224db v10def=4f9775f500b2 v10aggr=4f9775f500b2 ok V10DEF-DIFF V10AGG-DIFF
+-- self-checks: blockAlign2, the long FFTs, anchors and lags; Myers-Miller calls and recursion nodes
+sarscov2_500.fa t=8 MAFFT_BA2CHECK=1 MAFFT_FFTCHECK=1 MAFFT_ARLCHECK=1 ref=e8be67d631bc v10aggr=e8be67d631bc ok | ARLCHECK: 382 lags scored in parallel in Falign verified, no mismatch ARLCHECK: 0 Falign_udpari_long calls, 0 lags, 0 vector builds verified, no mismatch FFTCHECK: 2994 long transforms verified, no mismatch BA2CHECK: 998 blockAlign2 calls verified, no mismatch 
+sarscov2_1000.fa t=8 MAFFT_BA2CHECK=1 MAFFT_FFTCHECK=1 MAFFT_ARLCHECK=1 ref=3b000a61e12a v10aggr=3b000a61e12a ok | ARLCHECK: 198 lags scored in parallel in Falign verified, no mismatch ARLCHECK: 0 Falign_udpari_long calls, 0 lags, 0 vector builds verified, no mismatch FFTCHECK: 5994 long transforms verified, no mismatch BA2CHECK: 1998 blockAlign2 calls verified, no mismatch 
+sarscov2_500.fa t=32 MAFFT_BA2CHECK=1 MAFFT_FFTCHECK=1 MAFFT_ARLCHECK=1 ref=e8be67d631bc v10aggr=e8be67d631bc ok | ARLCHECK: 940 lags scored in parallel in Falign verified, no mismatch ARLCHECK: 0 Falign_udpari_long calls, 0 lags, 0 vector builds verified, no mismatch FFTCHECK: 2994 long transforms verified, no mismatch BA2CHECK: 998 blockAlign2 calls verified, no mismatch 
+long30x30k.fa t=32 MAFFT_MSKCHECK=1 MAFFT_MSCHECK=1 MAFFT_ARLCHECK=1 MAFFT_FFTCHECK=1 MAFFT_BA2CHECK=1 ref=f891671c076c v10aggr=f891671c076c ok | ARLCHECK: 58 Falign_udpari_long calls, 29000 lags, 116 vector builds verified, no mismatch MSCHECK: 3334 MSalignmm calls (9826 rows) verified against the original, no mismatch MSKCHECK: 22012 nodes' sweeps verified against the original loops, no mismatch FFTCHECK: 174 long transforms verified, no mismatch BA2CHECK: 58 blockAlign2 calls verified, no mismatch 
+-- every SIMD level (runtime dispatch), long10x30k at one thread
+long10x30k.fa t=1 MAFFT_SIMD=scalar MAFFT_MSCHECK=1 ref=b58c025c0b56 v10aggr=b58c025c0b56 ok | MSCHECK: 1156 MSalignmm calls (3102 rows) verified against the original, no mismatch 
+long10x30k.fa t=1 MAFFT_SIMD=sse2 MAFFT_MSCHECK=1 ref=b58c025c0b56 v10aggr=b58c025c0b56 ok | MSCHECK: 1156 MSalignmm calls (3102 rows) verified against the original, no mismatch 
+long10x30k.fa t=1 MAFFT_SIMD=avx2 MAFFT_MSCHECK=1 ref=b58c025c0b56 v10aggr=b58c025c0b56 ok | MSCHECK: 1156 MSalignmm calls (3102 rows) verified against the original, no mismatch 
+== IDENTITY SUMMARY: 23 checks, 2 differ
+== TIMING rep 1 part long, --thread 32, baseline then fast-mafft on each input (same node)
+baseAggr-r1 sarscov2_500 t=32 wall=28.7 maxrss_gb=0.78 md5=e8be67d631bc exit=0 stages=6mer:0.0,prog1:16.4,distmsa:0.0,prog2:10.9
+v10aggr-r1 sarscov2_500 t=32 wall=2.5 maxrss_gb=1.55 md5=e8be67d631bc exit=0 stages=6mer:0.0,prog1:1.0,distmsa:0.0,prog2:0.9
+baseAggr-r1 sarscov2_1000 t=32 wall=48.6 maxrss_gb=1.13 md5=3b000a61e12a exit=0 stages=6mer:0.0,prog1:28.5,distmsa:0.3,prog2:17.7
+v10aggr-r1 sarscov2_1000 t=32 wall=3.9 maxrss_gb=1.94 md5=3b000a61e12a exit=0 stages=6mer:0.0,prog1:1.5,distmsa:0.1,prog2:1.4
+baseAggr-r1 edge t=32 wall=79.3 maxrss_gb=6.11 md5=cc0dbbde5397 exit=0 stages=6mer:0.0,prog1:34.3,distmsa:0.1,prog2:44.2
+v10aggr-r1 edge t=32 wall=5.4 maxrss_gb=5.22 md5=cc0dbbde5397 exit=0 stages=6mer:0.0,prog1:2.7,distmsa:0.0,prog2:2.3
+baseAggr-r1 long100x30k t=32 wall=328.1 maxrss_gb=0.39 md5=337e5ebd176c exit=0 stages=6mer:0.0,prog1:163.4,distmsa:0.0,prog2:163.7
+v10aggr-r1 long100x30k t=32 wall=8.8 maxrss_gb=0.78 md5=337e5ebd176c exit=0 stages=6mer:0.0,prog1:4.0,distmsa:0.0,prog2:4.3
+baseAggr-r1 long1000x30k t=32 wall=937.2 maxrss_gb=0.90 md5=25999048f8b2 exit=0 stages=6mer:0.0,prog1:480.9,distmsa:0.0,prog2:453.5
+v10aggr-r1 long1000x30k t=32 wall=22.5 maxrss_gb=1.49 md5=25999048f8b2 exit=0 stages=6mer:0.0,prog1:11.2,distmsa:0.0,prog2:10.3
+baseAggr-r1 long300x50k t=32 wall=2056.4 maxrss_gb=0.62 md5=edb16ecc771b exit=0 stages=6mer:0.0,prog1:1014.2,distmsa:0.0,prog2:1039.6
+v10aggr-r1 long300x50k t=32 wall=26.2 maxrss_gb=1.49 md5=edb16ecc771b exit=0 stages=6mer:0.0,prog1:12.9,distmsa:0.0,prog2:12.3
+baseAggr-r1 long500x30k t=32 wall=1635.1 maxrss_gb=0.77 md5=2c2158b4d42d exit=0 stages=6mer:0.0,prog1:820.6,distmsa:0.0,prog2:812.8
+v10aggr-r1 long500x30k t=32 wall=37.5 maxrss_gb=1.47 md5=2c2158b4d42d exit=0 stages=6mer:0.0,prog1:18.1,distmsa:0.0,prog2:18.7
+baseAggr-r1 sarscov2_2000 t=32 wall=3800.2 maxrss_gb=3.00 md5=e6734daa2634 exit=0 stages=6mer:0.0,prog1:2307.4,distmsa:0.3,prog2:1487.2
+v10aggr-r1 sarscov2_2000 t=32 wall=18.9 maxrss_gb=2.78 md5=300dbffd1556 exit=0 stages=6mer:0.0,prog1:10.7,distmsa:0.2,prog2:6.2
+baseAgain-r1 sarscov2_2000 t=32 wall=3805.7 maxrss_gb=2.87 md5=e6734daa2634 exit=0 stages=6mer:0.0,prog1:2312.8,distmsa:0.2,prog2:1487.6
+v10Again-r1 sarscov2_2000 t=32 wall=19.0 maxrss_gb=2.83 md5=e6734daa2634 exit=0 stages=6mer:0.0,prog1:10.7,distmsa:0.1,prog2:5.8
+== end Sun Oct 18 07:33:49 PDT 2026
