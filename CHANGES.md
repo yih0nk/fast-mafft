@@ -1,7 +1,9 @@
-# fast-mafft v9: what changed, and why the output is still byte-identical
+# fast-mafft v10: what changed, and why the output is still byte-identical
 
-This document explains every optimization in fast-mafft v9, stage by stage. For each one it covers
-what MAFFT v7.526 does, what v9 does instead, why the alignment printed on stdout cannot change, and
+This document explains every optimization in fast-mafft, stage by stage. §1–§7 are v9, which covers
+every stage of MAFFT's default mode; §8 is v10, which adds alignments wider than 30,000 columns (long
+genomes) and collections of near-identical genomes. For each change it covers what MAFFT v7.526 does,
+what fast-mafft does instead, why the alignment printed on stdout cannot change, and
 what the change measured. All numbers are copied from the project's lever notes (`notes/*.md`), with
 the machine stated: "M5" is the development Mac (Apple M5, 4 performance + 6 efficiency cores,
 clang); "CARC" is a USC CARC node (AMD EPYC 7513, gcc 13.3, `--thread 32`). The final CARC
@@ -712,7 +714,208 @@ rnasim50k took 87.6 s. RESULTS.md has the final runs.
 
 ---
 
-## 8. Bugs found and fixed along the way
+## 8. v10: long genomes and near-identical genome collections
+
+v9 was built and timed on alignments of up to a few thousand columns. Two kinds of input it left at
+about MAFFT's own speed:
+
+- **Alignments wider than 30,000 columns** (long genomes, or shorter sequences with long unaligned
+  stretches). Past 30,000 columns MAFFT switches every later merge to its memory-saving aligners,
+  `Falign_udpari_long` and `MSalignmm`, which v9 never touched. v9 was 1.0–1.2× there.
+- **Collections of near-identical genomes**, such as SARS-CoV-2. They stay just under 30,000 columns
+  (29,875 for 500 genomes) and use v9's ordinary path, but each merge finds about 200 FFT anchors, and
+  the merges form a deep chain (129 steps per pass for 500 genomes). On CARC, v9 was 3.4× on 500
+  genomes and 4.6× on 1,000.
+
+v10 = v9 + the changes below, in six files (`MSalignmm.c`, `Falign.c`, `fftFunctions.c`, `fft.c`,
+`disttbfast.c`, `functions.h`). Every change keeps the rules of §0.4, and each new kernel has a bitwise
+self-check in the normal build (§8.7).
+
+### 8.1 Myers-Miller (`MSalignmm`)
+
+**What MAFFT does.** `MSalignmm` is a Myers-Miller (Hirschberg) divide and conquer: a forward and a
+backward DP sweep find the midpoint of the optimal path, and the two halves recurse. Its cells are
+branchy (data-dependent `if`s, an `i == imid` test per cell); every row recomputes a 26×26 match table
+after a `calloc`; every recursion node allocates and zeroes work arrays of (max length) × 26. It runs on
+one thread. On 30 genomes of 30 kb at one thread it is 70% of the run.
+
+**What v10 does.**
+
+- **Match scores** come from a table per call (per row of profile 1, per letter of profile 2) and its
+  transpose, built once. Each score is the same chain of `match_calc` terms.
+- **Cells.** The forward and backward rows run fused, branch-free kernels: the original's four
+  candidates and selects, without the jump bookkeeping that only rows `imid`, `imid−1` and `jumpi`
+  need; those rows run the original statements. On x86, 4 cells per AVX2 step (2 per SSE2 step), with
+  runtime dispatch; the selects are `maxpd`, and the row carry is a "later element wins ties" prefix
+  maximum inside the vector. ARM keeps the scalar kernel.
+- **Parallel divide and conquer.** The two halves of a node are independent; idle helper threads take
+  them from a per-call task stack. The gap tables are joined in order at the end, and the score is
+  summed in the original order.
+- **Parallel sweeps.** In large nodes the forward and backward sweeps are split into up to 16 bands of
+  at least 1,024 columns that run as a wavefront: band b computes row i after band b−1 has published
+  that row's last value and row carry.
+- **Output.** The recursion now produces only the two gap tables; the rows are made from them at the
+  end, in parallel by rows (`gapireru` of each input row, which is what the recursion writes piece by
+  piece).
+- The full-DP leaf (`MSalignmm_tanni`, nodes under 100 rows or columns) and the profile set-up
+  (`cpmx_calc_new`, gap counts) are ported the same way.
+
+### 8.2 The anchor search of `Falign_udpari_long`
+
+**What MAFFT does.** For each of up to 500 candidate FFT lags (`NKOUHO_LONG`), `alignableReagion`
+rebuilds the per-column profiles of both groups, O((c1 + c2) × L) per lag. The early exit on a lag
+without anchors is commented out there, so all 500 lags run. On low-divergence long genomes this is
+70% of the run. `getKouho` picks the 500 best lags with 500 passes over the correlation array.
+
+**What v10 does.**
+
+- The profiles are built once per call, and the nonzero entries of each column are kept as compressed
+  rows. The 500 lags are scored by idle helpers in parallel, each into its own segment buffer, and the
+  segments are taken over in lag order, exactly as the original loop finds them (with the same
+  `TOO MANY SEGMENTS` check).
+- `getKouho_fast` picks the 500 best lags in one pass with a bounded heap. Its order (value
+  descending, index ascending) and its padding when fewer than 500 values qualify are those of the
+  original's 500 rounds.
+- No row copies for the FFT input (the rows were only read); the input vectors are built by column
+  ranges, and the two forward transforms run at the same time.
+- A single segment covering both groups is aligned in place. Otherwise the segment results are
+  appended at their offsets (not with `strcat`, which is quadratic) in a per-thread arena, instead of
+  four `clus × alloclen` matrices allocated per call.
+- The original stays, as `Falign_udpari_long_orig`, for constraints and scoring-matrix sets.
+
+### 8.3 Threads in MAFFT's in-order dispatch
+
+Once a pass switches to the memsave mode it runs in MAFFT's in-order dispatch (§3.6). There, a thread
+that finds every step handed out exits, so the largest merges, near the root, ran on one thread.
+
+- Such threads now stay as helpers until the root step is done. They help inside the steps still
+  running (§8.1, §8.2).
+- At `--thread` above 16, the in-order dispatch also starts helper-only threads (MAFFT's dispatch uses
+  16 threads there). They never take a step.
+- Which thread takes which step, in which order, and when each step checks the switch, is MAFFT's.
+
+### 8.4 When the switch fires: a race in MAFFT, and the fix
+
+In MAFFT's in-order dispatch a thread claims the next step under the mutex, checks there whether a
+child is wider than 30,000 columns (if so it sets `alg = 'M'`), copies the member rows, unlocks, and
+only then reads `alg` to choose `Falign` or `Falign_udpari_long`. When the switch fires at one of the
+first steps, whether the steps already claimed read 'A' or 'M' depends on timing. MAFFT's row copies
+inside the mutex serialize the claims, so one outcome dominates; v9 moved the row copies out of the
+mutex, which made the others common. On the development Mac, at `--thread 10`, `long500x30k` then gave
+an md5 different from MAFFT's (tallies of the first 8 steps of pass 1 over repeated runs: MAFFT
+`AAAMMMMM` in 14 of 22 runs, v10 before the fix `MMMMMMMM` in 8 of 17).
+
+**The fix.** Each step reads `alg` under the mutex, right after the switch check. Because `alg` only
+goes from 'A' to 'M', and only under this mutex, that value is one MAFFT's own step can read; it is the
+outcome MAFFT's serialized claims make dominant (after the fix: `AAAMMMMM` in 5 of 5 runs). And a pass
+with an input sequence longer than 30,000 starts in the in-order dispatch at once, as MAFFT does,
+instead of first trying the ready queue (the switch is certain there).
+
+**What remains: a switch in the middle of a pass.** When the switch fires late in a pass, while
+other steps are in flight (the `viral100` set, or 2,000 SARS-CoV-2 genomes), which of those steps read
+'M' at the top level, and which of their Falign segments (each segment reads `alg` again) use the long
+aligner, depends on timing. MAFFT itself then varies: on CARC, `viral100` at 32 threads gave two
+different outputs in four runs. Usually, though, one outcome wins on a given machine, because MAFFT's
+steps near the switch take about the same time from run to run (`viral100` at 8 threads: 8 of 8 runs
+alike; `sarscov2_2000` at 32: 5 of 5). fast-mafft keeps MAFFT's dispatch and its per-segment reads, so
+the same mechanism decides its output, and every run switches at the same step as MAFFT. But it runs
+those steps 20–200 times faster, by different factors for different steps, so the race has different
+odds: `sarscov2_2000` at 32 threads gave MAFFT's usual output in 11 of 16 runs, `viral100` at 8 threads
+in 6 of 8. Reproducing MAFFT's usual outcome every time would mean reproducing MAFFT's relative step
+timings, which a faster program cannot do. At `--thread 1` there is no race and the output is
+identical. VERIFICATION.md §3 has the measurements.
+
+### 8.5 Near-identical genomes: the ordinary Falign path
+
+One step of the critical chain on 500 SARS-CoV-2 genomes took about 38 ms on the Mac at 10 threads:
+three FFTs of 32,768 points (~5 ms), `blockAlign2` (~6 ms) and about 200 small segment DPs run one
+after another (~21 ms).
+
+- **`blockAlign2`** (the anchor chaining DP). `permit()` always returns 0, so in its two inner k-loops
+  every k other than 0 is skipped unless j (or i) is the last cut point. The loops now stop after
+  k = 0 in that case: the same k, in the same order, with the same comparisons. O(ncut²) instead of
+  O(ncut³).
+- **The long FFT** (`fft.c`, 16,384 points or more). After the bit reversal, each stage's butterflies
+  run block by block, with the stage's twiddles copied into two contiguous arrays, instead of twiddle
+  by twiddle with a stride of 2k through the whole vector. Same butterflies, same operands; the
+  butterflies of a stage touch disjoint elements, so their order inside a stage does not matter.
+  32,768 points: 0.80 → 0.26 ms on the Mac. Below 16,384 points the original order is kept.
+- **Parallel segments.** A call with at least 16 anchors aligns its segments in parallel by default,
+  largest DP first. Each segment's inputs are columns of the original rows and the gap states at its
+  cut points, so it can be aligned anywhere, any time, into its own buffer. The outputs are
+  concatenated in segment order straight into the rows, and the score is summed in segment order.
+  (v9 had this code but off by default, because of its memory; it now uses the per-thread row arena.)
+- **The first two candidate lags at once.** Falign scores its FFT lags one by one and stops at the first
+  that yields no segment; on these genomes that is the second. With an idle helper the first two are
+  scored at the same time, the second by the helper, and the loop takes their segments over where it
+  would have scored them.
+- `getKouho_fast` (§8.2) also replaces Falign's `getKouho`.
+
+### 8.6 Memory: a pool for the large per-thread arenas
+
+Each thread kept its Falign row arena and its member-row block at the size of the largest step it had
+run. On the critical chain the big steps run one after another on whichever thread is free, so every
+thread ended up holding arenas for the largest groups: peak RSS on CARC was 2.4 / 3.3 GB on 500 / 1,000
+SARS-CoV-2 genomes, against MAFFT's 0.8 / 1.3 GB. Now a thread gives an arena of 4 MB or more back to a
+small shared pool when its step ends, and the next step, on any thread, takes the best-fitting pooled
+block. At most two blocks stay pooled; the pool is emptied when a pass ends.
+
+### 8.7 Why the output is identical, and the self-checks
+
+- **Match scores** (§8.1): the table entries keep the original statements and orders. Terms left out
+  (letters of zero weight) or added (padding to 4 letters) are `x * 0.0` added to a sum that starts at
+  +0.0 and cannot become −0.0, so they are exact no-ops (§0.4, rule 3).
+- **Cells**: the same four candidates, each `a + b * c` one statement, compared in the same order with
+  the same strictness. `maxpd` returns its first operand only when it is strictly larger, which is the
+  scalar select lane by lane. The row carry is a running "later wins ties" maximum, which is
+  associative on non-NaN values, so the in-vector scan gives every lane the scalar loop's value bit for
+  bit (values are selected, never recomputed).
+- **Bands and halves**: a band reads only its own columns plus its neighbour's published value and
+  carry; no column is written by two bands. A node's halves depend only on its own sweeps; the gap
+  tables and the score are joined in the original order.
+- **Anchors, lags, blockAlign2, FFT, segments**: the same terms in the same order; the parallel pieces
+  are consumed in the original order (§8.2, §8.5). The skipped `blockAlign2` iterations did nothing.
+- **Scheduling** (§8.3, §8.4): the claims, their order and the switch check are MAFFT's; extra threads
+  only help inside steps.
+- **Pool** (§8.6): only where buffers live changes.
+
+Self-checks in the normal build (each exits with a `MISMATCH` message on any difference):
+
+| variable | what it recomputes the original way |
+|---|---|
+| `MAFFT_MSCHECK=1` | every `MSalignmm` call (score, both gap tables, every row) and the fused profiles |
+| `MAFFT_MSKCHECK=1` | every recursion node's sweeps (midpoint, jumps, split) |
+| `MAFFT_ARLCHECK=1` | every lag's segments, the lag lists, the FFT input vectors, the helper-scored lags |
+| `MAFFT_BA2CHECK=1` | every `blockAlign2` call |
+| `MAFFT_FFTCHECK=1` | every transform of 16,384 points or more |
+
+Switches for A/B tests: `MAFFT_MSFAST=0` and `MAFFT_UDLV10=0` (the original memsave code),
+`MAFFT_PSEG=0` (sequential segments), `MAFFT_LAG2=0`.
+
+### 8.8 Measured
+
+Final CARC evaluation (RESULTS.md §3), `--thread 32`, mean of 3 runs, against MAFFT v7.526 built with
+`-O3 -march=native -flto`:
+
+| input | MAFFT (s) | v9 | v10 (s) | v10 speedup |
+|---|---:|---|---:|---:|
+| sarscov2_500 (500 real genomes) | 28.7 | 3.4x (v9's path, job 13159523) | 2.5 | 11.6x |
+| sarscov2_1000 | 48.6 | 4.6x (v9's path, job 13159523) | 4.1 | 11.8x |
+| sarscov2_2000 (switch in pass 1) | 3,810 | not run | 18.6 | 205x |
+| edge (59–66 k columns) | 79.8 | 1.2x (Mac, 10 threads) | 5.4 | 14.9x |
+| long100x30k | 326 | 1.1x (Mac, 10 threads) | 9.0 | 36.4x |
+| long1000x30k | 940 | | 23.1 | 40.8x |
+| long500x30k | 1,633 | | 39.8 | 41.2x |
+| long300x50k | 2,061 | | 28.5 | 72.8x |
+
+The changes of §8.5 also apply to ordinary inputs: on the 12 datasets of the v9 evaluation, v10's
+mean speedups are 10.1x–43.9x against v9's 9.7x–36.2x, and its slowest run 9.98x against 8.3x.
+Single steps, on the Mac at 10 threads: a late chain step of sarscov2_500 from ~38 ms to ~5.3 ms; the
+critical path of its pass 1 from 4.91 s to 1.16 s.
+
+---
+
+## 9. Bugs found and fixed along the way
 
 1. **The memsave switch under the ready queue** (found by the sextet lever, fixed in prog2 and, above
    20,000, in largen).
@@ -740,21 +943,35 @@ rnasim50k took 87.6 s. RESULTS.md has the final runs.
    - `Salignmm.c` now defines `_GNU_SOURCE` before its includes, as `disttbfast.c` already did.
 5. **A thread-local variable in the tiled DP's band-0 row setup** (found by `MAFFT_TILECHECK`, prog3
    lever). Fixed before merging.
+6. **The aligner read after the unlock** (found by the v10 lever on the Mac, `--thread 10`).
+   - v9's shorter critical section changed which outcome of MAFFT's own race (the steps claimed just
+     before the memsave switch read 'A' or 'M') was common, so `long500x30k` gave an md5 that MAFFT
+     rarely gives. CARC's 32-thread runs happened to match.
+   - Fix: the step's aligner is read under the mutex (§8.4).
 
-Behaviour that v9 deliberately keeps from MAFFT:
+Behaviour that fast-mafft deliberately keeps from MAFFT:
 
-- The racy memsave switch at ≤ 20,000 sequences with several threads (§3.6).
+- The racy memsave switch at ≤ 20,000 sequences with several threads (§3.6), when it fires in the
+  middle of a pass (§8.4).
 - The nondeterminism of MAFFT's iterative modes (`--auto` on small inputs, `--maxiterate`) at
   `--thread` > 1. v7.526 itself gives different md5s from run to run there.
 
-## 9. Known limitations
+## 10. Known limitations
 
-- **Peak memory** is close to, but on several sets slightly above, the baseline's on CARC.
-  - v9 against baseline peak RSS: homfam_rvp 33.2 vs 32.97 GB, homfam_sdr 10.24–10.28 vs 9.96 GB,
-    homfam_Acetyltransf 8.62–8.68 vs 8.47 GB, homfam_p450 2.55–2.59 vs 2.46 GB.
-  - With v8 (no v9 change in this area), 16S.T was 4.2–4.4 GB against 3.71 GB.
+- **Alignments that cross 30,000 columns in the middle of a pass**, at more than one thread: MAFFT's
+  own output depends on thread timing there, and fast-mafft's race has different odds, so it does not
+  always give the output MAFFT usually gives on that machine (§8.4; 11 of 16 runs on 2,000 SARS-CoV-2
+  genomes at 32 threads). At `--thread 1` it is identical.
+- **Small inputs.** At 1,000 sequences fast-mafft is 5.0–5.6x faster at 32 threads (MAFFT takes
+  6–10 s), and 2.4x on prot2k, where MAFFT takes 1.5 s; at 2,000 sequences 7.0–7.7x (RESULTS.md §3.2).
+  The fixed costs (launcher, input, the serial parts of each stage) dominate there.
+- **Peak memory** is close to, but on several sets above, the baseline's on CARC (v10, RESULTS.md §3).
+  - Large sets: homfam_rvp 33.20 vs 33.00 GB, homfam_sdr 10.26 vs 9.96 GB, homfam_Acetyltransf 8.66
+    vs 8.47 GB, 16S.T 4.02 vs 3.69 GB; lower on rnasim10k (3.68 vs 5.81) and rnasim20k (5.19 vs 12.93).
+  - Long genomes: 0.8–1.5 GB against 0.4–1.0 GB on the simulated sets; sarscov2_500 1.57 vs 0.80 GB.
+  - Small sets: 0.8–2.5 GB against 0.3–1.8 GB (per-thread buffers at 32 threads).
   - All are well inside the 64 GB of an evaluation node. The excess comes from several large steps
-    being in flight at once.
+    being in flight at once, and from per-thread buffers.
 - **Tuning.** Everything x86-specific was tuned on CARC's EPYC 7513 (Zen 3) nodes and estimated for
   Zen 2 with llvm-mca. The ARM build keeps the scalar DP kernels.
 - **Other strategies.** Only FFT-NS-2 (the default) was optimized and timed.
