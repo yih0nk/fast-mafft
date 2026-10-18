@@ -5,21 +5,53 @@ and fast-mafft from this repository on the job's node, runs both on any director
 checks byte-identity and speedup. See the top-level README, "How to evaluate", or run
 `bash carc/run_eval.sh --help`.
 
-The rest of this file documents how the numbers in `../RESULTS.md` were produced: the
-`carc_v9_final.sh` jobs, whose paths point at the author's CARC scratch directory, and the logs in
+The rest of this file documents how the numbers in `../RESULTS.md` were produced, and the logs in
 `logs/`.
 
-## The final-evaluation jobs
+## The v10 evaluation (RESULTS.md §3)
+
+`carc_v10_final.sh REP PART` is self-contained like `run_eval.sh`: submitted from the repository root,
+it builds MAFFT v7.526 (from the first commit) and fast-mafft on its node and reads the inputs from
+`bench/data` (`bash bench/get_data.sh --long --balibase`). Six jobs ran in parallel on 2026-10-18 at
+commit `b35964d`:
+
+```
+for rep in 1 2 3; do for part in std long; do
+  sbatch --account=<account> carc/carc_v10_final.sh $rep $part; done; done
+python3 carc/summarize.py carc/logs/v10final-*.log        # the tables of RESULTS.md §3
+```
+
+| job | REP | PART | node | what |
+|---|---:|---|---|---|
+| 13224806 | 1 | std | a03-19 | identity suite (45 checks, self-checks, BAliBASE 772 runs) + timing |
+| 13224807 | 1 | long | a03-19 | identity suite (23 checks) + timing |
+| 13224808 | 2 | std | a04-05 | timing |
+| 13224809 | 2 | long | a04-05 | timing |
+| 13224810 | 3 | std | b10-02 | timing |
+| 13224811 | 3 | long | b10-03 | timing |
+
+PART=std times sim1k, rnasim1k, prot2k, sim2k, rnasim2k and the 12 datasets of the v9 evaluation;
+PART=long times sarscov2_500, sarscov2_1000, edge, long100x30k, long1000x30k, long300x50k,
+long500x30k and sarscov2_2000. Each timed line has the format below (labels `baseAggr-rK` and
+`v10aggr-rK`; `baseAgain` / `v10Again` for the reruns after an md5 difference).
+
+## The v9 evaluation (RESULTS.md §4)
+
+The `carc_v9_final.sh` jobs, whose paths point at the author's CARC scratch directory.
 
 ## Files
 
 | file | what it is |
 |---|---|
-| `carc_v9_final.sh` | Slurm job script, a verbatim copy of `bench/carc_v9_final.sh`. One repetition per job. |
+| `carc_v10_final.sh` | Slurm job script of the v10 evaluation (above). |
+| `carc_v10_mix.sh`, `diag_mix.py` | The diagnostic job of RESULTS.md §3.4: repeated runs of both programs, with builds that log every step's aligner, on inputs that switch to the memsave mode in the middle of a pass. |
+| `carc_v9_final.sh` | Slurm job script of the v9 evaluation, a verbatim copy of `bench/carc_v9_final.sh`. One repetition per job. |
 | `carc_run.py` | Timing harness, a verbatim copy of `bench/carc_run.py`. It runs one `mafft --thread N` and prints one result line. |
-| `summarize.py` | Added for this package. It turns the job logs into the tables of `../RESULTS.md`. |
+| `summarize.py` | Turns the job logs (v9 or v10) into the tables of `../RESULTS.md`. |
+| `run_eval.sh` | The portable evaluation job (top-level README). |
+| `logs/` | `v10final-1322480{6..9}.log`, `v10final-1322481{0,1}.log`, `v10mix-13226265.log`, `v9final-1307213{6,7,8}.log`. |
 
-### What one job does (REP = 1, 2 or 3)
+### What one v9 job does (REP = 1, 2 or 3)
 
 1. Builds fast-mafft v9 twice on its node with gcc 13.3: once with `-O3 -march=native -flto`
    (`v9-aggr`) and once with the default flags (`v9-default`).

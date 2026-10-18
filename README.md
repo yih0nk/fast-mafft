@@ -1,8 +1,9 @@
-# fast-mafft v9
+# fast-mafft v10
 
 fast-mafft is a faster drop-in replacement for **MAFFT v7.526** in its default mode (FFT-NS-2,
 `mafft --thread N in.fa`). For the same compiler and flags, its stdout is **byte-identical** to
-v7.526's. It was built for the USC CSCI 270 bonus project and is evaluated on USC CARC: 32 cores,
+v7.526's (one exception at more than one thread, where MAFFT's own output depends on thread timing:
+see "Known limits"). It was built for the USC CSCI 270 bonus project and is evaluated on USC CARC: 32 cores,
 64 GB, large datasets, against v7.526 built with aggressive optimization.
 
 ## How to evaluate (USC CARC)
@@ -10,6 +11,7 @@ v7.526's. It was built for the USC CSCI 270 bonus project and is evaluated on US
 ```
 git clone https://github.com/yih0nk/fast-mafft.git && cd fast-mafft
 bash bench/get_data.sh                     # optional: our 32 benchmark inputs (93 MB), checksum-verified
+bash bench/get_data.sh --long              # optional: + 12 long-genome inputs, e.g. real SARS-CoV-2 (50 MB)
 sbatch --account=<account> carc/run_eval.sh                               # all of bench/data, --thread 32
 sbatch --account=<account> carc/run_eval.sh --data /path/to/fastas --reps 3   # your own inputs
 ```
@@ -22,6 +24,8 @@ wall time, speedup and peak memory to `fast-mafft-eval-<jobid>.log`. Options:
 
 - `--check-default` also compares the outputs of builds with the default Makefile flags;
 - `--selfcheck` also runs fast-mafft's internal bitwise self-checks;
+- when the two outputs of a run differ, both programs run again, and the summary says whether MAFFT
+  reproduced its own output (see "Known limits" below);
 - `--threads`, `--reps`, `--flags` and `--work` are listed by `bash carc/run_eval.sh --help`.
 
 Run `bench/get_data.sh` on a login node, since compute nodes may have no internet access.
@@ -33,11 +37,11 @@ Run `bench/get_data.sh` on a login node, since compute nodes may have no interne
 | `fast-mafft-src/` | Complete MAFFT v7.526 source tree with the changes, and no build artifacts. Build it with the stock Makefile (see BUILD.md). |
 | `fast-mafft-v10.patch` | Unified diff against pristine v7.526 (GitLab `sysimm/mafft`, tag v7.526, commit `ee97999`). It covers 21 files under `core/`: 14 changed, 7 new. Apply with `patch -p1` or `git apply` from the top of a clean v7.526 tree. |
 | [BUILD.md](BUILD.md) | Build on Linux/gcc (CARC: `module load gcc/13.3.0`) with default and aggressive flags, glibc notes, how to run, and every environment switch. |
-| [CHANGES.md](CHANGES.md) | Every optimization, stage by stage: what MAFFT did, what v9 does, why the output stays identical, and the measured effect. Also the bugs found and fixed. |
+| [CHANGES.md](CHANGES.md) | Every optimization, stage by stage: what MAFFT did, what fast-mafft does, why the output stays identical, and the measured effect (§8: the v10 changes for long genomes). Also the bugs found and fixed. |
 | [VERIFICATION.md](VERIFICATION.md) | How identity was verified: datasets, thread counts, compilers and SIMD levels, self-check modes, edge cases, reference md5s. |
-| [RESULTS.md](RESULTS.md) | Final 3-run CARC evaluation on 12 datasets (`--thread 32`, 32 cores, 64 GB): **9.7x–36.2x mean speedup, minimum single run 8.3x, byte-identical output in every run**. Also methodology, datasets and raw runs. |
-| `carc/` | `run_eval.sh`, the portable evaluation job above; the scripts, summarizer and logs of the final evaluation (`carc_v9_final.sh`, `summarize.py`, `logs/`); and a README. |
-| `bench/` | `get_data.sh` and `DATA.md` (benchmark inputs, provenance, licenses, checksums in `DATA_MD5.txt`), the timing harness `carc_run.py`, the development harness `run_bench.py`, and the synthetic-data generators. |
+| [RESULTS.md](RESULTS.md) | Final 3-run CARC evaluation (`--thread 32`, 32 cores, 64 GB): on the 12 datasets of the v9 evaluation **10.1x–43.9x mean speedup, slowest single run 9.98x, byte-identical in every run**; real SARS-CoV-2 collections 11.6x–205x; long genomes 14.9x–72.8x; smaller inputs. Also methodology, datasets, raw runs, and the v9 evaluation. |
+| `carc/` | `run_eval.sh`, the portable evaluation job above; the scripts, summarizer and logs of the final evaluations (`carc_v10_final.sh`, `carc_v9_final.sh`, `summarize.py`, `logs/`); and a README. |
+| `bench/` | `get_data.sh` and `DATA.md` (benchmark inputs, provenance, licenses, checksums in `DATA_MD5.txt` and `DATA_MD5_LONG.txt`), the timing harness `carc_run.py`, the development harness `run_bench.py`, and the synthetic-data generators. |
 
 ## Quick start (Linux)
 
@@ -67,14 +71,35 @@ v9 changes every stage of FFT-NS-2:
 - **Distances from the MSA:** bit-parallel popcount kernels.
 - **I/O:** much less overhead.
 
-Every floating-point value is produced by the same operations in the same order, integer sums are
-exact in any order, tie rules are kept, and the one order-dependent piece of MAFFT (the memsave
-switch) is reproduced explicitly. Each new kernel has a bitwise self-check against the original
-code.
+v10 adds the paths v9 left at MAFFT's speed:
 
-In the final CARC evaluation (3 runs on 3 nodes, 12 datasets, `--thread 32`), v9 was 9.7x–36.2x faster
-on average than MAFFT v7.526 built with `-O3 -march=native -flto`. Its slowest single run was 8.3x,
-and the output was byte-identical in every run. See RESULTS.md.
+- **Alignments wider than 30,000 columns** (long genomes), where MAFFT switches to its memsave
+  aligners: a branch-free, AVX2, parallel Myers-Miller; an anchor search that builds its profiles
+  once instead of 500 times per merge and scores the lags in parallel.
+- **Collections of near-identical genomes** (e.g. SARS-CoV-2): parallel Falign segments, an O(n²)
+  `blockAlign2`, cache-blocked long FFTs, and a shared pool for the large per-thread buffers.
+
+Every floating-point value is produced by the same operations in the same order, integer sums are
+exact in any order, tie rules are kept, and MAFFT's one order-dependent piece (the memsave switch) is
+reproduced explicitly. Each new kernel has a bitwise self-check against the original code.
+
+In the final CARC evaluation (3 runs, `--thread 32`), v10 was 10.1x–43.9x faster on average than MAFFT
+v7.526 built with `-O3 -march=native -flto` on the 12 datasets of the v9 evaluation, with a slowest
+single run of 9.98x and byte-identical output in every run; 11.6x–205x on real SARS-CoV-2
+collections; 14.9x–72.8x on long genomes. See RESULTS.md.
+
+## Known limits
+
+- **Alignments that cross 30,000 columns in the middle of a progressive pass**, at more than one
+  thread (in our tests: 2,000 SARS-CoV-2 genomes, and simulated virus collections). There MAFFT
+  switches modes while other steps are in flight, and its own output depends on thread timing; it
+  usually gives one output on a given machine, but not always. fast-mafft keeps the same mechanism,
+  but its timing is different, so it does not always give MAFFT's usual output (11 of 16 runs on 2,000
+  SARS-CoV-2 genomes at 32 threads). At `--thread 1` it is identical. Inputs whose alignment stays
+  under 30,000 columns, or crosses it in the first steps (most long-genome sets), were identical in
+  every run. Details: VERIFICATION.md §3, CHANGES.md §8.4.
+- **Small inputs:** about 5x at 1,000 sequences and 7x at 2,000 (MAFFT takes 6–20 s there);
+  10x or more on average from 5,000 sequences.
 
 ## Verification
 
