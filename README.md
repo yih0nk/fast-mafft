@@ -105,3 +105,9 @@ collections; 14.9x–72.8x on long genomes. See RESULTS.md.
 
 See VERIFICATION.md: identity across compilers, SIMD levels, thread counts, BAliBASE and edge
 cases, plus the self-check modes.
+
+## License
+
+BSD, as MAFFT's own code: see [LICENSE](LICENSE). MAFFT is by Kazutaka Katoh; his notice is kept in
+`fast-mafft-src/license`, and the unchanged `extensions/` keep their own licenses
+(`fast-mafft-src/license.extensions`).
