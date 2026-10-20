@@ -909,7 +909,7 @@ Final CARC evaluation (RESULTS.md §3), `--thread 32`, mean of 3 runs, against M
 | long500x30k | 1,633 | | 39.8 | 41.2x |
 | long300x50k | 2,061 | | 28.5 | 72.8x |
 
-The changes of §8.5 also apply to ordinary inputs: on the 12 datasets of the v9 evaluation, v10's
+The changes of §8.5 also apply to ordinary inputs: on the 12 large benchmark datasets (timed for v9 and again for v10), v10's
 mean speedups are 10.1x–43.9x against v9's 9.7x–36.2x, and its slowest run 9.98x against 8.3x.
 Single steps, on the Mac at 10 threads: a late chain step of sarscov2_500 from ~38 ms to ~5.3 ms; the
 critical path of its pass 1 from 4.91 s to 1.16 s.

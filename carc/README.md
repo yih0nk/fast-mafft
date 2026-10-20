@@ -30,7 +30,7 @@ python3 carc/summarize.py carc/logs/v10final-*.log        # the tables of RESULT
 | 13224810 | 3 | std | b10-02 | timing |
 | 13224811 | 3 | long | b10-03 | timing |
 
-PART=std times sim1k, rnasim1k, prot2k, sim2k, rnasim2k and the 12 datasets of the v9 evaluation;
+PART=std times sim1k, rnasim1k, prot2k, sim2k, rnasim2k and the 12 large benchmark datasets;
 PART=long times sarscov2_500, sarscov2_1000, edge, long100x30k, long1000x30k, long300x50k,
 long500x30k and sarscov2_2000. Each timed line has the format below (labels `baseAggr-rK` and
 `v10aggr-rK`; `baseAgain` / `v10Again` for the reruns after an md5 difference).

@@ -1,6 +1,6 @@
 # CARC evaluation results
 
-**Result: on the 12 datasets of the v9 evaluation, at `--thread 32` on a 32-core / 64 GB CARC node,
+**Result: on 12 large benchmark datasets, at `--thread 32` on a 32-core / 64 GB CARC node,
 fast-mafft v10 produced output byte-identical to MAFFT v7.526 in every run and was 10.1x to 43.9x
 faster on average; its slowest single run was 9.98x** (rnasim5k). The baseline is MAFFT v7.526 built
 with `-O3 -march=native -flto` (its output equals the default build's).
@@ -50,7 +50,7 @@ downloads them and verifies the checksums in `bench/DATA_MD5.txt`. Provenance an
 `bench/DATA.md`. `bash bench/get_data.sh --long` adds the long-genome sets (release `data-long-v1`).
 To rerun the comparison on them or on any other inputs, use `carc/run_eval.sh`.
 
-The 12 datasets of the v9 evaluation (lengths are ungapped; the input md5 is the first 12 hex digits of the FASTA file):
+The 12 large benchmark datasets (lengths are ungapped; the input md5 is the first 12 hex digits of the FASTA file):
 
 | # | dataset | sequences | length min / avg / max | type | source | input md5 | notes |
 |---:|---|---:|---|---|---|---|---|
@@ -92,7 +92,7 @@ The 12 datasets of the v9 evaluation (lengths are ungapped; the input md5 is the
 
 ## 3. Final results (v10)
 
-### 3.1 The 12 datasets of the v9 evaluation, `--thread 32`
+### 3.1 The 12 large benchmark datasets, `--thread 32`
 
 | dataset | baseline mean (s) | fast-mafft mean (s) | speedup r1 | speedup r2 | speedup r3 | mean speedup | min speedup | md5 match | peak RSS baseline / fast-mafft (GB) |
 |---|---:|---:|---:|---:|---:|---:|---:|---|---|
@@ -271,7 +271,7 @@ Rerun after the md5 difference:
 |---|---:|---|---|
 | sarscov2_2000 | 1 | e6734daa2634 / e6734daa2634 | 300dbffd1556 / e6734daa2634 |
 
-## 4. The v9 evaluation (2026-10-13), for comparison
+## 4. Previous version: the v9 evaluation (2026-10-13)
 
 The previous version, measured with [`carc/carc_v9_final.sh`](carc/carc_v9_final.sh) (logs `carc/logs/v9final-*.log`)
 on the same 12 datasets. v10 is faster on every one of them (§3.1 against §4.1).

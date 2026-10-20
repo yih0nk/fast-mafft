@@ -39,7 +39,7 @@ Run `bench/get_data.sh` on a login node, since compute nodes may have no interne
 | [BUILD.md](BUILD.md) | Build on Linux/gcc (CARC: `module load gcc/13.3.0`) with default and aggressive flags, glibc notes, how to run, and every environment switch. |
 | [CHANGES.md](CHANGES.md) | Every optimization, stage by stage: what MAFFT did, what fast-mafft does, why the output stays identical, and the measured effect (§8: the v10 changes for long genomes). Also the bugs found and fixed. |
 | [VERIFICATION.md](VERIFICATION.md) | How identity was verified: datasets, thread counts, compilers and SIMD levels, self-check modes, edge cases, reference md5s. |
-| [RESULTS.md](RESULTS.md) | Final 3-run CARC evaluation (`--thread 32`, 32 cores, 64 GB): on the 12 datasets of the v9 evaluation **10.1x–43.9x mean speedup, slowest single run 9.98x, byte-identical in every run**; real SARS-CoV-2 collections 11.6x–205x; long genomes 14.9x–72.8x; smaller inputs. Also methodology, datasets, raw runs, and the v9 evaluation. |
+| [RESULTS.md](RESULTS.md) | Final 3-run CARC evaluation (`--thread 32`, 32 cores, 64 GB): on 12 large benchmark datasets **10.1x–43.9x mean speedup, slowest single run 9.98x, byte-identical in every run**; real SARS-CoV-2 collections 11.6x–205x; long genomes 14.9x–72.8x; smaller inputs. Also methodology, datasets, raw runs, and the v9 evaluation. |
 | `carc/` | `run_eval.sh`, the portable evaluation job above; the scripts, summarizer and logs of the final evaluations (`carc_v10_final.sh`, `carc_v9_final.sh`, `summarize.py`, `logs/`); and a README. |
 | `bench/` | `get_data.sh` and `DATA.md` (benchmark inputs, provenance, licenses, checksums in `DATA_MD5.txt` and `DATA_MD5_LONG.txt`), the timing harness `carc_run.py`, the development harness `run_bench.py`, and the synthetic-data generators. |
 
@@ -55,7 +55,7 @@ $HOME/fast-mafft/bin/mafft --thread 32 in.fa > out.fa
 
 ## In one paragraph
 
-v9 changes every stage of FFT-NS-2:
+v9, the first complete version, changes every stage of FFT-NS-2:
 
 - **6-mer distances:** a byte-SAD identity (|a − b| summed with `psadbw`/`uaba`), inverted indexes
   and bit masks.
@@ -71,7 +71,7 @@ v9 changes every stage of FFT-NS-2:
 - **Distances from the MSA:** bit-parallel popcount kernels.
 - **I/O:** much less overhead.
 
-v10 adds the paths v9 left at MAFFT's speed:
+v10, the current version, adds the paths v9 left at MAFFT's speed:
 
 - **Alignments wider than 30,000 columns** (long genomes), where MAFFT switches to its memsave
   aligners: a branch-free, AVX2, parallel Myers-Miller; an anchor search that builds its profiles
@@ -84,7 +84,7 @@ exact in any order, tie rules are kept, and MAFFT's one order-dependent piece (t
 reproduced explicitly. Each new kernel has a bitwise self-check against the original code.
 
 In the final CARC evaluation (3 runs, `--thread 32`), v10 was 10.1x–43.9x faster on average than MAFFT
-v7.526 built with `-O3 -march=native -flto` on the 12 datasets of the v9 evaluation, with a slowest
+v7.526 built with `-O3 -march=native -flto` on 12 large benchmark datasets, with a slowest
 single run of 9.98x and byte-identical output in every run; 11.6x–205x on real SARS-CoV-2
 collections; 14.9x–72.8x on long genomes. See RESULTS.md.
 
