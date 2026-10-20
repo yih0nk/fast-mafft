@@ -360,7 +360,7 @@ That is 42 checks. The suite then runs the self-check modes on rnasim1k, 16S.T a
 
 ## 5. Earlier CARC measurements of v9 (orientation only)
 
-These come from development jobs recorded in `notes/v8s-lever.md` and `notes/v9p-lever.md`. They are
+These come from development jobs recorded in the v8s and v9p development notes (not published). They are
 all `--thread 32` with gcc 13.3 `-O3 -march=native -flto`. The baselines were not always measured in
 the same job or on the same node, so the ratios are approximate.
 

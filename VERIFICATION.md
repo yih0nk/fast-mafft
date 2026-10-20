@@ -1,7 +1,7 @@
 # How byte-identical output was verified
 
-Every count below comes from the lever notes (`notes/*.md`), the CARC job logs (`carc/logs/`), or
-the packaging checks (§3, §4). "M5" is the development Mac (Apple M5); "CARC" is USC CARC (AMD EPYC
+Every count below comes from the project's development notes (one per lever; kept privately, not
+published in this repository), the CARC job logs (`carc/logs/`), or the packaging checks (§3, §4). "M5" is the development Mac (Apple M5); "CARC" is USC CARC (AMD EPYC
 7513/7542, gcc 13.3).
 
 ## 1. What "identical" means here
@@ -148,9 +148,9 @@ report whether MAFFT gave the same output twice.
     own style.
 - **Both results equal `fast-mafft-src/` exactly.** `diff -r` reports no difference over all 179
   files, and the permission bits are equal as well.
-- **`fast-mafft-src/` equals `work/v9p/src`.** It holds every tracked file plus the 7 new sources,
+- **`fast-mafft-src/` equals the v9p development tree.** It holds every tracked file plus the 7 new sources,
   with no build artifacts. Its `disttbfast.c` md5 is `5a2011f1…` and `mltaln9.c` is `6214cdc5…`, the
-  files the final CARC jobs built (`notes/v9p-lever.md`).
+  files the final v9 CARC jobs built.
 - **Builds.** The patched tree builds with Apple clang 15 (`make CC=clang PREFIX=…`, default
   `CFLAGS=-O3`). It also builds with the literal stock form `make -C core && make -C core install
   PREFIX=…`, whose launcher points at `/usr/local/libexec/mafft` (BUILD.md §2). Neither build adds a
@@ -215,7 +215,7 @@ Further checks on CARC:
 
 ## 6. Checks during development (each lever, against the same-flag baseline)
 
-| lever (notes file) | md5 checks | other checks |
+| lever (development notes file, not published) | md5 checks | other checks |
 |---|---|---|
 | **v3 on CARC** (PLAN.md) | everything run on CARC, with gcc 13.3 `-O3 -g` at `--thread 32`, BAliBASE and the edge sets included: identical | |
 | **dist** (distance-lever) | sim1k, sim2k, sim5k, prot2k at 1/4/10 (12 cells); sim10k at 10 | `MAFFT_MSADIST=check` on sim1k, sim2k, sim5k (12.5 M pairs) and prot2k, both paths. sim5k matrix dump identical to the original code's (99,980,000 bytes). Random stress alignments (L from 1 to 4,097, 5 alphabets, 5–97% gaps), including x86 under Rosetta: 0 mismatches |

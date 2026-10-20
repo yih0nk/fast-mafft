@@ -4,8 +4,9 @@ This document explains every optimization in fast-mafft, stage by stage. §1–�
 every stage of MAFFT's default mode; §8 is v10, which adds alignments wider than 30,000 columns (long
 genomes) and collections of near-identical genomes. For each change it covers what MAFFT v7.526 does,
 what fast-mafft does instead, why the alignment printed on stdout cannot change, and
-what the change measured. All numbers are copied from the project's lever notes (`notes/*.md`), with
-the machine stated: "M5" is the development Mac (Apple M5, 4 performance + 6 efficiency cores,
+what the change measured. All numbers are copied from the project's development notes (one notes
+file per lever, kept privately and not published in this repository) or from the CARC logs in
+`carc/logs/`, with the machine stated: "M5" is the development Mac (Apple M5, 4 performance + 6 efficiency cores,
 clang); "CARC" is a USC CARC node (AMD EPYC 7513, gcc 13.3, `--thread 32`). The final CARC
 evaluation goes in [RESULTS.md](RESULTS.md).
 
@@ -28,7 +29,7 @@ The shell launcher then reformats the result with `f2cl`.
 
 ### 0.2 Where the baseline spends its time
 
-On the M5 (sim5k, 10 threads, 51.3 s), `notes/profile.md` splits the run as follows:
+On the M5 (sim5k, 10 threads, 51.3 s), a profile of the baseline splits the run as follows:
 
 | stage | share | hot function |
 |---|---:|---|
@@ -64,7 +65,7 @@ merged:
 | v8s | IUPAC rRNA at 32 threads |
 | v9p | huge protein N |
 
-Each lever's notes file records its measurements. v3 was the first build tested on CARC, v7 the
+Each lever's development notes record its measurements (not published here). v3 was the first build tested on CARC, v7 the
 merge of the round-3 levers, v8 = v7 + v8s, and **v9 = v8 + v9p**.
 
 ### 0.4 The exactness rules every change follows
